@@ -66,6 +66,8 @@ struct retro_game_info {
 const RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: u32 = 10;
 const RETRO_PIXEL_FORMAT_XRGB8888: i32 = 1;
 
+const RETRO_MEMORY_SAVE_RAM: u32 = 0;
+
 // Device + button ids.
 const RETRO_DEVICE_JOYPAD: u32 = 1;
 const RETRO_DEVICE_ID_JOYPAD_B: u32 = 0;
@@ -287,16 +289,29 @@ pub extern "C" fn retro_run() {
     });
 }
 
-// --- Save RAM / state: not implemented yet -----------------------------------
+// --- Save RAM: exposed so the front-end persists it to disk ------------------
 
 #[no_mangle]
-pub extern "C" fn retro_get_memory_data(_id: u32) -> *mut c_void {
-    ptr::null_mut()
+pub extern "C" fn retro_get_memory_data(id: u32) -> *mut c_void {
+    if id != RETRO_MEMORY_SAVE_RAM {
+        return ptr::null_mut();
+    }
+    with_state(|s| match &mut s.gba {
+        Some(gba) if !gba.bus.save.data.is_empty() => {
+            gba.bus.save.data.as_mut_ptr() as *mut c_void
+        }
+        _ => ptr::null_mut(),
+    })
 }
 #[no_mangle]
-pub extern "C" fn retro_get_memory_size(_id: u32) -> usize {
-    0
+pub extern "C" fn retro_get_memory_size(id: u32) -> usize {
+    if id != RETRO_MEMORY_SAVE_RAM {
+        return 0;
+    }
+    with_state(|s| s.gba.as_ref().map(|g| g.bus.save.data.len()).unwrap_or(0))
 }
+
+// --- Save states: not implemented yet ----------------------------------------
 #[no_mangle]
 pub extern "C" fn retro_serialize_size() -> usize {
     0

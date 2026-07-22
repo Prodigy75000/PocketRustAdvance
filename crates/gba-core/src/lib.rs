@@ -9,6 +9,7 @@ pub mod bus;
 pub mod cpu;
 pub mod memory;
 pub mod ppu;
+pub mod save;
 
 // Coming online next: DMA, timers, IRQ delivery, APU.
 

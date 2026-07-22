@@ -4,13 +4,15 @@
 
 use crate::bus::{Access, Bus};
 use crate::ppu::Ppu;
+use crate::save::Save;
 
 pub struct GbaBus {
     pub bios: Box<[u8]>,   // 16 KB
     pub ewram: Box<[u8]>,  // 256 KB
     pub iwram: Box<[u8]>,  // 32 KB
     pub rom: Box<[u8]>,    // up to 32 MB
-    pub sram: Box<[u8]>,   // 64 KB
+    /// Cartridge backup: SRAM / Flash (region 0xE-0xF) or EEPROM (region 0xD).
+    pub save: Save,
     pub ppu: Ppu,
     /// Catch-all for I/O registers not yet modeled (DMA/timers/IRQ/sound).
     io: Box<[u8]>, // 0x400
@@ -81,12 +83,13 @@ impl GbaBus {
                 b[off..off + 4].copy_from_slice(&word.to_le_bytes());
             }
         }
+        let save = Save::detect(&rom);
         GbaBus {
             bios: b.into_boxed_slice(),
             ewram: vec![0; 256 * 1024].into_boxed_slice(),
             iwram: vec![0; 32 * 1024].into_boxed_slice(),
             rom: rom.into_boxed_slice(),
-            sram: vec![0; 64 * 1024].into_boxed_slice(),
+            save,
             ppu: Ppu::new(),
             io: vec![0; 0x400].into_boxed_slice(),
             keyinput: 0x03FF,
@@ -169,8 +172,26 @@ impl GbaBus {
             2 => a,
             _ => a.wrapping_add(size),
         };
+        // EEPROM lives in region 0xD and is driven bit-serially by DMA; the
+        // transfer length tells the chip its command and address width.
+        let ee_src = self.save.is_eeprom() && (src >> 24) == 0xD;
+        let ee_dst = self.save.is_eeprom() && (dst >> 24) == 0xD;
+        if ee_src || ee_dst {
+            self.save.eeprom_set_dma_len(self.dma_count[ch]);
+        }
         for _ in 0..self.dma_count[ch] {
-            if word {
+            if ee_src || ee_dst {
+                let v = if ee_src {
+                    self.save.eeprom_read_bit() as u32
+                } else {
+                    self.read16_raw(src & !1) as u32
+                };
+                if ee_dst {
+                    self.save.eeprom_write_bit(v as u8);
+                } else {
+                    self.write(dst & !1, v, 2);
+                }
+            } else if word {
                 let v = self.read32_raw(src & !3);
                 self.write(dst & !3, v, 4);
             } else {
@@ -267,7 +288,7 @@ impl GbaBus {
                 let o = (addr & 0x01FF_FFFF) as usize;
                 *self.rom.get(o).unwrap_or(&0)
             }
-            0xE | 0xF => self.sram[(addr & 0xFFFF) as usize],
+            0xE | 0xF => self.save.read(addr),
             _ => 0,
         }
     }
@@ -348,7 +369,8 @@ impl GbaBus {
             0x5 => self.display_write(DisplayRegion::Pal, addr, val, width),
             0x6 => self.display_write(DisplayRegion::Vram, addr, val, width),
             0x7 => self.display_write(DisplayRegion::Oam, addr, val, width),
-            0xE | 0xF => self.sram[(addr & 0xFFFF) as usize] = val as u8,
+            // SRAM/Flash: an 8-bit bus, so only the low byte is written per byte.
+            0xE | 0xF => self.save.write(addr, val as u8),
             _ => {} // BIOS / ROM are read-only
         }
     }
@@ -502,6 +524,10 @@ impl Bus for GbaBus {
     }
     fn read16(&mut self, addr: u32, _a: Access) -> u16 {
         self.cycles += Self::access_cycles(addr, false);
+        // Direct EEPROM access (e.g. a game polling write-ready).
+        if self.save.is_eeprom() && (addr >> 24) == 0xD {
+            return self.save.eeprom_read_bit() as u16;
+        }
         self.read16_raw(addr)
     }
     fn read32(&mut self, addr: u32, _a: Access) -> u32 {
@@ -514,6 +540,10 @@ impl Bus for GbaBus {
     }
     fn write16(&mut self, addr: u32, val: u16, _a: Access) {
         self.cycles += Self::access_cycles(addr, false);
+        if self.save.is_eeprom() && (addr >> 24) == 0xD {
+            self.save.eeprom_write_bit(val as u8);
+            return;
+        }
         self.write(addr, val as u32, 2);
     }
     fn write32(&mut self, addr: u32, val: u32, _a: Access) {
