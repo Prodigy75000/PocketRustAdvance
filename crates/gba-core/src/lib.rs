@@ -155,7 +155,12 @@ impl Gba {
                     self.bus.cycles = target;
                     break;
                 }
-                self.bus.cur_pc = self.cpu.r[15];
+                // Debug watchpoint bookkeeping (zero-cost unless a watch is set):
+                // the executing instruction sits two fetches behind R15.
+                if self.bus.watch_addr != 0 {
+                    let back = if self.cpu.thumb() { 4 } else { 8 };
+                    self.bus.cur_pc = self.cpu.r[15].wrapping_sub(back);
+                }
                 self.cpu.step(&mut self.bus);
                 self.steps += 1;
             }

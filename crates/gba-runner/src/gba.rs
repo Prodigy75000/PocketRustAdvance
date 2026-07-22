@@ -317,8 +317,8 @@ fn main() {
     println!("steps={}  (~{} instr/frame)", gba.steps, gba.steps / frames.max(1) as u64);
     if gba.bus.watch_addr != 0 {
         println!("  watch {:08X}: {} writes", gba.bus.watch_addr, gba.bus.watch_hits.len());
-        for (pc, addr, val) in gba.bus.watch_hits.iter().take(16) {
-            println!("    PC={pc:08X} -> [{addr:08X}] = {val:08X}");
+        for (pc, addr, val) in gba.bus.watch_hits.iter().take(24) {
+            println!("    PC={pc:08X} w{} [{:07X}] = {val:08X}", addr >> 28, addr & 0x0FFF_FFFF);
         }
     }
     let counter = u32::from_le_bytes(gba.bus.iwram[0..4].try_into().unwrap());

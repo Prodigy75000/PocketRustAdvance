@@ -380,6 +380,11 @@ impl GbaBus {
     }
     #[inline]
     fn read32_raw(&self, addr: u32) -> u32 {
+        // The bus always returns the word-aligned value; the CPU rotates it for
+        // an unaligned LDR. Reading the raw (unaligned) bytes instead corrupts
+        // e.g. Pokemon's palette-fade loop (it LDRs colours from a halfword
+        // offset), which halved the palette and garbled sprites.
+        let addr = addr & !3;
         if let Some((mem, o)) = self.linear_region(addr) {
             if o + 4 <= mem.len() {
                 return u32::from_le_bytes([mem[o], mem[o + 1], mem[o + 2], mem[o + 3]]);
@@ -422,10 +427,11 @@ impl GbaBus {
     // --- Writes: width-aware so display-memory quirks are honored --------------
 
     fn write(&mut self, addr: u32, val: u32, width: u32) {
-        if self.watch_addr != 0 && addr >= self.watch_addr && addr < self.watch_addr + 0x400
-            && self.watch_hits.len() < 64
+        if self.watch_addr != 0 && addr >= self.watch_addr && addr < self.watch_addr + 0x4
+            && self.watch_hits.len() < 200
         {
-            self.watch_hits.push((self.cur_pc, addr, val));
+            // Stash width in the top nibble (palette values are 16-bit, so free).
+            self.watch_hits.push((self.cur_pc, (width << 28) | addr, val));
         }
         match (addr >> 24) & 0xF {
             0x2 => write_le(&mut self.ewram, (addr & 0x3_FFFF) as usize, val, width),
