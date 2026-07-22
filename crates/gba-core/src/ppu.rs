@@ -32,6 +32,8 @@ pub struct Ppu {
     bg_ref: [[i32; 2]; 2], // [bg2, bg3][x, y]
     /// Profiling switch: force colour effects off (measures blend cost).
     pub no_blend: bool,
+    /// Debug switch: force window masking off (isolates window bugs).
+    pub no_window: bool,
 }
 
 // Register indices (byte offset >> 1).
@@ -169,6 +171,7 @@ impl Default for Ppu {
             framebuffer: vec![0; SCREEN_W * SCREEN_H].into_boxed_slice(),
             bg_ref: [[0; 2]; 2],
             no_blend: false,
+            no_window: false,
         }
     }
 }
@@ -350,7 +353,7 @@ impl Ppu {
         let mut comp = Compositor::new(self.backdrop(), blend_mode != 0);
 
         // Window layer/effect masking (DISPCNT bits 13/14/15 enable win0/1/obj).
-        if dispcnt & 0xE000 != 0 {
+        if dispcnt & 0xE000 != 0 && !self.no_window {
             self.build_window_mask(line, dispcnt, &mut comp.win_mask);
         }
 
@@ -428,8 +431,21 @@ impl Ppu {
     fn build_window_mask(&self, line: usize, dispcnt: u16, mask: &mut [u8; SCREEN_W]) {
         let winout = self.regs[WINOUT];
         mask.fill((winout & 0x3F) as u8); // default: outside all windows
-        let winin = self.regs[WININ];
 
+        // OBJ-window: pixels covered by an OBJ-window sprite take WINOUT's high
+        // byte. Lower priority than WIN0/WIN1, higher than the outside region.
+        if dispcnt & 0x8000 != 0 {
+            let mut cover = [false; SCREEN_W];
+            self.obj_window_coverage(line, dispcnt, &mut cover);
+            let objmask = ((winout >> 8) & 0x3F) as u8;
+            for (m, &c) in mask.iter_mut().zip(cover.iter()) {
+                if c {
+                    *m = objmask;
+                }
+            }
+        }
+
+        let winin = self.regs[WININ];
         // Apply WIN1 first, then WIN0 on top (WIN0 has the higher priority).
         for (enable_bit, m, hreg, vreg) in [
             (14u16, winin >> 8, WIN0H + 1, WIN0V + 1), // WIN1H=0x42, WIN1V=0x46
@@ -454,6 +470,92 @@ impl Ppu {
                 let val = (m & 0x3F) as u8;
                 for cell in mask.iter_mut().take(x2).skip(x1) {
                     *cell = val;
+                }
+            }
+        }
+    }
+
+    /// Mark the pixels covered by OBJ-window sprites (OAM mode 2) on this
+    /// scanline. Same geometry as `sprite_line` but it records coverage instead
+    /// of drawing a colour.
+    fn obj_window_coverage(&self, line: usize, dispcnt: u16, cover: &mut [bool; SCREEN_W]) {
+        const SIZE: [[(i32, i32); 4]; 3] = [
+            [(8, 8), (16, 16), (32, 32), (64, 64)],
+            [(16, 8), (32, 8), (32, 16), (64, 32)],
+            [(8, 16), (8, 32), (16, 32), (32, 64)],
+        ];
+        let one_dim = dispcnt & 0x40 != 0;
+        for i in 0..128 {
+            let a0 = u16::from_le_bytes([self.oam[i * 8], self.oam[i * 8 + 1]]);
+            let a1 = u16::from_le_bytes([self.oam[i * 8 + 2], self.oam[i * 8 + 3]]);
+            let a2 = u16::from_le_bytes([self.oam[i * 8 + 4], self.oam[i * 8 + 5]]);
+            if (a0 >> 10) & 3 != 2 {
+                continue; // only OBJ-window sprites define coverage
+            }
+            let affine = a0 & 0x100 != 0;
+            if !affine && a0 & 0x200 != 0 {
+                continue;
+            }
+            let shape = ((a0 >> 14) & 3) as usize;
+            let size = ((a1 >> 14) & 3) as usize;
+            if shape == 3 {
+                continue;
+            }
+            let (w, h) = SIZE[shape][size];
+            let double = affine && a0 & 0x200 != 0;
+            let (bw, bh) = if double { (w * 2, h * 2) } else { (w, h) };
+            let y = (a0 & 0xFF) as i32;
+            let row = (line as i32 - y) & 0xFF;
+            if row >= bh {
+                continue;
+            }
+            let mut x = (a1 & 0x1FF) as i32;
+            if x >= 256 {
+                x -= 512;
+            }
+            let is_8bpp = a0 & 0x2000 != 0;
+            let base_tile = (a2 & 0x3FF) as usize;
+            let unit_stride = if is_8bpp { 2 } else { 1 };
+            let row_stride = if one_dim { (w / 8) as usize * unit_stride } else { 32 };
+            let (pa, pb, pc, pd) = if affine {
+                let g = ((a1 >> 9) & 0x1F) as usize * 0x20;
+                let p = |o: usize| i16::from_le_bytes([self.oam[g + o], self.oam[g + o + 1]]) as i32;
+                (p(0x06), p(0x0E), p(0x16), p(0x1E))
+            } else {
+                (0, 0, 0, 0)
+            };
+            let hflip = !affine && a1 & 0x1000 != 0;
+            let vflip = !affine && a1 & 0x2000 != 0;
+            for col in 0..bw {
+                let sx = x + col;
+                if sx < 0 || sx >= SCREEN_W as i32 {
+                    continue;
+                }
+                let (tex_x, tex_y) = if affine {
+                    let ox = col - bw / 2;
+                    let oy = row - bh / 2;
+                    let tx = ((pa * ox + pb * oy) >> 8) + w / 2;
+                    let ty = ((pc * ox + pd * oy) >> 8) + h / 2;
+                    if tx < 0 || ty < 0 || tx >= w || ty >= h {
+                        continue;
+                    }
+                    (tx as usize, ty as usize)
+                } else {
+                    let tx = if hflip { w - 1 - col } else { col };
+                    let ty = if vflip { h - 1 - row } else { row };
+                    (tx as usize, ty as usize)
+                };
+                let unit = base_tile + (tex_y / 8) * row_stride + (tex_x / 8) * unit_stride;
+                let base = 0x1_0000 + unit * 32;
+                let (px, py) = (tex_x % 8, tex_y % 8);
+                let idx = if is_8bpp {
+                    self.vram[base + py * 8 + px] as usize
+                } else {
+                    let b = self.vram[base + py * 4 + px / 2];
+                    (if px & 1 == 0 { b & 0xF } else { b >> 4 }) as usize
+                };
+                if idx != 0 {
+                    cover[sx as usize] = true;
                 }
             }
         }

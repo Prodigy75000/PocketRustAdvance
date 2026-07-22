@@ -149,13 +149,23 @@ fn main() {
     if std::env::var_os("GBA_NOBLEND").is_some() {
         gba.bus.ppu.no_blend = true;
     }
+    if std::env::var_os("GBA_NOWINDOW").is_some() {
+        gba.bus.ppu.no_window = true;
+    }
     // Track the most "interesting" frame (most distinct colours) so a single PNG
     // lands on a real rendered screen, not a blank/forced-blank transition frame.
     let mut best_fb: Vec<u16> = Vec::new();
     let mut best_distinct = 0usize;
     let mut best_frame = 0u32;
     let trace = std::env::var("GBA_TRACE").is_ok();
+    // Auto-advance menus: hold A/Start in short pulses to reach in-game scenes.
+    let autoinput = std::env::var_os("GBA_AUTOINPUT").is_some();
     for f in 0..frames {
+        if autoinput {
+            let p = f % 24 < 4; // pulse A + Start to advance title and dialogue
+            gba.set_button(gba_core::Button::A, p);
+            gba.set_button(gba_core::Button::Start, p);
+        }
         let fb = gba.run_frame().to_vec();
         let d = distinct_count(&fb);
         if d > best_distinct {
@@ -186,8 +196,33 @@ fn main() {
         println!("  BIOS intr flags [0x03FFFFF8]={:08X}  user IRQ handler [0x03FFFFFC]={:08X}",
             iw(0x7FF8), iw(0x7FFC));
         let rr = |o: u32| gba.bus.ppu.read_reg16(o);
-        println!("  BLDCNT={:04X} BLDALPHA={:04X} BLDY={:04X}  WININ={:04X} WINOUT={:04X} WIN0H={:04X} WIN0V={:04X}",
-            rr(0x50), rr(0x52), rr(0x54), rr(0x48), rr(0x4A), rr(0x40), rr(0x44));
+        println!("  BLDCNT={:04X} BLDALPHA={:04X} BLDY={:04X}  WININ={:04X} WINOUT={:04X}",
+            rr(0x50), rr(0x52), rr(0x54), rr(0x48), rr(0x4A));
+        println!("  WIN0H={:04X} WIN0V={:04X} WIN1H={:04X} WIN1V={:04X}  backdrop(pal0)={:04X}",
+            rr(0x40), rr(0x44), rr(0x42), rr(0x46),
+            u16::from_le_bytes([gba.bus.ppu.palram[0], gba.bus.ppu.palram[1]]));
+        // OAM census: enabled sprites, split by affine / mode.
+        let oam = &gba.bus.ppu.oam;
+        let (mut normal, mut affine, mut objwin) = (0, 0, 0);
+        for i in 0..128 {
+            let a0 = u16::from_le_bytes([oam[i * 8], oam[i * 8 + 1]]);
+            let aff = a0 & 0x100 != 0;
+            let disabled = !aff && a0 & 0x200 != 0;
+            if disabled {
+                continue;
+            }
+            match (a0 >> 10) & 3 {
+                2 => objwin += 1,
+                _ if aff => affine += 1,
+                _ => normal += 1,
+            }
+        }
+        println!("  OAM: {normal} normal, {affine} affine, {objwin} obj-window sprites");
+        // Framebuffer samples (240x160): background, professor centre, text row.
+        let fb = &gba.bus.ppu.framebuffer;
+        let px = |x: usize, y: usize| fb[y * SCREEN_W + x];
+        println!("  fb: bg(120,40)={:04X} centre(120,70)={:04X} text(60,140)={:04X} top(120,10)={:04X}",
+            px(120, 40), px(120, 70), px(60, 140), px(120, 10));
         if std::env::var("GBA_REGS").is_ok() {
             for row in 0..4 {
                 let r = row * 4;
@@ -210,7 +245,8 @@ fn main() {
     let counter = u32::from_le_bytes(gba.bus.iwram[0..4].try_into().unwrap());
     println!("IWRAM counter @0x03000000 = {counter}  (IRQs taken)");
     // Prefer the best (most colourful) frame for the PNG; fall back to the final.
-    let fb: Vec<u16> = if best_distinct > 1 {
+    // GBA_LASTFRAME forces the final frame (to inspect a specific moment).
+    let fb: Vec<u16> = if best_distinct > 1 && std::env::var_os("GBA_LASTFRAME").is_none() {
         best_fb.clone()
     } else {
         gba.bus.ppu.framebuffer.to_vec()
