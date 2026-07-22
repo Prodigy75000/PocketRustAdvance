@@ -143,6 +143,12 @@ fn main() {
     };
 
     let mut gba = Gba::new(rom, bios);
+    if std::env::var_os("GBA_NORENDER").is_some() {
+        gba.render_enabled = false;
+    }
+    if std::env::var_os("GBA_NOBLEND").is_some() {
+        gba.bus.ppu.no_blend = true;
+    }
     // Track the most "interesting" frame (most distinct colours) so a single PNG
     // lands on a real rendered screen, not a blank/forced-blank transition frame.
     let mut best_fb: Vec<u16> = Vec::new();
@@ -200,6 +206,7 @@ fn main() {
             println!();
         }
     }
+    println!("steps={}  (~{} instr/frame)", gba.steps, gba.steps / frames.max(1) as u64);
     let counter = u32::from_le_bytes(gba.bus.iwram[0..4].try_into().unwrap());
     println!("IWRAM counter @0x03000000 = {counter}  (IRQs taken)");
     // Prefer the best (most colourful) frame for the PNG; fall back to the final.

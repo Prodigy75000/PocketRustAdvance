@@ -30,6 +30,8 @@ pub struct Ppu {
     /// BG2 and BG3. Latched from BGxX/BGxY at the top of the frame and advanced
     /// by PB/PD each scanline (a mid-frame write to BGxX/Y reloads them).
     bg_ref: [[i32; 2]; 2], // [bg2, bg3][x, y]
+    /// Profiling switch: force colour effects off (measures blend cost).
+    pub no_blend: bool,
 }
 
 // Register indices (byte offset >> 1).
@@ -64,10 +66,12 @@ struct Compositor {
     snd_col: [u16; SCREEN_W],
     snd_id: [u8; SCREEN_W],
     snd_key: [u16; SCREEN_W],
+    /// Track the second layer only when a colour effect needs it (blending on).
+    track_second: bool,
 }
 
 impl Compositor {
-    fn new(backdrop: u16) -> Self {
+    fn new(backdrop: u16, track_second: bool) -> Self {
         let bd_key = (4u16 << 8) | 5; // below every BG/OBJ
         Compositor {
             top_col: [backdrop; SCREEN_W],
@@ -76,6 +80,18 @@ impl Compositor {
             snd_col: [backdrop; SCREEN_W],
             snd_id: [5; SCREEN_W],
             snd_key: [bd_key; SCREEN_W],
+            track_second,
+        }
+    }
+
+    /// The key below which a new layer pixel is worth placing. Without blending
+    /// only the winner matters (`top_key`); with it, a layer can still be second.
+    #[inline]
+    fn threshold(&self, x: usize) -> u16 {
+        if self.track_second {
+            self.snd_key[x]
+        } else {
+            self.top_key[x]
         }
     }
 
@@ -83,13 +99,15 @@ impl Compositor {
     fn place(&mut self, x: usize, col: u16, id: u8, priority: u8, rank: u8) {
         let key = ((priority as u16) << 8) | rank as u16;
         if key < self.top_key[x] {
-            self.snd_col[x] = self.top_col[x];
-            self.snd_id[x] = self.top_id[x];
-            self.snd_key[x] = self.top_key[x];
+            if self.track_second {
+                self.snd_col[x] = self.top_col[x];
+                self.snd_id[x] = self.top_id[x];
+                self.snd_key[x] = self.top_key[x];
+            }
             self.top_col[x] = col;
             self.top_id[x] = id;
             self.top_key[x] = key;
-        } else if key < self.snd_key[x] {
+        } else if self.track_second && key < self.snd_key[x] {
             self.snd_col[x] = col;
             self.snd_id[x] = id;
             self.snd_key[x] = key;
@@ -137,6 +155,7 @@ impl Default for Ppu {
             oam: vec![0; 1024].into_boxed_slice(),
             framebuffer: vec![0; SCREEN_W * SCREEN_H].into_boxed_slice(),
             bg_ref: [[0; 2]; 2],
+            no_blend: false,
         }
     }
 }
@@ -313,8 +332,14 @@ impl Ppu {
     /// priority. Mode 0 is four text BGs; mode 1 is BG0/BG1 text + BG2 affine;
     /// mode 2 is BG2/BG3 affine.
     fn render_tiled(&mut self, line: usize, mode: u16, dispcnt: u16) {
-        let mut comp = Compositor::new(self.backdrop());
+        let bldcnt = self.regs[0x50 / 2];
+        let blend_mode = if self.no_blend { 0 } else { (bldcnt >> 6) & 3 };
+        let mut comp = Compositor::new(self.backdrop(), blend_mode != 0);
 
+        // Gather the enabled BGs and render them front-to-back (by priority,
+        // then BG index) so covered pixels are pruned by the skip check.
+        let mut layers: [(u8, usize, bool); 4] = [(0, 0, false); 4];
+        let mut n = 0;
         for bg in 0..4 {
             if dispcnt & (1 << (8 + bg)) == 0 {
                 continue;
@@ -329,10 +354,18 @@ impl Ppu {
                 2 => bg == 2 || bg == 3,
                 _ => false,
             };
-            if text {
-                self.text_bg_line(bg, line, &mut comp);
-            } else if affine {
+            if text || affine {
+                let priority = (self.regs[0x08 / 2 + bg] & 3) as u8;
+                layers[n] = (priority, bg, affine);
+                n += 1;
+            }
+        }
+        layers[..n].sort_unstable_by_key(|&(p, bg, _)| ((p as u16) << 8) | bg as u16);
+        for &(_, bg, affine) in &layers[..n] {
+            if affine {
                 self.affine_bg_line(bg, &mut comp);
+            } else {
+                self.text_bg_line(bg, line, &mut comp);
             }
         }
 
@@ -340,9 +373,14 @@ impl Ppu {
             self.sprite_line(line, dispcnt, &mut comp);
         }
 
+        let dst = &mut self.framebuffer[line * SCREEN_W..(line + 1) * SCREEN_W];
+        if blend_mode == 0 {
+            // No colour effect: the winning layer is the output.
+            dst.copy_from_slice(&comp.top_col);
+            return;
+        }
+
         // Apply the colour special effects (BLDCNT) to the composited top layer.
-        let bldcnt = self.regs[0x50 / 2];
-        let mode = (bldcnt >> 6) & 3;
         let first = bldcnt & 0x3F; // 1st-target layer mask
         let second = (bldcnt >> 8) & 0x3F; // 2nd-target layer mask
         let bldalpha = self.regs[0x52 / 2];
@@ -350,11 +388,10 @@ impl Ppu {
         let evb = ((bldalpha >> 8) & 0x1F).min(16);
         let evy = (self.regs[0x54 / 2] & 0x1F).min(16);
 
-        let dst = &mut self.framebuffer[line * SCREEN_W..(line + 1) * SCREEN_W];
         for x in 0..SCREEN_W {
             let tc = comp.top_col[x];
             let first_hit = first & (1 << comp.top_id[x]) != 0;
-            dst[x] = match mode {
+            dst[x] = match blend_mode {
                 1 if first_hit && second & (1 << comp.snd_id[x]) != 0 => {
                     blend_alpha(tc, comp.snd_col[x], eva, evb)
                 }
@@ -387,7 +424,7 @@ impl Ppu {
 
         let key = ((priority as u16) << 8) | rank as u16;
         for x in 0..SCREEN_W {
-            let visible = key < comp.snd_key[x]; // could still land as 1st or 2nd
+            let visible = key < comp.threshold(x); // could still land as 1st or 2nd
             let mut tx = cx >> 8;
             let mut ty = cy >> 8;
             cx = cx.wrapping_add(pa);
@@ -438,8 +475,8 @@ impl Ppu {
 
         let key = ((priority as u16) << 8) | rank as u16;
         for x in 0..SCREEN_W {
-            // Skip only if this BG can't even become the second layer here.
-            if key >= comp.snd_key[x] {
+            // Skip if this BG can't beat the winner (or, when blending, the second).
+            if key >= comp.threshold(x) {
                 continue;
             }
             let bgx = (x + hofs) & (w - 1);
@@ -495,22 +532,22 @@ impl Ppu {
             let a2 = u16::from_le_bytes([self.oam[i * 8 + 4], self.oam[i * 8 + 5]]);
 
             let affine = a0 & 0x100 != 0;
-            if affine {
-                continue; // affine sprites: TODO
-            }
-            if a0 & 0x200 != 0 {
-                continue; // disabled
+            // For non-affine sprites bit 9 = disabled; for affine it = double-size.
+            if !affine && a0 & 0x200 != 0 {
+                continue;
             }
             let shape = ((a0 >> 14) & 3) as usize;
             let size = ((a1 >> 14) & 3) as usize;
             if shape == 3 {
                 continue;
             }
-            let (w, h) = SIZE[shape][size];
+            let (w, h) = SIZE[shape][size]; // texture size
+            let double = affine && a0 & 0x200 != 0;
+            let (bw, bh) = if double { (w * 2, h * 2) } else { (w, h) }; // on-screen box
 
             let y = (a0 & 0xFF) as i32;
             let row = (line as i32 - y) & 0xFF; // 8-bit wrap
-            if row >= h {
+            if row >= bh {
                 continue;
             }
             let mut x = (a1 & 0x1FF) as i32;
@@ -519,27 +556,49 @@ impl Ppu {
             }
 
             let is_8bpp = a0 & 0x2000 != 0;
-            let hflip = a1 & 0x1000 != 0;
-            let vflip = a1 & 0x2000 != 0;
             let base_tile = (a2 & 0x3FF) as usize;
             let priority = ((a2 >> 10) & 3) as u8;
             let pal_bank = ((a2 >> 12) & 0xF) as usize;
             let unit_stride = if is_8bpp { 2 } else { 1 };
             let row_stride = if one_dim { (w / 8) as usize * unit_stride } else { 32 };
 
-            let sy = if vflip { h - 1 - row } else { row };
-            for col in 0..w {
+            // Affine sprites carry a 2x2 matrix from one of 32 OAM parameter
+            // groups (interleaved in the unused attr3 slots); non-affine use flip.
+            let (pa, pb, pc, pd) = if affine {
+                let g = ((a1 >> 9) & 0x1F) as usize * 0x20;
+                let p = |o: usize| i16::from_le_bytes([self.oam[g + o], self.oam[g + o + 1]]) as i32;
+                (p(0x06), p(0x0E), p(0x16), p(0x1E))
+            } else {
+                (0, 0, 0, 0)
+            };
+            let hflip = !affine && a1 & 0x1000 != 0;
+            let vflip = !affine && a1 & 0x2000 != 0;
+
+            for col in 0..bw {
                 let sx = x + col;
                 if sx < 0 || sx >= SCREEN_W as i32 {
                     continue;
                 }
                 let sx = sx as usize;
-                let tex_x = if hflip { w - 1 - col } else { col };
-                let unit = base_tile
-                    + (sy / 8) as usize * row_stride
-                    + (tex_x / 8) as usize * unit_stride;
+                // Map the screen pixel to a texture texel.
+                let (tex_x, tex_y) = if affine {
+                    let ox = col - bw / 2;
+                    let oy = row - bh / 2;
+                    let tx = ((pa * ox + pb * oy) >> 8) + w / 2;
+                    let ty = ((pc * ox + pd * oy) >> 8) + h / 2;
+                    if tx < 0 || ty < 0 || tx >= w || ty >= h {
+                        continue; // outside the texture
+                    }
+                    (tx as usize, ty as usize)
+                } else {
+                    let tx = if hflip { w - 1 - col } else { col };
+                    let ty = if vflip { h - 1 - row } else { row };
+                    (tx as usize, ty as usize)
+                };
+                let unit =
+                    base_tile + (tex_y / 8) * row_stride + (tex_x / 8) * unit_stride;
                 let base = 0x1_0000 + unit * 32;
-                let (px, py) = ((tex_x % 8) as usize, (sy % 8) as usize);
+                let (px, py) = (tex_x % 8, tex_y % 8);
                 let idx = if is_8bpp {
                     self.vram[base + py * 8 + px] as usize
                 } else {
@@ -656,6 +715,26 @@ mod tests {
         p.render_line(0);
         assert_eq!(p.framebuffer[0], 0x03E0, "affine BG2 texel renders");
         assert_eq!(p.framebuffer[7], 0x03E0, "identity transform fills the row");
+    }
+
+    #[test]
+    fn affine_sprite_identity_matches_regular() {
+        let mut p = Ppu::new();
+        put16(&mut p.palram, 0x202, 0x03E0); // OBJ palette[1] = green
+        for i in 0..64 {
+            p.vram[0x1_0000 + i] = 1; // OBJ tile 0 (8bpp), index 1
+        }
+        // OAM sprite 0: affine (a0 bit8), 8x8, y=0, x=0, group 0, tile 0, 8bpp.
+        put16(&mut p.oam, 0, 0x2100); // a0: affine + 256-colour (bit13) + y 0
+        put16(&mut p.oam, 2, 0x0000); // a1: group 0, x 0, size 0
+        put16(&mut p.oam, 4, 0x0000); // a2: tile 0, priority 0
+        // Affine group 0 = identity matrix (PA=PD=1.0, PB=PC=0).
+        put16(&mut p.oam, 0x06, 0x0100); // PA
+        put16(&mut p.oam, 0x1E, 0x0100); // PD
+        p.write_reg16(0x00, 0x1040); // DISPCNT: OBJ on, 1D mapping
+        p.render_line(0);
+        assert_eq!(p.framebuffer[0], 0x03E0, "affine (identity) sprite renders");
+        assert_eq!(p.framebuffer[7], 0x03E0, "identity covers the whole 8px row");
     }
 
     #[test]

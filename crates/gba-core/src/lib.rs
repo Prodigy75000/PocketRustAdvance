@@ -46,6 +46,10 @@ pub struct Gba {
     pub bus: GbaBus,
     /// Diagnostics: how many IRQs the CPU has taken since boot.
     pub irqs_taken: u64,
+    /// Diagnostics: CPU instructions executed since boot.
+    pub steps: u64,
+    /// When false, scanline rendering is skipped (for profiling CPU vs PPU).
+    pub render_enabled: bool,
     /// Interleaved stereo output samples produced this frame (drained by the
     /// front-end via [`Gba::take_audio`]). Silent for now, but emitted at the
     /// correct rate so an audio-synced libretro host paces us to real time —
@@ -78,7 +82,15 @@ impl Gba {
         }
         cpu.reload_pipeline(&mut bus);
 
-        Gba { cpu, bus, irqs_taken: 0, audio: Vec::new(), sample_error: 0 }
+        Gba {
+            cpu,
+            bus,
+            irqs_taken: 0,
+            steps: 0,
+            render_enabled: true,
+            audio: Vec::new(),
+            sample_error: 0,
+        }
     }
 
     /// The audio sample rate reported to the front-end.
@@ -117,8 +129,9 @@ impl Gba {
                     break;
                 }
                 self.cpu.step(&mut self.bus);
+                self.steps += 1;
             }
-            if line < SCREEN_H as u32 {
+            if line < SCREEN_H as u32 && self.render_enabled {
                 self.bus.ppu.render_line(line as usize);
             }
         }
