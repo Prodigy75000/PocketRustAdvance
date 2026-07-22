@@ -179,6 +179,9 @@ fn main() {
             gba.irqs_taken, gba.bus.ie, gba.bus.if_, gba.bus.ime, gba.bus.ppu.dispstat(), gba.cpu.cpsr);
         println!("  BIOS intr flags [0x03FFFFF8]={:08X}  user IRQ handler [0x03FFFFFC]={:08X}",
             iw(0x7FF8), iw(0x7FFC));
+        let rr = |o: u32| gba.bus.ppu.read_reg16(o);
+        println!("  BLDCNT={:04X} BLDALPHA={:04X} BLDY={:04X}  WININ={:04X} WINOUT={:04X} WIN0H={:04X} WIN0V={:04X}",
+            rr(0x50), rr(0x52), rr(0x54), rr(0x48), rr(0x4A), rr(0x40), rr(0x44));
         if std::env::var("GBA_REGS").is_ok() {
             for row in 0..4 {
                 let r = row * 4;

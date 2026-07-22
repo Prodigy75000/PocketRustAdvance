@@ -272,10 +272,38 @@ impl GbaBus {
         }
     }
 
+    /// Fast path for the large linear regions (BIOS/EWRAM/IWRAM/ROM): the region
+    /// slice and the masked offset. `None` for the small side-effect regions
+    /// (I/O, PAL/VRAM/OAM, SRAM), which stay on the byte-compose path.
+    #[inline]
+    fn linear_region(&self, addr: u32) -> Option<(&[u8], usize)> {
+        match (addr >> 24) & 0xF {
+            0x0 => Some((&self.bios, (addr & 0x3FFF) as usize)),
+            0x2 => Some((&self.ewram, (addr & 0x3_FFFF) as usize)),
+            0x3 => Some((&self.iwram, (addr & 0x7FFF) as usize)),
+            0x8..=0xD => Some((&self.rom, (addr & 0x01FF_FFFF) as usize)),
+            _ => None,
+        }
+    }
+
+    #[inline]
     fn read16_raw(&self, addr: u32) -> u16 {
+        // The instruction-fetch/data hot path: one region dispatch, one slice
+        // read, instead of two per-byte dispatches.
+        if let Some((mem, o)) = self.linear_region(addr) {
+            if o + 2 <= mem.len() {
+                return u16::from_le_bytes([mem[o], mem[o + 1]]);
+            }
+        }
         u16::from_le_bytes([self.read8_raw(addr), self.read8_raw(addr + 1)])
     }
+    #[inline]
     fn read32_raw(&self, addr: u32) -> u32 {
+        if let Some((mem, o)) = self.linear_region(addr) {
+            if o + 4 <= mem.len() {
+                return u32::from_le_bytes([mem[o], mem[o + 1], mem[o + 2], mem[o + 3]]);
+            }
+        }
         u32::from_le_bytes([
             self.read8_raw(addr),
             self.read8_raw(addr + 1),
@@ -415,8 +443,16 @@ enum DisplayRegion {
 /// Write the low `width` bytes of `val` little-endian into `mem` at `off`,
 /// wrapping within the slice.
 fn write_le(mem: &mut [u8], off: usize, val: u32, width: u32) {
+    let width = width as usize;
+    // Fast path: the whole value fits without wrapping (the common case).
+    if off + width <= mem.len() {
+        for i in 0..width {
+            mem[off + i] = (val >> (i * 8)) as u8;
+        }
+        return;
+    }
     let len = mem.len();
-    for i in 0..width as usize {
+    for i in 0..width {
         mem[(off + i) % len] = (val >> (i * 8)) as u8;
     }
 }

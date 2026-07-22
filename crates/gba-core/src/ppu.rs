@@ -52,6 +52,82 @@ fn sign_extend_28(v: u32) -> i32 {
     }
 }
 
+/// Per-scanline layer compositor: keeps the top two opaque layers at each pixel
+/// (colour + layer id + a packed (priority, rank) sort key) so the colour
+/// special effects (BLDCNT) can blend the top with the one directly below it.
+/// Layer ids match the BLDCNT target bits: BG0..BG3 = 0..3, OBJ = 4, backdrop
+/// = 5. Smaller key wins; OBJ uses rank 0 to beat a same-priority BG.
+struct Compositor {
+    top_col: [u16; SCREEN_W],
+    top_id: [u8; SCREEN_W],
+    top_key: [u16; SCREEN_W],
+    snd_col: [u16; SCREEN_W],
+    snd_id: [u8; SCREEN_W],
+    snd_key: [u16; SCREEN_W],
+}
+
+impl Compositor {
+    fn new(backdrop: u16) -> Self {
+        let bd_key = (4u16 << 8) | 5; // below every BG/OBJ
+        Compositor {
+            top_col: [backdrop; SCREEN_W],
+            top_id: [5; SCREEN_W],
+            top_key: [bd_key; SCREEN_W],
+            snd_col: [backdrop; SCREEN_W],
+            snd_id: [5; SCREEN_W],
+            snd_key: [bd_key; SCREEN_W],
+        }
+    }
+
+    #[inline]
+    fn place(&mut self, x: usize, col: u16, id: u8, priority: u8, rank: u8) {
+        let key = ((priority as u16) << 8) | rank as u16;
+        if key < self.top_key[x] {
+            self.snd_col[x] = self.top_col[x];
+            self.snd_id[x] = self.top_id[x];
+            self.snd_key[x] = self.top_key[x];
+            self.top_col[x] = col;
+            self.top_id[x] = id;
+            self.top_key[x] = key;
+        } else if key < self.snd_key[x] {
+            self.snd_col[x] = col;
+            self.snd_id[x] = id;
+            self.snd_key[x] = key;
+        }
+    }
+}
+
+#[inline]
+fn channels(c: u16) -> (i32, i32, i32) {
+    ((c & 0x1F) as i32, ((c >> 5) & 0x1F) as i32, ((c >> 10) & 0x1F) as i32)
+}
+#[inline]
+fn pack(r: i32, g: i32, b: i32) -> u16 {
+    (r as u16) | ((g as u16) << 5) | ((b as u16) << 10)
+}
+/// BLDCNT mode 1: `a*EVA/16 + b*EVB/16` per channel, clamped to 31.
+fn blend_alpha(a: u16, b: u16, eva: u16, evb: u16) -> u16 {
+    let (ar, ag, ab) = channels(a);
+    let (br, bg, bb) = channels(b);
+    let (ea, eb) = (eva as i32, evb as i32);
+    let f = |x: i32, y: i32| ((x * ea + y * eb) / 16).min(31);
+    pack(f(ar, br), f(ag, bg), f(ab, bb))
+}
+/// BLDCNT mode 2: brighten toward white by EVY/16.
+fn brighten(a: u16, evy: u16) -> u16 {
+    let (r, g, b) = channels(a);
+    let e = evy as i32;
+    let f = |x: i32| x + ((31 - x) * e) / 16;
+    pack(f(r), f(g), f(b))
+}
+/// BLDCNT mode 3: darken toward black by EVY/16.
+fn darken(a: u16, evy: u16) -> u16 {
+    let (r, g, b) = channels(a);
+    let e = evy as i32;
+    let f = |x: i32| x - (x * e) / 16;
+    pack(f(r), f(g), f(b))
+}
+
 impl Default for Ppu {
     fn default() -> Self {
         Ppu {
@@ -237,18 +313,12 @@ impl Ppu {
     /// priority. Mode 0 is four text BGs; mode 1 is BG0/BG1 text + BG2 affine;
     /// mode 2 is BG2/BG3 affine.
     fn render_tiled(&mut self, line: usize, mode: u16, dispcnt: u16) {
-        let backdrop = self.backdrop();
-        let mut out = [backdrop; SCREEN_W];
-        // Per-pixel winning (priority, rank); rank orders same-priority layers
-        // with OBJ = 0 on top, then BG0..BG3.
-        let mut win_prio = [4u8; SCREEN_W];
-        let mut win_rank = [5u8; SCREEN_W];
+        let mut comp = Compositor::new(self.backdrop());
 
         for bg in 0..4 {
             if dispcnt & (1 << (8 + bg)) == 0 {
                 continue;
             }
-            // Which layer type each BG is, per mode. `None` = disabled in mode.
             let text = match mode {
                 0 => true,
                 1 => bg < 2, // BG0/BG1 text, BG2 affine, BG3 unused
@@ -260,30 +330,46 @@ impl Ppu {
                 _ => false,
             };
             if text {
-                self.text_bg_line(bg, line, &mut out, &mut win_prio, &mut win_rank);
+                self.text_bg_line(bg, line, &mut comp);
             } else if affine {
-                self.affine_bg_line(bg, &mut out, &mut win_prio, &mut win_rank);
+                self.affine_bg_line(bg, &mut comp);
             }
         }
 
         if dispcnt & 0x1000 != 0 {
-            self.sprite_line(line, dispcnt, &mut out, &mut win_prio, &mut win_rank);
+            self.sprite_line(line, dispcnt, &mut comp);
         }
 
-        self.framebuffer[line * SCREEN_W..(line + 1) * SCREEN_W].copy_from_slice(&out);
+        // Apply the colour special effects (BLDCNT) to the composited top layer.
+        let bldcnt = self.regs[0x50 / 2];
+        let mode = (bldcnt >> 6) & 3;
+        let first = bldcnt & 0x3F; // 1st-target layer mask
+        let second = (bldcnt >> 8) & 0x3F; // 2nd-target layer mask
+        let bldalpha = self.regs[0x52 / 2];
+        let eva = (bldalpha & 0x1F).min(16);
+        let evb = ((bldalpha >> 8) & 0x1F).min(16);
+        let evy = (self.regs[0x54 / 2] & 0x1F).min(16);
+
+        let dst = &mut self.framebuffer[line * SCREEN_W..(line + 1) * SCREEN_W];
+        for x in 0..SCREEN_W {
+            let tc = comp.top_col[x];
+            let first_hit = first & (1 << comp.top_id[x]) != 0;
+            dst[x] = match mode {
+                1 if first_hit && second & (1 << comp.snd_id[x]) != 0 => {
+                    blend_alpha(tc, comp.snd_col[x], eva, evb)
+                }
+                2 if first_hit => brighten(tc, evy),
+                3 if first_hit => darken(tc, evy),
+                _ => tc,
+            };
+        }
     }
 
     /// Composite one affine background's scanline. BG2/BG3 (`bg` = 2/3) are
     /// 8bpp, 256-colour, using the internal reference point (already advanced to
     /// this scanline) plus PA/PC per pixel. Outside the map: transparent, or
     /// wrapped when the overflow bit is set.
-    fn affine_bg_line(
-        &self,
-        bg: usize,
-        out: &mut [u16; SCREEN_W],
-        win_prio: &mut [u8; SCREEN_W],
-        win_rank: &mut [u8; SCREEN_W],
-    ) {
+    fn affine_bg_line(&self, bg: usize, comp: &mut Compositor) {
         let cnt = self.regs[0x08 / 2 + bg]; // BGxCNT
         let priority = (cnt & 3) as u8;
         let rank = bg as u8 + 1;
@@ -299,19 +385,20 @@ impl Ppu {
         let pc = self.regs[pbase + 2] as i16 as i32; // dy per pixel
         let (mut cx, mut cy) = (self.bg_ref[idx][0], self.bg_ref[idx][1]);
 
+        let key = ((priority as u16) << 8) | rank as u16;
         for x in 0..SCREEN_W {
-            if (priority, rank) >= (win_prio[x], win_rank[x]) {
-                cx = cx.wrapping_add(pa);
-                cy = cy.wrapping_add(pc);
-                continue;
-            }
+            let visible = key < comp.snd_key[x]; // could still land as 1st or 2nd
             let mut tx = cx >> 8;
             let mut ty = cy >> 8;
             cx = cx.wrapping_add(pa);
             cy = cy.wrapping_add(pc);
+            if !visible {
+                continue;
+            }
             if wrap {
-                tx = tx.rem_euclid(map_px);
-                ty = ty.rem_euclid(map_px);
+                // Map dimensions are always powers of two, so wrap with a mask.
+                tx &= map_px - 1;
+                ty &= map_px - 1;
             } else if tx < 0 || ty < 0 || tx >= map_px || ty >= map_px {
                 continue; // outside the map, transparent
             }
@@ -321,22 +408,14 @@ impl Ppu {
             if pal == 0 {
                 continue; // transparent
             }
-            out[x] =
+            let color =
                 u16::from_le_bytes([self.palram[pal * 2], self.palram[pal * 2 + 1]]) & 0x7FFF;
-            win_prio[x] = priority;
-            win_rank[x] = rank;
+            comp.place(x, color, bg as u8, priority, rank);
         }
     }
 
-    /// Composite one text background's scanline into the pixel buffers.
-    fn text_bg_line(
-        &self,
-        bg: usize,
-        line: usize,
-        out: &mut [u16; SCREEN_W],
-        win_prio: &mut [u8; SCREEN_W],
-        win_rank: &mut [u8; SCREEN_W],
-    ) {
+    /// Composite one text background's scanline into the compositor.
+    fn text_bg_line(&self, bg: usize, line: usize, comp: &mut Compositor) {
         let cnt = self.regs[0x08 / 2 + bg]; // BGxCNT
         let priority = (cnt & 3) as u8;
         let rank = bg as u8 + 1;
@@ -357,9 +436,10 @@ impl Ppu {
         let ty = (bgy % 256) / 8;
         let py = bgy % 8;
 
+        let key = ((priority as u16) << 8) | rank as u16;
         for x in 0..SCREEN_W {
-            // A pixel already fully on top of this BG can't be beaten by it.
-            if (priority, rank) >= (win_prio[x], win_rank[x]) {
+            // Skip only if this BG can't even become the second layer here.
+            if key >= comp.snd_key[x] {
                 continue;
             }
             let bgx = (x + hofs) & (w - 1);
@@ -392,21 +472,14 @@ impl Ppu {
             } else {
                 ((entry >> 12) & 0xF) as usize * 16 + idx
             };
-            out[x] = u16::from_le_bytes([self.palram[pal * 2], self.palram[pal * 2 + 1]]) & 0x7FFF;
-            win_prio[x] = priority;
-            win_rank[x] = rank;
+            let color =
+                u16::from_le_bytes([self.palram[pal * 2], self.palram[pal * 2 + 1]]) & 0x7FFF;
+            comp.place(x, color, bg as u8, priority, rank);
         }
     }
 
     /// Composite the regular (non-affine) sprites for one scanline.
-    fn sprite_line(
-        &self,
-        line: usize,
-        dispcnt: u16,
-        out: &mut [u16; SCREEN_W],
-        win_prio: &mut [u8; SCREEN_W],
-        win_rank: &mut [u8; SCREEN_W],
-    ) {
+    fn sprite_line(&self, line: usize, dispcnt: u16, comp: &mut Compositor) {
         const SIZE: [[(i32, i32); 4]; 3] = [
             [(8, 8), (16, 16), (32, 32), (64, 64)],  // square
             [(16, 8), (32, 8), (32, 16), (64, 32)],  // horizontal
@@ -484,12 +557,8 @@ impl Ppu {
                 let pal = 0x100 + if is_8bpp { idx } else { pal_bank * 16 + idx };
                 let color =
                     u16::from_le_bytes([self.palram[pal * 2], self.palram[pal * 2 + 1]]) & 0x7FFF;
-                // OBJ beats a BG of equal priority (rank 0).
-                if (priority, 0u8) < (win_prio[sx], win_rank[sx]) {
-                    out[sx] = color;
-                    win_prio[sx] = priority;
-                    win_rank[sx] = 0;
-                }
+                // OBJ (layer id 4) beats a BG of equal priority (rank 0).
+                comp.place(sx, color, 4, priority, 0);
             }
         }
     }
@@ -553,6 +622,20 @@ mod tests {
         p.write_reg16(0x00, 0x1140); // DISPCNT: mode 0, BG0 + OBJ, 1D
         p.render_line(0);
         assert_eq!(p.framebuffer[0], 0x03E0, "OBJ wins over BG at equal priority");
+    }
+
+    #[test]
+    fn blend_effects_math() {
+        // Alpha: red*8/16 + blue*8/16 -> (15,0,15).
+        assert_eq!(blend_alpha(0x001F, 0x7C00, 8, 8), pack(15, 0, 15));
+        // Alpha clamps each channel to 31 (white + white at full weight).
+        assert_eq!(blend_alpha(0x7FFF, 0x7FFF, 16, 16), pack(31, 31, 31));
+        // Darken red by half: 31 - 31*8/16 = 16.
+        assert_eq!(darken(0x001F, 8), pack(16, 0, 0));
+        // Brighten red by half: R stays 31, G/B rise 0 -> 15.
+        assert_eq!(brighten(0x001F, 8), pack(31, 15, 15));
+        // EVY = 0 is a no-op.
+        assert_eq!(darken(0x1234 & 0x7FFF, 0), 0x1234 & 0x7FFF);
     }
 
     #[test]
