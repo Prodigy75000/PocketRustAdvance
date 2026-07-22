@@ -1,0 +1,10 @@
+# Build artifacts (the umbrella workspace builds to TrophyHub/target).
+/target/
+target/
+
+# TomHarte conformance vectors: ~832 MB, downloaded from SingleStepTests/ARM7TDMI.
+tests/vectors/
+
+# Generated frame dumps from the gba runner.
+*.png
+gba_frame.png

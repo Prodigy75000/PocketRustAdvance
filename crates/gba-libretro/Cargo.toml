@@ -1,0 +1,14 @@
+[package]
+name = "gba-libretro"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# cdylib -> libgbacore_libretro.so; renamed to the libretro convention on deploy
+# (pocketrust_gba). Deploys to Trophy Hub as a separate .so from the GB core.
+name = "gbacore_libretro"
+crate-type = ["cdylib"]
+
+[dependencies]
+gba-core = { path = "../gba-core" }
+pocketrust-common = { path = "../../../pocketrust-common" }

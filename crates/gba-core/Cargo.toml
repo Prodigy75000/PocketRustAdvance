@@ -1,0 +1,12 @@
+[package]
+name = "gba-core"
+version = "0.1.0"
+edition = "2021"
+description = "A clean-room Game Boy Advance emulator core, written from scratch in Rust."
+
+[lib]
+name = "gba_core"
+path = "src/lib.rs"
+
+[dependencies]
+pocketrust-common = { path = "../../../pocketrust-common" }
