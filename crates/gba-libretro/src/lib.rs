@@ -12,7 +12,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 use gba_core::{Button, Gba, SCREEN_H, SCREEN_W};
-use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void};
 use std::ptr;
 
@@ -109,12 +109,23 @@ impl State {
     }
 }
 
-thread_local! {
-    static STATE: RefCell<State> = const { RefCell::new(State::new()) };
-}
+/// Trophy Hub's libretro host registers callbacks (env, video, audio, input) on
+/// its main thread but runs frames on a dedicated emulation thread. So the state
+/// must be a single process-global, not thread-local — otherwise `retro_run`
+/// sees a fresh empty state with null callbacks (black screen, no audio). This
+/// mirrors how C libretro cores keep their state in plain `static`s.
+struct GlobalState(UnsafeCell<State>);
+
+// SAFETY: libretro serializes every call into the core — `retro_run`, the
+// `retro_set_*` registrations and load/unload never overlap — so there is never
+// concurrent access to the single STATE instance.
+unsafe impl Sync for GlobalState {}
+
+static STATE: GlobalState = GlobalState(UnsafeCell::new(State::new()));
 
 fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
-    STATE.with(|s| f(&mut s.borrow_mut()))
+    // SAFETY: see `GlobalState` — accesses are serialized by the frontend.
+    unsafe { f(&mut *STATE.0.get()) }
 }
 
 /// Expand a GBA RGB555 pixel (0bbbbbggggggrrrrr) into host XRGB8888.
