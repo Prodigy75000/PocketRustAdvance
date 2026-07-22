@@ -47,6 +47,12 @@ pub struct Gba {
     pub steps: u64,
     /// When false, scanline rendering is skipped (for profiling CPU vs PPU).
     pub render_enabled: bool,
+    /// A fixed-rate audio clock: it advances by exactly one scanline's worth of
+    /// cycles per rendered line, independent of `bus.cycles` (which our timing
+    /// model inflates whenever DMA runs). Direct Sound is paced off this so a
+    /// heavy graphics-DMA frame can't over-pump the FIFO and run the sample-buffer
+    /// pointer off the end (which played garbage during screen transitions).
+    audio_clock: u64,
 }
 
 impl Gba {
@@ -78,6 +84,7 @@ impl Gba {
             irqs_taken: 0,
             steps: 0,
             render_enabled: true,
+            audio_clock: 0,
         }
     }
 
@@ -109,10 +116,11 @@ impl Gba {
         }
         self.cpu.deserialize(&mut r);
         self.bus.deserialize(&mut r);
-        // Resume audio from the restored clock, not from wherever the APU's own
-        // cycle landed (a pre-APU state leaves it at 0, which would burst).
-        let now = self.bus.cycles;
-        self.bus.apu.resync(now);
+        // Align the fixed audio clock to the APU's restored position (its own
+        // clock domain, independent of bus.cycles) so audio resumes seamlessly
+        // and deterministically. A pre-APU state leaves the APU at 0, which is
+        // fine: audio simply restarts from 0 rather than bursting a backlog.
+        self.audio_clock = self.bus.apu.cycle();
         !r.failed
     }
 
@@ -157,10 +165,11 @@ impl Gba {
             }
             // Generate this line's audio (one stereo sample per 512 cycles) from
             // the APU state as it stands after the line's CPU work, then let the
-            // sound DMA top up any Direct Sound FIFO that has drained.
+            // sound DMA top up any Direct Sound FIFO that has drained. Paced off
+            // the fixed audio clock, not bus.cycles, so DMA can't inflate the rate.
+            self.audio_clock += ppu::CYCLES_PER_LINE as u64;
             let periods = [self.bus.ds_timer_period(0), self.bus.ds_timer_period(1)];
-            let target = self.bus.cycles;
-            self.bus.apu.generate(periods, target);
+            self.bus.apu.generate(periods, self.audio_clock);
             self.bus.refill_fifos();
         }
 

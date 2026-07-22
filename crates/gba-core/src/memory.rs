@@ -40,6 +40,8 @@ pub struct GbaBus {
     pub cur_pc: u32,
     pub watch_addr: u32,
     pub watch_hits: Vec<(u32, u32, u32)>,
+    /// Debug counter: sound-FIFO DMA refills (4-word transfers) since boot.
+    pub dbg_fifo_refills: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -114,6 +116,7 @@ impl GbaBus {
             cur_pc: 0,
             watch_addr: 0,
             watch_hits: Vec::new(),
+            dbg_fifo_refills: 0,
         }
     }
 
@@ -205,6 +208,14 @@ impl GbaBus {
             }
             prev_overflows = overflows;
         }
+    }
+
+    /// Debug: a DMA channel's live (latched) source and its control-register
+    /// snapshot, plus the current per-channel running source. For diagnosing the
+    /// sound FIFO DMA (channels 1/2).
+    pub fn dma_dbg(&self, ch: usize) -> (u32, u32, u16, u32) {
+        let base = 0xB0 + ch as u32 * 12;
+        (self.io_u32(base) & 0x0FFF_FFFF, self.io_u32(base + 4) & 0x0FFF_FFFF, self.io_u16(base + 10), self.dma_src[ch])
     }
 
     /// The overflow period (in system cycles) of timer `ch`, or `None` if it is
@@ -349,6 +360,7 @@ impl GbaBus {
     /// fixed FIFO port. The word count and destination-fixed behaviour are forced
     /// by the hardware regardless of the channel's programmed count/dest-control.
     fn run_sound_dma(&mut self, ch: usize, dst: u32) {
+        self.dbg_fifo_refills += 1;
         let base = 0xB0 + ch as u32 * 12;
         let control = self.io_u16(base + 10);
         let src_ctrl = (control >> 7) & 3;

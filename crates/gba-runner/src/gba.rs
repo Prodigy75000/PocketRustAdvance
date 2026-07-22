@@ -234,6 +234,8 @@ fn main() {
     // did to the sound registers / DISPCNT around a screen transition.
     let apulog = std::env::var_os("GBA_APULOG").is_some();
     let mut prev_sound = (0u8, 0u16, 0u16, 0u16);
+    let (mut lp, mut lu, mut lr) = (0u64, 0u64, 0u64);
+    let mut lirq = 0u64;
     for f in 0..frames {
         if autoinput {
             let p = f % 24 < 4; // pulse A + Start to advance title and dialogue
@@ -255,14 +257,32 @@ fn main() {
             let sl = u16::from_le_bytes([gba.bus.apu.read8(0x80), gba.bus.apu.read8(0x81)]);
             let sh = u16::from_le_bytes([gba.bus.apu.read8(0x82), gba.bus.apu.read8(0x83)]);
             let dispcnt = gba.bus.ppu.read_reg16(0);
+            let irqd = gba.irqs_taken.wrapping_sub(lirq);
+            lirq = gba.irqs_taken;
+            let (pops, und, refs) =
+                (gba.bus.apu.dbg_pops, gba.bus.apu.dbg_underruns, gba.bus.dbg_fifo_refills);
+            let (dp, du, dr) = (pops - lp, und - lu, refs - lr);
+            lp = pops;
+            lu = und;
+            lr = refs;
+            let per = gba.bus.ds_timer_period(0);
+            let rate = per.map(|p| 16_777_216 / p.max(1)).unwrap_or(0);
             let cur = (sx, sl, sh, dispcnt);
-            if cur != prev_sound || blip > 6000 {
+            if cur != prev_sound || blip > 6000 || du > 0 {
+                let (s1, _d1, c1, r1) = gba.bus.dma_dbg(1);
                 println!(
-                    "  f{f:>4} blip={blip:>5} SOUNDCNT_X={sx:02X} _L={sl:04X} _H={sh:04X} DISPCNT={dispcnt:04X} fifoA={} fifoB={}",
+                    "  f{f:>4} blip={blip:>5} H={sh:04X} DISP={dispcnt:04X} fA={:>2} irq={irqd:>2} T0rate={rate:>5} pops={dp:>4} under={du:>4} refills={dr:>3} | DMA1 sad={s1:07X}->run{r1:07X} ctl={c1:04X}",
                     gba.bus.apu.fifo_a_len(),
-                    gba.bus.apu.fifo_b_len()
                 );
                 prev_sound = cur;
+                if blip > 7000 {
+                    // Dump the sample buffer the sound DMA is sourcing, as signed
+                    // bytes, to see whether it is plausible PCM or garbage.
+                    let (_, _, _, run) = gba.bus.dma_dbg(1);
+                    let bytes: Vec<i32> =
+                        (0..24).map(|k| gba.bus.read8(run + k, Access::NonSeq) as i8 as i32).collect();
+                    println!("      run@{run:07X}: {bytes:?}");
+                }
             }
         }
         audio.extend(a);

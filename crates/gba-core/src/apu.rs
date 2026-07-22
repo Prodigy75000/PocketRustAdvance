@@ -373,6 +373,11 @@ pub struct Apu {
 
     cycle: u64,
     out: Vec<i16>,
+
+    // Debug counters (cumulative): FIFO pops that had data, and pops that found
+    // the FIFO empty (underruns), summed across both Direct Sound channels.
+    pub dbg_pops: u64,
+    pub dbg_underruns: u64,
 }
 
 impl Default for Apu {
@@ -401,6 +406,8 @@ impl Default for Apu {
             ma_r: 0,
             cycle: 0,
             out: Vec::new(),
+            dbg_pops: 0,
+            dbg_underruns: 0,
         }
     }
 }
@@ -412,6 +419,11 @@ impl Apu {
 
     pub fn take_output(&mut self) -> Vec<i16> {
         std::mem::take(&mut self.out)
+    }
+
+    /// The APU's current position on the (fixed-rate) audio clock.
+    pub fn cycle(&self) -> u64 {
+        self.cycle
     }
 
     /// Align the APU's clock to `cycle` (dropping any FIFO-pop backlog). Called
@@ -683,6 +695,9 @@ impl Apu {
                 } else {
                     self.ds_a = s;
                 }
+                self.dbg_pops += 1;
+            } else {
+                self.dbg_underruns += 1;
             }
             next += period;
         }
