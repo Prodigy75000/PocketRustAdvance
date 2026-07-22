@@ -265,6 +265,13 @@ fn main() {
             }
         }
         println!("  OAM: {normal} normal, {affine} affine, {objwin} obj-window sprites");
+        {
+            use gba_core::save::SaveKind;
+            let sv = &gba.bus.save;
+            let nonzero = sv.data.iter().filter(|&&b| b != 0).count();
+            println!("  SAVE: kind={:?} size={} nonzero={nonzero}  data[0..16]={:02X?}",
+                sv.kind, sv.data.len(), &sv.data[..sv.data.len().min(16)]);
+        }
         // Palette dump (to spot a washed/faded/duplicated palette).
         let pe = |i: usize| u16::from_le_bytes([gba.bus.ppu.palram[i * 2], gba.bus.ppu.palram[i * 2 + 1]]);
         let row = |base: usize| {
