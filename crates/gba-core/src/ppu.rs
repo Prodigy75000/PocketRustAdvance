@@ -43,6 +43,11 @@ const BG2_PA: usize = 0x20 >> 1; // PA,PB,PC,PD at BG2_PA..+3
 const BG2_X: usize = 0x28 >> 1; // BG2X (lo,hi) at BG2_X, BG2_X+1; BG2Y at +2,+3
 const BG3_PA: usize = 0x30 >> 1;
 const BG3_X: usize = 0x38 >> 1;
+// Window register indices.
+const WIN0H: usize = 0x40 >> 1;
+const WIN0V: usize = 0x44 >> 1;
+const WININ: usize = 0x48 >> 1;
+const WINOUT: usize = 0x4A >> 1;
 
 /// Sign-extend a 28-bit affine reference coordinate to i32.
 fn sign_extend_28(v: u32) -> i32 {
@@ -68,6 +73,9 @@ struct Compositor {
     snd_key: [u16; SCREEN_W],
     /// Track the second layer only when a colour effect needs it (blending on).
     track_second: bool,
+    /// Per-pixel window mask: bits 0-4 enable BG0-3/OBJ, bit 5 the colour effect.
+    /// All-ones (0x3F) when no window is active.
+    win_mask: [u8; SCREEN_W],
 }
 
 impl Compositor {
@@ -81,6 +89,7 @@ impl Compositor {
             snd_id: [5; SCREEN_W],
             snd_key: [bd_key; SCREEN_W],
             track_second,
+            win_mask: [0x3F; SCREEN_W],
         }
     }
 
@@ -97,6 +106,10 @@ impl Compositor {
 
     #[inline]
     fn place(&mut self, x: usize, col: u16, id: u8, priority: u8, rank: u8) {
+        // A layer disabled by the window here contributes nothing.
+        if self.win_mask[x] & (1 << id) == 0 {
+            return;
+        }
         let key = ((priority as u16) << 8) | rank as u16;
         if key < self.top_key[x] {
             if self.track_second {
@@ -336,6 +349,11 @@ impl Ppu {
         let blend_mode = if self.no_blend { 0 } else { (bldcnt >> 6) & 3 };
         let mut comp = Compositor::new(self.backdrop(), blend_mode != 0);
 
+        // Window layer/effect masking (DISPCNT bits 13/14/15 enable win0/1/obj).
+        if dispcnt & 0xE000 != 0 {
+            self.build_window_mask(line, dispcnt, &mut comp.win_mask);
+        }
+
         // Gather the enabled BGs and render them front-to-back (by priority,
         // then BG index) so covered pixels are pruned by the skip check.
         let mut layers: [(u8, usize, bool); 4] = [(0, 0, false); 4];
@@ -390,7 +408,9 @@ impl Ppu {
 
         for x in 0..SCREEN_W {
             let tc = comp.top_col[x];
-            let first_hit = first & (1 << comp.top_id[x]) != 0;
+            // The colour effect only runs where the window enables it (bit 5).
+            let effect = comp.win_mask[x] & 0x20 != 0;
+            let first_hit = effect && first & (1 << comp.top_id[x]) != 0;
             dst[x] = match blend_mode {
                 1 if first_hit && second & (1 << comp.snd_id[x]) != 0 => {
                     blend_alpha(tc, comp.snd_col[x], eva, evb)
@@ -399,6 +419,43 @@ impl Ppu {
                 3 if first_hit => darken(tc, evy),
                 _ => tc,
             };
+        }
+    }
+
+    /// Fill `mask` with the per-pixel window layer/effect bits for this scanline.
+    /// Priority: WIN0 > WIN1 > (OBJ window, TODO) > outside. Each region's 6-bit
+    /// value enables BG0-3/OBJ (bits 0-4) and the colour effect (bit 5).
+    fn build_window_mask(&self, line: usize, dispcnt: u16, mask: &mut [u8; SCREEN_W]) {
+        let winout = self.regs[WINOUT];
+        mask.fill((winout & 0x3F) as u8); // default: outside all windows
+        let winin = self.regs[WININ];
+
+        // Apply WIN1 first, then WIN0 on top (WIN0 has the higher priority).
+        for (enable_bit, m, hreg, vreg) in [
+            (14u16, winin >> 8, WIN0H + 1, WIN0V + 1), // WIN1H=0x42, WIN1V=0x46
+            (13u16, winin, WIN0H, WIN0V),
+        ] {
+            if dispcnt & (1 << enable_bit) == 0 {
+                continue;
+            }
+            let h = self.regs[hreg];
+            let v = self.regs[vreg];
+            let x1 = (h >> 8) as usize;
+            let mut x2 = (h & 0xFF) as usize;
+            if x2 > SCREEN_W || x2 < x1 {
+                x2 = SCREEN_W;
+            }
+            let y1 = (v >> 8) as usize;
+            let mut y2 = (v & 0xFF) as usize;
+            if y2 > SCREEN_H || y2 < y1 {
+                y2 = SCREEN_H;
+            }
+            if line >= y1 && line < y2 {
+                let val = (m & 0x3F) as u8;
+                for cell in mask.iter_mut().take(x2).skip(x1) {
+                    *cell = val;
+                }
+            }
         }
     }
 
@@ -534,6 +591,11 @@ impl Ppu {
             let affine = a0 & 0x100 != 0;
             // For non-affine sprites bit 9 = disabled; for affine it = double-size.
             if !affine && a0 & 0x200 != 0 {
+                continue;
+            }
+            // OBJ mode (bits 10-11): 2 = OBJ-window (defines a region, not drawn),
+            // 3 = prohibited. Neither renders as a visible sprite.
+            if matches!((a0 >> 10) & 3, 2 | 3) {
                 continue;
             }
             let shape = ((a0 >> 14) & 3) as usize;
@@ -715,6 +777,29 @@ mod tests {
         p.render_line(0);
         assert_eq!(p.framebuffer[0], 0x03E0, "affine BG2 texel renders");
         assert_eq!(p.framebuffer[7], 0x03E0, "identity transform fills the row");
+    }
+
+    #[test]
+    fn window0_masks_a_background() {
+        let mut p = Ppu::new();
+        put16(&mut p.palram, 0, 0x0000); // backdrop = black
+        put16(&mut p.palram, 2, 0x001F); // BG palette[1] = red
+        for i in 0..32 {
+            p.vram[i] = 0x11; // tile 0 = index 1 everywhere
+        }
+        put16(&mut p.vram, 0x800, 0); // map entry 0 -> tile 0
+        p.write_reg16(0x08, 0x0100); // BG0CNT
+        p.write_reg16(0x00, 0x2100); // DISPCNT: mode 0, BG0 on, WIN0 enable
+        p.write_reg16(0x40, 0x0206); // WIN0H: x in [2,6)
+        p.write_reg16(0x44, 0x0008); // WIN0V: y in [0,8)
+        p.write_reg16(0x48, 0x0000); // WININ: inside win0, no layers
+        p.write_reg16(0x4A, 0x003F); // WINOUT: outside, all layers
+        p.render_line(0);
+        assert_eq!(p.framebuffer[0], 0x001F, "outside window: BG shows");
+        assert_eq!(p.framebuffer[1], 0x001F, "outside window: BG shows");
+        assert_eq!(p.framebuffer[2], 0x0000, "inside window: BG masked -> backdrop");
+        assert_eq!(p.framebuffer[5], 0x0000, "inside window: BG masked -> backdrop");
+        assert_eq!(p.framebuffer[6], 0x001F, "past window: BG shows again");
     }
 
     #[test]
