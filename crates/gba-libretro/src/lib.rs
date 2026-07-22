@@ -276,8 +276,14 @@ pub extern "C" fn retro_run() {
             }
         }
 
-        // Audio is not produced yet; nothing to feed the host.
-        let _ = s.audio_batch;
+        // Feed this frame's audio (interleaved stereo i16). Silent for now, but
+        // emitted at the correct rate so the host paces us to real time.
+        if let (Some(gba), Some(audio)) = (&mut s.gba, s.audio_batch) {
+            let samples = gba.take_audio();
+            if !samples.is_empty() {
+                unsafe { audio(samples.as_ptr(), samples.len() / 2) };
+            }
+        }
     });
 }
 

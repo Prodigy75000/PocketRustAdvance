@@ -33,11 +33,26 @@ pub enum Button {
 }
 
 /// A whole console: the CPU plus the system bus.
+/// Audio output rate. The GBA's own sound hardware runs at 32768 Hz; the value
+/// only needs to match [`Gba::SAMPLE_RATE`] and the AV-info the front-end reads.
+const SAMPLE_RATE: u64 = 32_768;
+/// GBA system clock (cycles per second).
+const CLOCK: u64 = 16_777_216;
+/// Cycles per rendered frame (228 scanlines).
+const CYCLES_PER_FRAME: u64 = TOTAL_LINES as u64 * ppu::CYCLES_PER_LINE as u64;
+
 pub struct Gba {
     pub cpu: Arm7tdmi,
     pub bus: GbaBus,
     /// Diagnostics: how many IRQs the CPU has taken since boot.
     pub irqs_taken: u64,
+    /// Interleaved stereo output samples produced this frame (drained by the
+    /// front-end via [`Gba::take_audio`]). Silent for now, but emitted at the
+    /// correct rate so an audio-synced libretro host paces us to real time —
+    /// without this the host free-runs at the display refresh (double speed).
+    audio: Vec<i16>,
+    /// Fractional-sample accumulator (in clock-cycle units) for an exact rate.
+    sample_error: u64,
 }
 
 impl Gba {
@@ -63,7 +78,15 @@ impl Gba {
         }
         cpu.reload_pipeline(&mut bus);
 
-        Gba { cpu, bus, irqs_taken: 0 }
+        Gba { cpu, bus, irqs_taken: 0, audio: Vec::new(), sample_error: 0 }
+    }
+
+    /// The audio sample rate reported to the front-end.
+    pub const SAMPLE_RATE: u32 = SAMPLE_RATE as u32;
+
+    /// Drain this frame's interleaved-stereo samples for the front-end.
+    pub fn take_audio(&mut self) -> Vec<i16> {
+        std::mem::take(&mut self.audio)
     }
 
     /// Run one full frame (228 scanlines) and return the RGB555 framebuffer.
@@ -99,6 +122,16 @@ impl Gba {
                 self.bus.ppu.render_line(line as usize);
             }
         }
+
+        // Emit this frame's audio at exactly SAMPLE_RATE (integer accumulator):
+        // samples_this_frame = SAMPLE_RATE * CYCLES_PER_FRAME / CLOCK, carrying
+        // the remainder so the long-run average is exact. Silent until the APU
+        // exists — the point right now is pacing the host.
+        self.sample_error += SAMPLE_RATE * CYCLES_PER_FRAME;
+        let n = self.sample_error / CLOCK;
+        self.sample_error %= CLOCK;
+        self.audio.extend(std::iter::repeat(0).take(n as usize * 2)); // stereo
+
         &self.bus.ppu.framebuffer
     }
 
