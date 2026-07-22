@@ -20,7 +20,7 @@ pub const CYCLES_PER_LINE: u32 = DOTS_PER_LINE * CYCLES_PER_DOT; // 1232
 
 pub struct Ppu {
     /// LCD I/O registers 0x04000000..0x04000060 as halfwords.
-    regs: [u16; 0x30],
+    regs: [u16; 0x40],
     pub vram: Box<[u8]>,   // 96 KB
     pub palram: Box<[u8]>, // 1 KB
     pub oam: Box<[u8]>,    // 1 KB
@@ -36,7 +36,7 @@ const VCOUNT: usize = 0x06 >> 1;
 impl Default for Ppu {
     fn default() -> Self {
         Ppu {
-            regs: [0; 0x30],
+            regs: [0; 0x40],
             vram: vec![0; 96 * 1024].into_boxed_slice(),
             palram: vec![0; 1024].into_boxed_slice(),
             oam: vec![0; 1024].into_boxed_slice(),
@@ -53,7 +53,7 @@ impl Ppu {
     // --- LCD I/O registers (0x04000000..0x04000060) ---------------------------
 
     pub fn read_reg16(&self, offset: u32) -> u16 {
-        self.regs[(offset as usize >> 1) & 0x2F]
+        self.regs[(offset as usize >> 1) & 0x3F]
     }
 
     /// Current DISPSTAT (for the interrupt controller's LCD IRQ decisions).
@@ -62,7 +62,7 @@ impl Ppu {
     }
 
     pub fn write_reg16(&mut self, offset: u32, val: u16) {
-        let i = (offset as usize >> 1) & 0x2F;
+        let i = (offset as usize >> 1) & 0x3F;
         match i {
             VCOUNT => {} // read-only
             DISPSTAT => {
@@ -436,5 +436,21 @@ mod tests {
         p.write_reg16(0x00, 0x1140); // DISPCNT: mode 0, BG0 + OBJ, 1D
         p.render_line(0);
         assert_eq!(p.framebuffer[0], 0x03E0, "OBJ wins over BG at equal priority");
+    }
+
+    #[test]
+    fn affine_regs_do_not_alias_control_regs() {
+        // Regression: a bad index mask (& 0x2F) folded the affine parameters at
+        // 0x20..0x3F onto the LCD control registers at 0x00..0x1F. Writing BG2PC
+        // (0x24) then wiped DISPSTAT (0x04), stalling any game that enabled a
+        // VBlank IRQ after setting up an affine background (e.g. Mario & Luigi).
+        let mut p = Ppu::new();
+        p.write_reg16(0x04, 0x0008); // DISPSTAT: VBlank IRQ enable
+        p.write_reg16(0x24, 0x0000); // BG2PC = 0
+        p.write_reg16(0x20, 0x0100); // BG2PA
+        assert_eq!(p.dispstat() & 0x0008, 0x0008, "DISPSTAT survives affine writes");
+        assert_eq!(p.read_reg16(0x00), 0x0000, "DISPCNT not touched by BG2PA");
+        assert_eq!(p.read_reg16(0x24), 0x0000, "BG2PC read back independently");
+        assert_eq!(p.read_reg16(0x20), 0x0100, "BG2PA read back independently");
     }
 }

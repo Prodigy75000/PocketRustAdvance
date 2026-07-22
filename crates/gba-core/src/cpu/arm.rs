@@ -56,7 +56,7 @@ pub fn execute<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool {
         0b01 => single_data_transfer(cpu, bus, op), // LDR / STR
         0b10 if (op >> 25) & 1 == 1 => branch(cpu, op), // B / BL (bits 27..25 = 101)
         0b10 => block_data_transfer(cpu, bus, op), // LDM / STM (bits 27..25 = 100)
-        0b11 if (op >> 24) & 0xF == 0xF => software_interrupt(cpu), // SWI
+        0b11 if (op >> 24) & 0xF == 0xF => software_interrupt(cpu, bus, op), // SWI
         // Block transfer, multiply, etc. land as their vector files are brought
         // in. Unhandled: leave state untouched (fails the diff honestly rather
         // than silently mutating).
@@ -165,7 +165,11 @@ fn single_data_transfer<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> boo
 /// SWI: software interrupt — the canonical exception entry. Enters Supervisor
 /// mode with the return address in LR_svc, the old CPSR in SPSR_svc, IRQs
 /// disabled and ARM state forced, then vectors to 0x08.
-fn software_interrupt(cpu: &mut Arm7tdmi) -> bool {
+fn software_interrupt<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool {
+    // With an HLE BIOS there is nothing at the vector; emulate the call directly.
+    if cpu.hle_bios {
+        return super::hle::swi(cpu, bus, (op >> 16) as u8);
+    }
     // Return address is the instruction after the SWI (R15 is PC+8 here).
     let return_addr = cpu.r[15].wrapping_sub(4);
     let old_cpsr = cpu.cpsr;

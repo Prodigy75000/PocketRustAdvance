@@ -29,6 +29,8 @@ pub struct GbaBus {
     dma_count: [u32; 4],
     /// Free-running cycle counter; drives the frame/scanline pacing.
     pub cycles: u64,
+    /// CPU halted (by the HLE Halt / IntrWait SWIs) until the next IRQ.
+    pub halted: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -97,6 +99,7 @@ impl GbaBus {
             dma_dst: [0; 4],
             dma_count: [0; 4],
             cycles: 0,
+            halted: false,
         }
     }
 
@@ -483,5 +486,8 @@ impl Bus for GbaBus {
     }
     fn tick(&mut self, n: u32) {
         self.cycles += n as u64;
+    }
+    fn set_halted(&mut self, halted: bool) {
+        self.halted = halted;
     }
 }

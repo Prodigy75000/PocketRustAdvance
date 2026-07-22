@@ -60,7 +60,7 @@ pub fn execute<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u16) -> bool {
             if (op >> 12) & 1 == 0 {
                 block_transfer(cpu, bus, op) // format 15
             } else if (op >> 8) & 0xF == 0b1111 {
-                software_interrupt(cpu) // format 17
+                software_interrupt(cpu, bus, op) // format 17
             } else {
                 conditional_branch(cpu, op) // format 16
             }
@@ -541,7 +541,11 @@ fn long_branch_link(cpu: &mut Arm7tdmi, op: u32) -> bool {
 }
 
 /// Format 17: Thumb SWI — identical exception entry to ARM SWI.
-fn software_interrupt(cpu: &mut Arm7tdmi) -> bool {
+fn software_interrupt<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool {
+    // With an HLE BIOS there is nothing at the vector; emulate the call directly.
+    if cpu.hle_bios {
+        return super::hle::swi(cpu, bus, (op & 0xFF) as u8);
+    }
     // Return address is the instruction after the SWI (R15 is PC+4 in Thumb).
     let return_addr = cpu.r[15].wrapping_sub(2);
     let old_cpsr = cpu.cpsr;

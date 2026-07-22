@@ -28,6 +28,7 @@
 
 pub mod arm;
 pub mod barrel;
+pub mod hle;
 pub mod psr;
 pub mod thumb;
 
@@ -64,6 +65,9 @@ pub struct Arm7tdmi {
     pub cpsr: u32,
     /// The two prefetched pipeline words: [execute slot, fetch slot].
     pub pipeline: [u32; 2],
+    /// When set, SWIs are emulated at the CPU level (HLE BIOS) instead of
+    /// vectoring to 0x08. Enabled on direct boot when no real BIOS is present.
+    pub hle_bios: bool,
 
     /// Saved r8..r12: [0] = the bank shared by every non-FIQ mode, [1] = FIQ.
     r8_12: [[u32; 5]; 2],
@@ -79,6 +83,7 @@ impl Default for Arm7tdmi {
             r: [0; 16],
             cpsr: Mode::System as u32,
             pipeline: [0; 2],
+            hle_bios: false,
             r8_12: [[0; 5]; 2],
             r13_14: [[0; 2]; 6],
             spsr_bank: [0; 5],

@@ -5,6 +5,9 @@ target/
 # TomHarte conformance vectors: ~832 MB, downloaded from SingleStepTests/ARM7TDMI.
 tests/vectors/
 
+# Real ROMs + BIOS copied in for boot-testing (copyrighted, never committed).
+dumps/
+
 # Generated frame dumps from the gba runner.
 *.png
 gba_frame.png

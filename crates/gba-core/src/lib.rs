@@ -36,6 +36,8 @@ pub enum Button {
 pub struct Gba {
     pub cpu: Arm7tdmi,
     pub bus: GbaBus,
+    /// Diagnostics: how many IRQs the CPU has taken since boot.
+    pub irqs_taken: u64,
 }
 
 impl Gba {
@@ -57,10 +59,11 @@ impl Gba {
             let svc = [0x0300_7FE0, 0]; // SP_svc
             let irq = [0x0300_7FA0, 0]; // SP_irq
             cpu.load_full(0x1F, r, [0; 7], svc, [0, 0], irq, [0; 2], [0; 5]);
+            cpu.hle_bios = true; // no real BIOS: emulate SWIs
         }
         cpu.reload_pipeline(&mut bus);
 
-        Gba { cpu, bus }
+        Gba { cpu, bus, irqs_taken: 0 }
     }
 
     /// Run one full frame (228 scanlines) and return the RGB555 framebuffer.
@@ -77,9 +80,18 @@ impl Gba {
             }
             let target = self.bus.cycles + ppu::CYCLES_PER_LINE as u64;
             while self.bus.cycles < target {
-                // Take a pending IRQ at the instruction boundary.
+                // Take a pending IRQ at the instruction boundary; taking one also
+                // wakes the CPU from a HLE Halt / IntrWait.
                 if self.bus.irq_pending() && self.cpu.irq_ready() {
                     self.cpu.take_irq(&mut self.bus);
+                    self.bus.halted = false;
+                    self.irqs_taken += 1;
+                }
+                if self.bus.halted {
+                    // Parked waiting for an interrupt: skip to the end of the line
+                    // (the next scanline may raise the IRQ that wakes us).
+                    self.bus.cycles = target;
+                    break;
                 }
                 self.cpu.step(&mut self.bus);
             }

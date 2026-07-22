@@ -7,6 +7,7 @@
 use std::fs::File;
 use std::io::BufWriter;
 
+use gba_core::bus::{Access, Bus};
 use gba_core::{Gba, SCREEN_H, SCREEN_W};
 
 /// A tiny ARM program: DISPCNT = mode 3 + BG2, then fill 240*160 VRAM halfwords
@@ -86,6 +87,28 @@ fn irq_rom() -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
+/// Decode the cartridge header (GBATEK): 12-byte ASCII title at 0xA0, 4-byte
+/// game code at 0xAC, and verify the header checksum at 0xBD.
+fn dump_header(rom: &[u8]) {
+    if rom.len() < 0xC0 {
+        return;
+    }
+    let title: String = rom[0xA0..0xAC]
+        .iter()
+        .take_while(|&&b| b != 0)
+        .map(|&b| b as char)
+        .collect();
+    let code: String = rom[0xAC..0xB0].iter().map(|&b| b as char).collect();
+    let mut chk = 0u8;
+    for &b in &rom[0xA0..0xBD] {
+        chk = chk.wrapping_sub(b);
+    }
+    chk = chk.wrapping_sub(0x19);
+    let ok = chk == rom[0xBD];
+    println!("  header: title=\"{title}\" code={code} checksum={} (stored {:02X}, calc {:02X})",
+        if ok { "OK" } else { "BAD" }, rom[0xBD], chk);
+}
+
 fn main() {
     let (rom, label) = match std::env::args().nth(1) {
         Some(a) if a == "tile" => (tile_rom(), "built-in mode-0 tile test".to_string()),
@@ -100,13 +123,88 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
 
-    let mut gba = Gba::new(rom, Vec::new());
-    for _ in 0..frames {
-        gba.run_frame();
+    // A real BIOS (16 KB) can be supplied via GBA_BIOS; otherwise direct-boot.
+    let bios = std::env::var("GBA_BIOS")
+        .ok()
+        .and_then(|p| std::fs::read(p).ok())
+        .unwrap_or_default();
+
+    let is_cart = rom.len() >= 0xC0 && label.ends_with(".gba");
+    if is_cart {
+        dump_header(&rom);
+        println!("  boot: {}", if bios.is_empty() { "direct (no BIOS)" } else { "via BIOS" });
+    }
+
+    let distinct_count = |fb: &[u16]| {
+        let mut v: Vec<u16> = fb.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        v.len()
+    };
+
+    let mut gba = Gba::new(rom, bios);
+    // Track the most "interesting" frame (most distinct colours) so a single PNG
+    // lands on a real rendered screen, not a blank/forced-blank transition frame.
+    let mut best_fb: Vec<u16> = Vec::new();
+    let mut best_distinct = 0usize;
+    let mut best_frame = 0u32;
+    let trace = std::env::var("GBA_TRACE").is_ok();
+    for f in 0..frames {
+        let fb = gba.run_frame().to_vec();
+        let d = distinct_count(&fb);
+        if d > best_distinct {
+            best_distinct = d;
+            best_fb = fb;
+            best_frame = f;
+        }
+        if trace && f < 40 {
+            println!("  f{f:>3} cyc={:>9} PC={:08X} DISPCNT={:04X} DISPSTAT={:04X} IE={:04X} IME={} halt={} irqs={}",
+                gba.bus.cycles, gba.cpu.r[15], gba.bus.ppu.read_reg16(0), gba.bus.ppu.dispstat(),
+                gba.bus.ie, gba.bus.ime, gba.bus.halted as u8, gba.irqs_taken);
+        }
+    }
+    if best_distinct > 1 {
+        println!("  best frame: #{best_frame} with {best_distinct} distinct colours (saved to PNG)");
+    }
+
+    if is_cart {
+        let pc = gba.cpu.r[15];
+        let region = match (pc >> 24) & 0xF {
+            0x0 => "BIOS", 0x2 => "EWRAM", 0x3 => "IWRAM",
+            0x8..=0xD => "ROM", _ => "other",
+        };
+        println!("  after {frames} frames: PC={pc:08X} ({region})  DISPCNT={:04X}", gba.bus.ppu.read_reg16(0));
+        let iw = |a: u32| u32::from_le_bytes(gba.bus.iwram[(a & 0x7FFF) as usize..][..4].try_into().unwrap());
+        println!("  irqs taken={}  IE={:04X} IF={:04X} IME={:X} DISPSTAT={:04X} CPSR={:08X}",
+            gba.irqs_taken, gba.bus.ie, gba.bus.if_, gba.bus.ime, gba.bus.ppu.dispstat(), gba.cpu.cpsr);
+        println!("  BIOS intr flags [0x03FFFFF8]={:08X}  user IRQ handler [0x03FFFFFC]={:08X}",
+            iw(0x7FF8), iw(0x7FFC));
+        if std::env::var("GBA_REGS").is_ok() {
+            for row in 0..4 {
+                let r = row * 4;
+                println!("    R{:>2}-R{:>2}: {:08X} {:08X} {:08X} {:08X}",
+                    r, r + 3, gba.cpu.r[r], gba.cpu.r[r + 1], gba.cpu.r[r + 2], gba.cpu.r[r + 3]);
+            }
+            // Instruction words around the (Thumb or ARM) execute point.
+            let thumb = gba.cpu.cpsr & (1 << 5) != 0;
+            let base = if thumb { pc.wrapping_sub(4) } else { pc.wrapping_sub(8) };
+            print!("    code @ {base:08X}:");
+            for i in 0..6 {
+                let a = base + i * 2;
+                let h = gba.bus.read16(a, Access::NonSeq);
+                print!(" {h:04X}");
+            }
+            println!();
+        }
     }
     let counter = u32::from_le_bytes(gba.bus.iwram[0..4].try_into().unwrap());
     println!("IWRAM counter @0x03000000 = {counter}  (IRQs taken)");
-    let fb = gba.bus.ppu.framebuffer.clone();
+    // Prefer the best (most colourful) frame for the PNG; fall back to the final.
+    let fb: Vec<u16> = if best_distinct > 1 {
+        best_fb.clone()
+    } else {
+        gba.bus.ppu.framebuffer.to_vec()
+    };
 
     // Stats so the user has measurable facts (no self-judging of the image).
     let nonzero = fb.iter().filter(|&&p| p != 0).count();

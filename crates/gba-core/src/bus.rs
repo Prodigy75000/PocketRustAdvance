@@ -51,4 +51,8 @@ pub trait Bus {
     /// Charge `n` internal cycles (the `I` cycles of MUL, shifts by register,
     /// etc.). Memory-access cycles are charged inside the read/write calls.
     fn tick(&mut self, n: u32);
+
+    /// HLE BIOS halt hook: the Halt / IntrWait SWIs park the CPU until an IRQ.
+    /// Default no-op so the TomHarte harness bus need not model it.
+    fn set_halted(&mut self, _halted: bool) {}
 }
