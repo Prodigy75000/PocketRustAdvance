@@ -16,6 +16,13 @@
 use crate::state::{Reader, Writer};
 
 const CYCLES_PER_SAMPLE: u64 = 512;
+/// Internal oversampling: the mixer is sampled this many times per output sample
+/// and box-averaged down. This band-limits the zero-order-hold steps of the 8-bit
+/// Direct Sound PCM and the PSG square edges, and averages out the small jitter
+/// when a channel's rate isn't a clean divisor of the output grid, which is what
+/// otherwise reads as a sprinkle of static. 512 / 4 = 128 cycles per sub-sample.
+const OVERSAMPLE: u64 = 4;
+const SUB_CYCLES: u64 = CYCLES_PER_SAMPLE / OVERSAMPLE;
 /// System cycles per 512 Hz frame-sequencer tick (16_777_216 / 512).
 const FS_PERIOD: u32 = 32_768;
 
@@ -350,6 +357,14 @@ pub struct Apu {
     a_next: u64,
     b_next: u64,
 
+    // DC-blocking high-pass state (integer one-pole, corner ~1.3 Hz), per side.
+    // The `y` state is kept in Q12 fixed point (i64) so the feedback term never
+    // hits a >>12 deadband and gets stuck on a non-zero offset in silence.
+    hp_xl: i32,
+    hp_yl: i64,
+    hp_xr: i32,
+    hp_yr: i64,
+
     cycle: u64,
     out: Vec<i16>,
 }
@@ -372,6 +387,10 @@ impl Default for Apu {
             ds_b: 0,
             a_next: 0,
             b_next: 0,
+            hp_xl: 0,
+            hp_yl: 0,
+            hp_xr: 0,
+            hp_yr: 0,
             cycle: 0,
             out: Vec::new(),
         }
@@ -572,12 +591,34 @@ impl Apu {
     /// matching Direct Sound FIFO.
     pub fn generate(&mut self, timer_period: [Option<u32>; 2], target: u64) {
         while self.cycle + CYCLES_PER_SAMPLE <= target {
-            self.advance_chunk(CYCLES_PER_SAMPLE, timer_period);
-            let (l, r) = self.mix();
-            self.out.push(l);
-            self.out.push(r);
-            self.cycle += CYCLES_PER_SAMPLE;
+            let mut acc_l = 0i32;
+            let mut acc_r = 0i32;
+            for _ in 0..OVERSAMPLE {
+                self.advance_chunk(SUB_CYCLES, timer_period);
+                self.cycle += SUB_CYCLES;
+                let (l, r) = self.mix_raw();
+                acc_l += l;
+                acc_r += r;
+            }
+            let (l, r) = self.dc_block(acc_l / OVERSAMPLE as i32, acc_r / OVERSAMPLE as i32);
+            self.out.push(l.clamp(-32768, 32767) as i16);
+            self.out.push(r.clamp(-32768, 32767) as i16);
         }
+    }
+
+    /// One-pole DC blocker per side: y[n] = x[n] - x[n-1] + (1 - 2^-12)*y[n-1],
+    /// with `y` carried in Q12 (state = y * 4096) so the feedback decays cleanly
+    /// to zero instead of sticking in a >>12 deadband. Removes the standing offset
+    /// (and its steps when channels toggle) the DAC centring and Direct Sound
+    /// latch leave behind, without touching tone.
+    fn dc_block(&mut self, l: i32, r: i32) -> (i32, i32) {
+        self.hp_yl += ((l - self.hp_xl) as i64) << 12;
+        self.hp_yl -= self.hp_yl >> 12;
+        self.hp_xl = l;
+        self.hp_yr += ((r - self.hp_xr) as i64) << 12;
+        self.hp_yr -= self.hp_yr >> 12;
+        self.hp_xr = r;
+        ((self.hp_yl >> 12) as i32, (self.hp_yr >> 12) as i32)
     }
 
     fn advance_chunk(&mut self, n: u64, timer_period: [Option<u32>; 2]) {
@@ -645,7 +686,7 @@ impl Apu {
         }
     }
 
-    fn mix(&self) -> (i16, i16) {
+    fn mix_raw(&self) -> (i32, i32) {
         if !self.master_enable {
             return (0, 0);
         }
@@ -692,7 +733,7 @@ impl Apu {
         if cnt_h & 0x1000 != 0 {
             r += b;
         }
-        ((l * 24).clamp(-32768, 32767) as i16, (r * 24).clamp(-32768, 32767) as i16)
+        (l * 24, r * 24)
     }
 
     // --- Save-state -----------------------------------------------------------
@@ -708,6 +749,10 @@ impl Apu {
         w.u64(self.b_next);
         w.u8(self.ds_a as u8);
         w.u8(self.ds_b as u8);
+        w.i32(self.hp_xl);
+        w.u64(self.hp_yl as u64);
+        w.i32(self.hp_xr);
+        w.u64(self.hp_yr as u64);
         for f in [&self.fifo_a, &self.fifo_b] {
             w.u8(f.len as u8);
             w.u8(f.head as u8);
@@ -741,6 +786,10 @@ impl Apu {
         self.b_next = r.u64();
         self.ds_a = r.u8() as i8;
         self.ds_b = r.u8() as i8;
+        self.hp_xl = r.i32();
+        self.hp_yl = r.u64() as i64;
+        self.hp_xr = r.i32();
+        self.hp_yr = r.u64() as i64;
         for f in [&mut self.fifo_a, &mut self.fifo_b] {
             f.len = r.u8() as usize;
             f.head = r.u8() as usize;
