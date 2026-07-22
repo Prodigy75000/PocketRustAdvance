@@ -109,6 +109,27 @@ fn dump_header(rom: &[u8]) {
         if ok { "OK" } else { "BAD" }, rom[0xBD], chk);
 }
 
+/// RetroArch wraps a core save-state in a "RASTATE" container: an 8-byte header
+/// then blocks of [4-byte id][4-byte LE size][data]. The core's data is the
+/// "MEM " block. Return that if present, else the bytes unchanged.
+fn unwrap_rastate(bytes: &[u8]) -> &[u8] {
+    if !bytes.starts_with(b"RASTATE") {
+        return bytes;
+    }
+    let mut pos = 8; // "RASTATE" + version byte
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let start = pos + 8;
+        let end = (start + size).min(bytes.len());
+        if id == b"MEM " {
+            return &bytes[start..end];
+        }
+        pos = end;
+    }
+    bytes
+}
+
 fn main() {
     let (rom, label) = match std::env::args().nth(1) {
         Some(a) if a == "tile" => (tile_rom(), "built-in mode-0 tile test".to_string()),
@@ -147,12 +168,19 @@ fn main() {
     // frame is rendered afterwards so the framebuffer/PNG reflect the state.
     if let Some(path) = std::env::var_os("GBA_LOADSTATE") {
         match std::fs::read(&path) {
-            Ok(bytes) if gba.load_state(&bytes) => {
-                eprintln!("loaded state {:?} ({} bytes)", path, bytes.len());
+            Ok(bytes) => {
+                let blob = unwrap_rastate(&bytes);
+                if gba.load_state(blob) {
+                    eprintln!("loaded state {:?} ({} bytes core data)", path, blob.len());
+                } else {
+                    eprintln!("state {:?} rejected (bad magic/version/size)", path);
+                }
             }
-            Ok(_) => eprintln!("state {:?} rejected (bad magic/version/size)", path),
             Err(e) => eprintln!("could not read state {:?}: {e}", path),
         }
+    }
+    if let Ok(a) = std::env::var("GBA_WATCHW") {
+        gba.bus.watch_addr = u32::from_str_radix(a.trim_start_matches("0x"), 16).unwrap_or(0);
     }
     if std::env::var_os("GBA_NORENDER").is_some() {
         gba.render_enabled = false;
@@ -237,10 +265,32 @@ fn main() {
             }
         }
         println!("  OAM: {normal} normal, {affine} affine, {objwin} obj-window sprites");
-        // First few BG palette entries (to spot a washed/faded palette).
+        // Palette dump (to spot a washed/faded/duplicated palette).
         let pe = |i: usize| u16::from_le_bytes([gba.bus.ppu.palram[i * 2], gba.bus.ppu.palram[i * 2 + 1]]);
-        println!("  BG pal[0..8]: {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
-            pe(0), pe(1), pe(2), pe(3), pe(4), pe(5), pe(6), pe(7));
+        let row = |base: usize| {
+            (0..16).map(|i| format!("{:04X}", pe(base + i))).collect::<Vec<_>>().join(" ")
+        };
+        println!("  BG pal[0..16]:  {}", row(0));
+        println!("  BG pal[16..32]: {}", row(16));
+        println!("  OBJ pal[0..16]: {}", row(0x100));
+        // Search EWRAM/IWRAM for the rug-green 0x5BF4 to find the source palette
+        // buffer, and show whether it is paired there or clean (distinct).
+        if let Ok(hexs) = std::env::var("GBA_FINDHALF") {
+            let needle = u16::from_str_radix(&hexs, 16).unwrap_or(0x5BF4);
+            for (name, mem) in [("EWRAM", &gba.bus.ewram[..]), ("IWRAM", &gba.bus.iwram[..])] {
+                let mut found = 0;
+                let mut o = 0;
+                while o + 8 <= mem.len() && found < 4 {
+                    let h = u16::from_le_bytes([mem[o], mem[o + 1]]);
+                    if h == needle {
+                        let hw = |k: usize| u16::from_le_bytes([mem[o + k * 2], mem[o + k * 2 + 1]]);
+                        println!("  {name}@{:05X}: {:04X} {:04X} {:04X} {:04X}", o, hw(0), hw(1), hw(2), hw(3));
+                        found += 1;
+                    }
+                    o += 2;
+                }
+            }
+        }
         // Framebuffer samples (240x160): background, professor centre, text row.
         let fb = &gba.bus.ppu.framebuffer;
         let px = |x: usize, y: usize| fb[y * SCREEN_W + x];
@@ -265,6 +315,12 @@ fn main() {
         }
     }
     println!("steps={}  (~{} instr/frame)", gba.steps, gba.steps / frames.max(1) as u64);
+    if gba.bus.watch_addr != 0 {
+        println!("  watch {:08X}: {} writes", gba.bus.watch_addr, gba.bus.watch_hits.len());
+        for (pc, addr, val) in gba.bus.watch_hits.iter().take(16) {
+            println!("    PC={pc:08X} -> [{addr:08X}] = {val:08X}");
+        }
+    }
     let counter = u32::from_le_bytes(gba.bus.iwram[0..4].try_into().unwrap());
     println!("IWRAM counter @0x03000000 = {counter}  (IRQs taken)");
     // Prefer the best (most colourful) frame for the PNG; fall back to the final.

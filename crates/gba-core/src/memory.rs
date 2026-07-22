@@ -33,6 +33,11 @@ pub struct GbaBus {
     pub cycles: u64,
     /// CPU halted (by the HLE Halt / IntrWait SWIs) until the next IRQ.
     pub halted: bool,
+    /// Debug write-watchpoint: current CPU PC, watched address (0 = off), and a
+    /// capped log of (pc, value, width) writes that hit it.
+    pub cur_pc: u32,
+    pub watch_addr: u32,
+    pub watch_hits: Vec<(u32, u32, u32)>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -103,6 +108,9 @@ impl GbaBus {
             dma_count: [0; 4],
             cycles: 0,
             halted: false,
+            cur_pc: 0,
+            watch_addr: 0,
+            watch_hits: Vec::new(),
         }
     }
 
@@ -414,6 +422,11 @@ impl GbaBus {
     // --- Writes: width-aware so display-memory quirks are honored --------------
 
     fn write(&mut self, addr: u32, val: u32, width: u32) {
+        if self.watch_addr != 0 && addr >= self.watch_addr && addr < self.watch_addr + 0x400
+            && self.watch_hits.len() < 64
+        {
+            self.watch_hits.push((self.cur_pc, addr, val));
+        }
         match (addr >> 24) & 0xF {
             0x2 => write_le(&mut self.ewram, (addr & 0x3_FFFF) as usize, val, width),
             0x3 => write_le(&mut self.iwram, (addr & 0x7FFF) as usize, val, width),

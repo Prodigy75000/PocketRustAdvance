@@ -155,6 +155,7 @@ impl Gba {
                     self.bus.cycles = target;
                     break;
                 }
+                self.bus.cur_pc = self.cpu.r[15];
                 self.cpu.step(&mut self.bus);
                 self.steps += 1;
             }
