@@ -5,14 +5,13 @@
 //! vectors through the [`bus::Bus`] trait. [`GbaBus`] is the real system bus it
 //! drives; [`Gba`] wires the two together and runs frames.
 
+pub mod apu;
 pub mod bus;
 pub mod cpu;
 pub mod memory;
 pub mod ppu;
 pub mod save;
 pub mod state;
-
-// Coming online next: DMA, timers, IRQ delivery, APU.
 
 pub use memory::GbaBus;
 pub use ppu::{Ppu, SCREEN_H, SCREEN_W, TOTAL_LINES};
@@ -38,10 +37,6 @@ pub enum Button {
 /// Audio output rate. The GBA's own sound hardware runs at 32768 Hz; the value
 /// only needs to match [`Gba::SAMPLE_RATE`] and the AV-info the front-end reads.
 const SAMPLE_RATE: u64 = 32_768;
-/// GBA system clock (cycles per second).
-const CLOCK: u64 = 16_777_216;
-/// Cycles per rendered frame (228 scanlines).
-const CYCLES_PER_FRAME: u64 = TOTAL_LINES as u64 * ppu::CYCLES_PER_LINE as u64;
 
 pub struct Gba {
     pub cpu: Arm7tdmi,
@@ -52,13 +47,6 @@ pub struct Gba {
     pub steps: u64,
     /// When false, scanline rendering is skipped (for profiling CPU vs PPU).
     pub render_enabled: bool,
-    /// Interleaved stereo output samples produced this frame (drained by the
-    /// front-end via [`Gba::take_audio`]). Silent for now, but emitted at the
-    /// correct rate so an audio-synced libretro host paces us to real time —
-    /// without this the host free-runs at the display refresh (double speed).
-    audio: Vec<i16>,
-    /// Fractional-sample accumulator (in clock-cycle units) for an exact rate.
-    sample_error: u64,
 }
 
 impl Gba {
@@ -90,8 +78,6 @@ impl Gba {
             irqs_taken: 0,
             steps: 0,
             render_enabled: true,
-            audio: Vec::new(),
-            sample_error: 0,
         }
     }
 
@@ -100,7 +86,7 @@ impl Gba {
 
     /// Drain this frame's interleaved-stereo samples for the front-end.
     pub fn take_audio(&mut self) -> Vec<i16> {
-        std::mem::take(&mut self.audio)
+        self.bus.apu.take_output()
     }
 
     /// Serialize the whole machine to a save-state blob. The ROM and BIOS are
@@ -111,7 +97,6 @@ impl Gba {
         w.u8(state::VERSION);
         self.cpu.serialize(&mut w);
         self.bus.serialize(&mut w);
-        w.u64(self.sample_error);
         w.buf
     }
 
@@ -124,7 +109,6 @@ impl Gba {
         }
         self.cpu.deserialize(&mut r);
         self.bus.deserialize(&mut r);
-        self.sample_error = r.u64();
         !r.failed
     }
 
@@ -167,16 +151,14 @@ impl Gba {
             if line < SCREEN_H as u32 && self.render_enabled {
                 self.bus.ppu.render_line(line as usize);
             }
+            // Generate this line's audio (one stereo sample per 512 cycles) from
+            // the APU state as it stands after the line's CPU work, then let the
+            // sound DMA top up any Direct Sound FIFO that has drained.
+            let periods = [self.bus.ds_timer_period(0), self.bus.ds_timer_period(1)];
+            let target = self.bus.cycles;
+            self.bus.apu.generate(periods, target);
+            self.bus.refill_fifos();
         }
-
-        // Emit this frame's audio at exactly SAMPLE_RATE (integer accumulator):
-        // samples_this_frame = SAMPLE_RATE * CYCLES_PER_FRAME / CLOCK, carrying
-        // the remainder so the long-run average is exact. Silent until the APU
-        // exists — the point right now is pacing the host.
-        self.sample_error += SAMPLE_RATE * CYCLES_PER_FRAME;
-        let n = self.sample_error / CLOCK;
-        self.sample_error %= CLOCK;
-        self.audio.extend(std::iter::repeat(0).take(n as usize * 2)); // stereo
 
         &self.bus.ppu.framebuffer
     }

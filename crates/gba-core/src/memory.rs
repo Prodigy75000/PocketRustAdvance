@@ -2,6 +2,7 @@
 //! I/O dispatch. Implements [`crate::bus::Bus`] so the CPU drives it exactly as
 //! it drove the test harness. Region layout and mirroring follow GBATEK.
 
+use crate::apu::Apu;
 use crate::bus::{Access, Bus};
 use crate::ppu::Ppu;
 use crate::save::Save;
@@ -14,6 +15,7 @@ pub struct GbaBus {
     /// Cartridge backup: SRAM / Flash (region 0xE-0xF) or EEPROM (region 0xD).
     pub save: Save,
     pub ppu: Ppu,
+    pub apu: Apu,
     /// Catch-all for I/O registers not yet modeled (DMA/timers/IRQ/sound).
     io: Box<[u8]>, // 0x400
     /// KEYINPUT (0x4000130): bits are active-low, 1 = released.
@@ -96,6 +98,7 @@ impl GbaBus {
             rom: rom.into_boxed_slice(),
             save,
             ppu: Ppu::new(),
+            apu: Apu::new(),
             io: vec![0; 0x400].into_boxed_slice(),
             keyinput: 0x03FF,
             ie: 0,
@@ -138,6 +141,7 @@ impl GbaBus {
         w.bytes(&self.io);
         self.save.serialize(w);
         self.ppu.serialize(w);
+        self.apu.serialize(w);
     }
 
     pub fn deserialize(&mut self, r: &mut crate::state::Reader) {
@@ -164,6 +168,11 @@ impl GbaBus {
         r.bytes_into(&mut self.io);
         self.save.deserialize(r);
         self.ppu.deserialize(r);
+        // The APU block was appended after the state format shipped; only read it
+        // when the blob actually carries it, so pre-APU states still load.
+        if r.remaining() > 8 {
+            self.apu.deserialize(r);
+        }
     }
 
     // --- Timers ---------------------------------------------------------------
@@ -196,6 +205,18 @@ impl GbaBus {
             }
             prev_overflows = overflows;
         }
+    }
+
+    /// The overflow period (in system cycles) of timer `ch`, or `None` if it is
+    /// stopped or in cascade mode. Used by the APU to schedule Direct Sound FIFO
+    /// pops at the audio rate the game programmed.
+    pub fn ds_timer_period(&self, ch: usize) -> Option<u32> {
+        let t = &self.timers[ch];
+        if t.control & 0x80 == 0 || (ch > 0 && t.control & 4 != 0) {
+            return None;
+        }
+        let prescaler = [1u32, 64, 256, 1024][(t.control & 3) as usize];
+        Some((0x1_0000 - t.reload as u32) * prescaler)
     }
 
     // --- DMA ------------------------------------------------------------------
@@ -302,6 +323,52 @@ impl GbaBus {
         }
     }
 
+    /// Top up the Direct Sound FIFOs from their sound DMA channels. Hardware
+    /// requests a refill when a FIFO drops to <= 4 words (16 bytes); DMA1/DMA2 in
+    /// "special" timing service FIFO_A/FIFO_B respectively, always 4 words wide.
+    pub fn refill_fifos(&mut self) {
+        for ch in [1usize, 2] {
+            let base = 0xB0 + ch as u32 * 12;
+            let control = self.io_u16(base + 10);
+            if control & 0x8000 == 0 || (control >> 12) & 3 != 3 {
+                continue; // channel off, or not sound-FIFO timing
+            }
+            let dst = self.io_u32(base + 4) & 0x07FF_FFFF;
+            let level = match dst {
+                0x0400_00A0 => self.apu.fifo_a_len(),
+                0x0400_00A4 => self.apu.fifo_b_len(),
+                _ => continue,
+            };
+            if level <= 16 {
+                self.run_sound_dma(ch, dst);
+            }
+        }
+    }
+
+    /// Transfer one FIFO request: 4 words from the (incrementing) source into the
+    /// fixed FIFO port. The word count and destination-fixed behaviour are forced
+    /// by the hardware regardless of the channel's programmed count/dest-control.
+    fn run_sound_dma(&mut self, ch: usize, dst: u32) {
+        let base = 0xB0 + ch as u32 * 12;
+        let control = self.io_u16(base + 10);
+        let src_ctrl = (control >> 7) & 3;
+        let mut src = self.dma_src[ch];
+        for _ in 0..4 {
+            let v = self.read32_raw(src & !3);
+            self.write(dst, v, 4);
+            src = match src_ctrl {
+                1 => src.wrapping_sub(4),
+                2 => src,
+                _ => src.wrapping_add(4),
+            };
+            self.cycles += 4;
+        }
+        self.dma_src[ch] = src;
+        if control & 0x4000 != 0 {
+            self.if_ |= 1 << (8 + ch); // DMA-complete IRQ
+        }
+    }
+
     /// True when the CPU should take an IRQ: master-enabled and some enabled
     /// source is requesting. The CPU still gates on its own CPSR I bit.
     pub fn irq_pending(&self) -> bool {
@@ -402,6 +469,7 @@ impl GbaBus {
         let off = addr & 0x3FF;
         match off {
             0x000..=0x05F => (self.ppu.read_reg16(off & !1) >> ((off & 1) * 8)) as u8,
+            0x060..=0x0A7 => self.apu.read8(off),
             0x130 => self.keyinput as u8,
             0x131 => (self.keyinput >> 8) as u8,
             0x100..=0x10F => {
@@ -463,6 +531,7 @@ impl GbaBus {
                     };
                     self.ppu.write_reg16(reg, merged);
                 }
+                0x060..=0x0A7 => self.apu.write8(o, byte),
                 0x130 | 0x131 => {} // KEYINPUT read-only
                 0x200 => self.ie = (self.ie & 0xFF00) | byte as u16,
                 0x201 => self.ie = (self.ie & 0x00FF) | ((byte as u16) << 8),

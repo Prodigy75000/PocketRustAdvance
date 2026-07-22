@@ -50,6 +50,11 @@ impl<'a> Reader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
         Reader { buf, pos: 0, failed: false }
     }
+    /// Bytes not yet consumed. Used to make newly-appended state blocks (e.g. the
+    /// APU, added after the format shipped) optional, so older states still load.
+    pub fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
     fn take(&mut self, n: usize) -> &[u8] {
         if self.pos + n > self.buf.len() {
             self.failed = true;

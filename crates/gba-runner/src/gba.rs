@@ -10,6 +10,35 @@ use std::io::BufWriter;
 use gba_core::bus::{Access, Bus};
 use gba_core::{Gba, SCREEN_H, SCREEN_W};
 
+/// Write interleaved-stereo `i16` samples as a 16-bit PCM WAV (for offline
+/// listening / measurement of the emulated audio).
+fn write_wav(path: &std::ffi::OsStr, samples: &[i16], rate: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    let channels = 2u16;
+    let bits = 16u16;
+    let block_align = channels * bits / 8;
+    let byte_rate = rate * block_align as u32;
+    let data_len = (samples.len() * 2) as u32;
+    let mut f = BufWriter::new(File::create(path)?);
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data_len).to_le_bytes())?;
+    f.write_all(b"WAVE")?;
+    f.write_all(b"fmt ")?;
+    f.write_all(&16u32.to_le_bytes())?; // PCM fmt chunk size
+    f.write_all(&1u16.to_le_bytes())?; // PCM
+    f.write_all(&channels.to_le_bytes())?;
+    f.write_all(&rate.to_le_bytes())?;
+    f.write_all(&byte_rate.to_le_bytes())?;
+    f.write_all(&block_align.to_le_bytes())?;
+    f.write_all(&bits.to_le_bytes())?;
+    f.write_all(b"data")?;
+    f.write_all(&data_len.to_le_bytes())?;
+    for &s in samples {
+        f.write_all(&s.to_le_bytes())?;
+    }
+    Ok(())
+}
+
 /// A tiny ARM program: DISPCNT = mode 3 + BG2, then fill 240*160 VRAM halfwords
 /// with an incrementing value (a gradient), then spin.
 fn test_rom() -> Vec<u8> {
@@ -199,6 +228,7 @@ fn main() {
     let trace = std::env::var("GBA_TRACE").is_ok();
     // Auto-advance menus: hold A/Start in short pulses to reach in-game scenes.
     let autoinput = std::env::var_os("GBA_AUTOINPUT").is_some();
+    let mut audio: Vec<i16> = Vec::new();
     for f in 0..frames {
         if autoinput {
             let p = f % 24 < 4; // pulse A + Start to advance title and dialogue
@@ -206,6 +236,7 @@ fn main() {
             gba.set_button(gba_core::Button::Start, p);
         }
         let fb = gba.run_frame().to_vec();
+        audio.extend(gba.take_audio());
         let d = distinct_count(&fb);
         if d > best_distinct {
             best_distinct = d;
@@ -220,6 +251,29 @@ fn main() {
     }
     if best_distinct > 1 {
         println!("  best frame: #{best_frame} with {best_distinct} distinct colours (saved to PNG)");
+    }
+    // Audio stats (measurable, no judgement): sample count, peak, RMS, and how
+    // many samples were non-zero. GBA_WAV=<file> also dumps a 16-bit stereo WAV.
+    {
+        let frames_out = audio.len() / 2;
+        let peak = audio.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        let nonzero = audio.iter().filter(|&&s| s != 0).count();
+        let rms = if !audio.is_empty() {
+            let sum: f64 = audio.iter().map(|&s| (s as f64).powi(2)).sum();
+            (sum / audio.len() as f64).sqrt()
+        } else {
+            0.0
+        };
+        println!(
+            "  audio: {frames_out} stereo samples ({:.1}/frame), peak {peak}, rms {rms:.1}, {nonzero} non-zero",
+            frames_out as f64 / frames.max(1) as f64
+        );
+        if let Some(path) = std::env::var_os("GBA_WAV") {
+            match write_wav(&path, &audio, gba_core::Gba::SAMPLE_RATE) {
+                Ok(()) => eprintln!("wrote wav {:?} ({} samples)", path, frames_out),
+                Err(e) => eprintln!("could not write wav {:?}: {e}", path),
+            }
+        }
     }
     // GBA_SAVESTATE=<file> writes a save-state of the final frame.
     if let Some(path) = std::env::var_os("GBA_SAVESTATE") {
