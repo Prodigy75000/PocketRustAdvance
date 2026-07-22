@@ -10,6 +10,7 @@ pub mod cpu;
 pub mod memory;
 pub mod ppu;
 pub mod save;
+pub mod state;
 
 // Coming online next: DMA, timers, IRQ delivery, APU.
 
@@ -102,6 +103,31 @@ impl Gba {
         std::mem::take(&mut self.audio)
     }
 
+    /// Serialize the whole machine to a save-state blob. The ROM and BIOS are
+    /// not included (the front-end already has them); everything else is.
+    pub fn save_state(&self) -> Vec<u8> {
+        let mut w = state::Writer::default();
+        w.u32(state::MAGIC);
+        w.u8(state::VERSION);
+        self.cpu.serialize(&mut w);
+        self.bus.serialize(&mut w);
+        w.u64(self.sample_error);
+        w.buf
+    }
+
+    /// Restore a save-state produced by [`save_state`] on the same cartridge.
+    /// Returns false if the blob is not a valid state for this build.
+    pub fn load_state(&mut self, data: &[u8]) -> bool {
+        let mut r = state::Reader::new(data);
+        if r.u32() != state::MAGIC || r.u8() != state::VERSION {
+            return false;
+        }
+        self.cpu.deserialize(&mut r);
+        self.bus.deserialize(&mut r);
+        self.sample_error = r.u64();
+        !r.failed
+    }
+
     /// Run one full frame (228 scanlines) and return the RGB555 framebuffer.
     pub fn run_frame(&mut self) -> &[u16] {
         for line in 0..TOTAL_LINES {
@@ -157,5 +183,39 @@ impl Gba {
         } else {
             self.bus.keyinput |= bit;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_state_roundtrip_is_deterministic() {
+        // A small ROM: enough for the CPU to run deterministically for a while.
+        let rom = vec![0u8; 0x2000];
+        let mut a = Gba::new(rom.clone(), Vec::new());
+        for _ in 0..8 {
+            a.run_frame();
+        }
+        let blob = a.save_state();
+
+        // Restore into a fresh machine and confirm it resumes identically.
+        let mut b = Gba::new(rom, Vec::new());
+        assert!(b.load_state(&blob), "state should load");
+        assert_eq!(a.cpu.r, b.cpu.r, "registers restored");
+        assert_eq!(a.cpu.cpsr, b.cpu.cpsr);
+        assert_eq!(a.bus.cycles, b.bus.cycles);
+
+        // Advancing both from the same point stays bit-identical.
+        for _ in 0..4 {
+            a.run_frame();
+            b.run_frame();
+        }
+        assert_eq!(a.cpu.r, b.cpu.r, "diverged after resume");
+        assert_eq!(&a.bus.ppu.framebuffer[..], &b.bus.ppu.framebuffer[..]);
+
+        // A garbage blob is rejected, not panicked on.
+        assert!(!b.load_state(&[1, 2, 3]));
     }
 }

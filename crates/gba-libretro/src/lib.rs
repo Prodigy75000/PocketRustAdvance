@@ -314,15 +314,36 @@ pub extern "C" fn retro_get_memory_size(id: u32) -> usize {
 // --- Save states: not implemented yet ----------------------------------------
 #[no_mangle]
 pub extern "C" fn retro_serialize_size() -> usize {
-    0
+    with_state(|s| s.gba.as_ref().map(|g| g.save_state().len()).unwrap_or(0))
 }
 #[no_mangle]
-pub unsafe extern "C" fn retro_serialize(_data: *mut c_void, _size: usize) -> bool {
-    false
+pub unsafe extern "C" fn retro_serialize(data: *mut c_void, size: usize) -> bool {
+    with_state(|s| {
+        let gba = match s.gba.as_ref() {
+            Some(g) => g,
+            None => return false,
+        };
+        let blob = gba.save_state();
+        if data.is_null() || blob.len() > size {
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(blob.as_ptr(), data as *mut u8, blob.len());
+        true
+    })
 }
 #[no_mangle]
-pub unsafe extern "C" fn retro_unserialize(_data: *const c_void, _size: usize) -> bool {
-    false
+pub unsafe extern "C" fn retro_unserialize(data: *const c_void, size: usize) -> bool {
+    with_state(|s| {
+        let gba = match s.gba.as_mut() {
+            Some(g) => g,
+            None => return false,
+        };
+        if data.is_null() {
+            return false;
+        }
+        let slice = std::slice::from_raw_parts(data as *const u8, size);
+        gba.load_state(slice)
+    })
 }
 #[no_mangle]
 pub extern "C" fn retro_cheat_reset() {}

@@ -106,6 +106,58 @@ impl GbaBus {
         }
     }
 
+    pub fn serialize(&self, w: &mut crate::state::Writer) {
+        w.u16(self.keyinput);
+        w.u16(self.ie);
+        w.u16(self.if_);
+        w.u16(self.ime);
+        w.u64(self.cycles);
+        w.u64(self.timer_cycles);
+        w.bool(self.halted);
+        for i in 0..4 {
+            w.u32(self.dma_src[i]);
+            w.u32(self.dma_dst[i]);
+            w.u32(self.dma_count[i]);
+        }
+        for t in &self.timers {
+            w.u16(t.reload);
+            w.u16(t.counter);
+            w.u16(t.control);
+            w.u32(t.subcycle);
+        }
+        w.bytes(&self.ewram);
+        w.bytes(&self.iwram);
+        w.bytes(&self.io);
+        self.save.serialize(w);
+        self.ppu.serialize(w);
+    }
+
+    pub fn deserialize(&mut self, r: &mut crate::state::Reader) {
+        self.keyinput = r.u16();
+        self.ie = r.u16();
+        self.if_ = r.u16();
+        self.ime = r.u16();
+        self.cycles = r.u64();
+        self.timer_cycles = r.u64();
+        self.halted = r.bool();
+        for i in 0..4 {
+            self.dma_src[i] = r.u32();
+            self.dma_dst[i] = r.u32();
+            self.dma_count[i] = r.u32();
+        }
+        for t in &mut self.timers {
+            t.reload = r.u16();
+            t.counter = r.u16();
+            t.control = r.u16();
+            t.subcycle = r.u32();
+        }
+        r.bytes_into(&mut self.ewram);
+        r.bytes_into(&mut self.iwram);
+        r.bytes_into(&mut self.io);
+        self.save.deserialize(r);
+        self.ppu.deserialize(r);
+    }
+
     // --- Timers ---------------------------------------------------------------
 
     /// Advance all four timers by the cycles elapsed since the last call,

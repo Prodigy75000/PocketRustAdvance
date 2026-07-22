@@ -187,6 +187,32 @@ impl Ppu {
         self.regs[(offset as usize >> 1) & 0x3F]
     }
 
+    pub fn serialize(&self, w: &mut crate::state::Writer) {
+        for &v in &self.regs {
+            w.u16(v);
+        }
+        for pair in &self.bg_ref {
+            w.i32(pair[0]);
+            w.i32(pair[1]);
+        }
+        w.bytes(&self.vram);
+        w.bytes(&self.palram);
+        w.bytes(&self.oam);
+    }
+
+    pub fn deserialize(&mut self, r: &mut crate::state::Reader) {
+        for v in &mut self.regs {
+            *v = r.u16();
+        }
+        for pair in &mut self.bg_ref {
+            pair[0] = r.i32();
+            pair[1] = r.i32();
+        }
+        r.bytes_into(&mut self.vram);
+        r.bytes_into(&mut self.palram);
+        r.bytes_into(&mut self.oam);
+    }
+
     /// Current DISPSTAT (for the interrupt controller's LCD IRQ decisions).
     pub fn dispstat(&self) -> u16 {
         self.regs[DISPSTAT]

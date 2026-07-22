@@ -143,6 +143,17 @@ fn main() {
     };
 
     let mut gba = Gba::new(rom, bios);
+    // Load a save-state (GBA_LOADSTATE=<file>) to inspect an exact scene. One
+    // frame is rendered afterwards so the framebuffer/PNG reflect the state.
+    if let Some(path) = std::env::var_os("GBA_LOADSTATE") {
+        match std::fs::read(&path) {
+            Ok(bytes) if gba.load_state(&bytes) => {
+                eprintln!("loaded state {:?} ({} bytes)", path, bytes.len());
+            }
+            Ok(_) => eprintln!("state {:?} rejected (bad magic/version/size)", path),
+            Err(e) => eprintln!("could not read state {:?}: {e}", path),
+        }
+    }
     if std::env::var_os("GBA_NORENDER").is_some() {
         gba.render_enabled = false;
     }
@@ -182,6 +193,14 @@ fn main() {
     if best_distinct > 1 {
         println!("  best frame: #{best_frame} with {best_distinct} distinct colours (saved to PNG)");
     }
+    // GBA_SAVESTATE=<file> writes a save-state of the final frame.
+    if let Some(path) = std::env::var_os("GBA_SAVESTATE") {
+        let blob = gba.save_state();
+        match std::fs::write(&path, &blob) {
+            Ok(()) => eprintln!("wrote state {:?} ({} bytes)", path, blob.len()),
+            Err(e) => eprintln!("could not write state {:?}: {e}", path),
+        }
+    }
 
     if is_cart {
         let pc = gba.cpu.r[15];
@@ -218,6 +237,10 @@ fn main() {
             }
         }
         println!("  OAM: {normal} normal, {affine} affine, {objwin} obj-window sprites");
+        // First few BG palette entries (to spot a washed/faded palette).
+        let pe = |i: usize| u16::from_le_bytes([gba.bus.ppu.palram[i * 2], gba.bus.ppu.palram[i * 2 + 1]]);
+        println!("  BG pal[0..8]: {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
+            pe(0), pe(1), pe(2), pe(3), pe(4), pe(5), pe(6), pe(7));
         // Framebuffer samples (240x160): background, professor centre, text row.
         let fb = &gba.bus.ppu.framebuffer;
         let px = |x: usize, y: usize| fb[y * SCREEN_W + x];

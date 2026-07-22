@@ -71,6 +71,52 @@ impl Save {
         self.kind == SaveKind::Eeprom
     }
 
+    pub fn serialize(&self, w: &mut crate::state::Writer) {
+        w.u8(self.flash_phase);
+        w.bool(self.flash_id_mode);
+        w.bool(self.flash_erase_prep);
+        w.bool(self.flash_write_pending);
+        w.bool(self.flash_bank_pending);
+        w.u32(self.flash_bank as u32);
+        w.u32(self.ee_addr_bits);
+        w.u32(self.ee_expect);
+        w.u128(self.ee_rx);
+        w.u32(self.ee_rx_count);
+        w.u32(self.ee_read_pos as u32);
+        // Fixed-size queue (<= 68 bits) so the whole state has a stable length.
+        w.u32(self.ee_read.len() as u32);
+        for i in 0..68 {
+            w.u8(self.ee_read.get(i).map(|&b| b as u8).unwrap_or(0));
+        }
+        w.bytes(&self.data);
+    }
+
+    pub fn deserialize(&mut self, r: &mut crate::state::Reader) {
+        self.flash_phase = r.u8();
+        self.flash_id_mode = r.bool();
+        self.flash_erase_prep = r.bool();
+        self.flash_write_pending = r.bool();
+        self.flash_bank_pending = r.bool();
+        self.flash_bank = r.u32() as usize;
+        self.ee_addr_bits = r.u32();
+        self.ee_expect = r.u32();
+        self.ee_rx = r.u128();
+        self.ee_rx_count = r.u32();
+        self.ee_read_pos = r.u32() as usize;
+        let n = r.u32() as usize;
+        let mut queue = Vec::with_capacity(n.min(68));
+        for i in 0..68 {
+            let b = r.bool();
+            if i < n {
+                queue.push(b);
+            }
+        }
+        self.ee_read = queue;
+        let data = r.bytes_vec();
+        let m = data.len().min(self.data.len());
+        self.data[..m].copy_from_slice(&data[..m]);
+    }
+
     // --- SRAM / Flash region (0x0E000000-0x0E00FFFF) ---------------------------
 
     pub fn read(&self, addr: u32) -> u8 {

@@ -96,6 +96,51 @@ impl Arm7tdmi {
         Self::default()
     }
 
+    /// Serialize the full register/banked state for a save-state.
+    pub fn serialize(&self, w: &mut crate::state::Writer) {
+        for &v in &self.r {
+            w.u32(v);
+        }
+        w.u32(self.cpsr);
+        w.u32(self.pipeline[0]);
+        w.u32(self.pipeline[1]);
+        w.bool(self.hle_bios);
+        for bank in &self.r8_12 {
+            for &v in bank {
+                w.u32(v);
+            }
+        }
+        for bank in &self.r13_14 {
+            w.u32(bank[0]);
+            w.u32(bank[1]);
+        }
+        for &v in &self.spsr_bank {
+            w.u32(v);
+        }
+    }
+
+    pub fn deserialize(&mut self, r: &mut crate::state::Reader) {
+        for v in &mut self.r {
+            *v = r.u32();
+        }
+        self.cpsr = r.u32();
+        self.pipeline[0] = r.u32();
+        self.pipeline[1] = r.u32();
+        self.hle_bios = r.bool();
+        for bank in &mut self.r8_12 {
+            for v in bank {
+                *v = r.u32();
+            }
+        }
+        for bank in &mut self.r13_14 {
+            bank[0] = r.u32();
+            bank[1] = r.u32();
+        }
+        for v in &mut self.spsr_bank {
+            *v = r.u32();
+        }
+    }
+
     /// The C flag (carry), needed as a shifter/ALU carry-in.
     pub fn carry(&self) -> bool {
         self.cpsr & (1 << 29) != 0
