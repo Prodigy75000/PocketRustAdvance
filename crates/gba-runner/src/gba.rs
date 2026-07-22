@@ -229,6 +229,11 @@ fn main() {
     // Auto-advance menus: hold A/Start in short pulses to reach in-game scenes.
     let autoinput = std::env::var_os("GBA_AUTOINPUT").is_some();
     let mut audio: Vec<i16> = Vec::new();
+    // GBA_APULOG: per-frame sound state, and flag frames whose audio has a large
+    // internal discontinuity (a "blip"), to correlate blips with what the game
+    // did to the sound registers / DISPCNT around a screen transition.
+    let apulog = std::env::var_os("GBA_APULOG").is_some();
+    let mut prev_sound = (0u8, 0u16, 0u16, 0u16);
     for f in 0..frames {
         if autoinput {
             let p = f % 24 < 4; // pulse A + Start to advance title and dialogue
@@ -236,7 +241,31 @@ fn main() {
             gba.set_button(gba_core::Button::Start, p);
         }
         let fb = gba.run_frame().to_vec();
-        audio.extend(gba.take_audio());
+        let a = gba.take_audio();
+        if apulog {
+            let blip = a
+                .chunks_exact(2)
+                .map(|s| s[0] as i32)
+                .collect::<Vec<_>>()
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .max()
+                .unwrap_or(0);
+            let sx = gba.bus.apu.read8(0x84);
+            let sl = u16::from_le_bytes([gba.bus.apu.read8(0x80), gba.bus.apu.read8(0x81)]);
+            let sh = u16::from_le_bytes([gba.bus.apu.read8(0x82), gba.bus.apu.read8(0x83)]);
+            let dispcnt = gba.bus.ppu.read_reg16(0);
+            let cur = (sx, sl, sh, dispcnt);
+            if cur != prev_sound || blip > 6000 {
+                println!(
+                    "  f{f:>4} blip={blip:>5} SOUNDCNT_X={sx:02X} _L={sl:04X} _H={sh:04X} DISPCNT={dispcnt:04X} fifoA={} fifoB={}",
+                    gba.bus.apu.fifo_a_len(),
+                    gba.bus.apu.fifo_b_len()
+                );
+                prev_sound = cur;
+            }
+        }
+        audio.extend(a);
         let d = distinct_count(&fb);
         if d > best_distinct {
             best_distinct = d;

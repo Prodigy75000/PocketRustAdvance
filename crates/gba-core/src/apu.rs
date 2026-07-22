@@ -364,6 +364,12 @@ pub struct Apu {
     hp_yl: i64,
     hp_xr: i32,
     hp_yr: i64,
+    // 2-tap moving-average state (previous filtered sample per side). Its null is
+    // at the output Nyquist (16384 Hz) = exactly where the 16384 Hz Direct Sound
+    // playback images, so it removes the hard DS-sample-boundary steps ("blips")
+    // that the oversampler can't (they fall between output samples).
+    ma_l: i32,
+    ma_r: i32,
 
     cycle: u64,
     out: Vec<i16>,
@@ -391,6 +397,8 @@ impl Default for Apu {
             hp_yl: 0,
             hp_xr: 0,
             hp_yr: 0,
+            ma_l: 0,
+            ma_r: 0,
             cycle: 0,
             out: Vec::new(),
         }
@@ -404,6 +412,14 @@ impl Apu {
 
     pub fn take_output(&mut self) -> Vec<i16> {
         std::mem::take(&mut self.out)
+    }
+
+    /// Align the APU's clock to `cycle` (dropping any FIFO-pop backlog). Called
+    /// after a save-state load so audio resumes from the current time.
+    pub fn resync(&mut self, cycle: u64) {
+        self.cycle = cycle;
+        self.a_next = cycle;
+        self.b_next = cycle;
     }
 
     pub fn fifo_a_len(&self) -> usize {
@@ -590,6 +606,12 @@ impl Apu {
     /// timer `i`, or `None` if that timer is stopped; the selected one clocks the
     /// matching Direct Sound FIFO.
     pub fn generate(&mut self, timer_period: [Option<u32>; 2], target: u64) {
+        // Defensive: if the clock jumped far ahead of us (e.g. a save-state load
+        // left the APU cycle behind the bus cycle), snap forward instead of
+        // emitting a huge silent backlog of samples.
+        if target > self.cycle + 300_000 {
+            self.resync(target);
+        }
         while self.cycle + CYCLES_PER_SAMPLE <= target {
             let mut acc_l = 0i32;
             let mut acc_r = 0i32;
@@ -601,8 +623,12 @@ impl Apu {
                 acc_r += r;
             }
             let (l, r) = self.dc_block(acc_l / OVERSAMPLE as i32, acc_r / OVERSAMPLE as i32);
-            self.out.push(l.clamp(-32768, 32767) as i16);
-            self.out.push(r.clamp(-32768, 32767) as i16);
+            let out_l = (l + self.ma_l) / 2;
+            let out_r = (r + self.ma_r) / 2;
+            self.ma_l = l;
+            self.ma_r = r;
+            self.out.push(out_l.clamp(-32768, 32767) as i16);
+            self.out.push(out_r.clamp(-32768, 32767) as i16);
         }
     }
 
@@ -753,6 +779,8 @@ impl Apu {
         w.u64(self.hp_yl as u64);
         w.i32(self.hp_xr);
         w.u64(self.hp_yr as u64);
+        w.i32(self.ma_l);
+        w.i32(self.ma_r);
         for f in [&self.fifo_a, &self.fifo_b] {
             w.u8(f.len as u8);
             w.u8(f.head as u8);
@@ -790,6 +818,8 @@ impl Apu {
         self.hp_yl = r.u64() as i64;
         self.hp_xr = r.i32();
         self.hp_yr = r.u64() as i64;
+        self.ma_l = r.i32();
+        self.ma_r = r.i32();
         for f in [&mut self.fifo_a, &mut self.fifo_b] {
             f.len = r.u8() as usize;
             f.head = r.u8() as usize;

@@ -109,6 +109,10 @@ impl Gba {
         }
         self.cpu.deserialize(&mut r);
         self.bus.deserialize(&mut r);
+        // Resume audio from the restored clock, not from wherever the APU's own
+        // cycle landed (a pre-APU state leaves it at 0, which would burst).
+        let now = self.bus.cycles;
+        self.bus.apu.resync(now);
         !r.failed
     }
 
