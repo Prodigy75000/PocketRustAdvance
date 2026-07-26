@@ -348,35 +348,42 @@ impl Ppu {
 
     fn render_bitmap(&mut self, line: usize, mode: u16, dispcnt: u16) {
         let backdrop = self.backdrop();
+        let frame = if dispcnt & 0x10 != 0 { 0xA000 } else { 0 };
+        // In modes 3/4/5 the bitmap is BG2, an AFFINE background: it is sampled
+        // through BG2's rotation/scaling matrix (PA/PB/PC/PD) and reference point,
+        // not blitted 1:1. Games commonly magnify a smaller video frame 2x (PA=PD=
+        // 0x080) to fill the screen; blitting 1:1 showed it at 1/4 size in the
+        // corner (DBZ Legacy of Goku's intro cinematic). bg_ref[0] holds BG2's
+        // per-scanline reference (reloaded at line 0, advanced by PB/PD each line).
+        let pa = self.regs[BG2_PA] as i16 as i32; // dx per screen pixel
+        let pc = self.regs[BG2_PA + 2] as i16 as i32; // dy per screen pixel
+        let (mut cx, mut cy) = (self.bg_ref[0][0], self.bg_ref[0][1]);
+        // Bitmap dimensions: modes 3/4 are full-screen, mode 5 is 160x128.
+        let (bw, bh) = if mode == 5 { (160i32, 128i32) } else { (SCREEN_W as i32, SCREEN_H as i32) };
+
         let row = &mut self.framebuffer[line * SCREEN_W..(line + 1) * SCREEN_W];
-        match mode {
-            3 => {
-                let base = line * SCREEN_W * 2;
-                for (x, px) in row.iter_mut().enumerate() {
-                    let o = base + x * 2;
-                    *px = u16::from_le_bytes([self.vram[o], self.vram[o + 1]]) & 0x7FFF;
-                }
+        for px in row.iter_mut() {
+            let tx = cx >> 8;
+            let ty = cy >> 8;
+            cx = cx.wrapping_add(pa);
+            cy = cy.wrapping_add(pc);
+            if tx < 0 || ty < 0 || tx >= bw || ty >= bh {
+                *px = backdrop; // outside the bitmap: backdrop (no wrap in bitmap modes)
+                continue;
             }
-            4 => {
-                let frame = if dispcnt & 0x10 != 0 { 0xA000 } else { 0 };
-                let base = frame + line * SCREEN_W;
-                for (x, px) in row.iter_mut().enumerate() {
-                    let idx = self.vram[base + x] as usize;
-                    *px = u16::from_le_bytes([self.palram[idx * 2], self.palram[idx * 2 + 1]])
-                        & 0x7FFF;
+            let (tx, ty) = (tx as usize, ty as usize);
+            *px = match mode {
+                4 => {
+                    let idx = self.vram[frame + ty * bw as usize + tx] as usize;
+                    u16::from_le_bytes([self.palram[idx * 2], self.palram[idx * 2 + 1]]) & 0x7FFF
                 }
-            }
-            _ => {
-                let frame = if dispcnt & 0x10 != 0 { 0xA000 } else { 0 };
-                for (x, px) in row.iter_mut().enumerate() {
-                    if line < 128 && x < 160 {
-                        let o = frame + (line * 160 + x) * 2;
-                        *px = u16::from_le_bytes([self.vram[o], self.vram[o + 1]]) & 0x7FFF;
-                    } else {
-                        *px = backdrop;
-                    }
+                _ => {
+                    // Modes 3 and 5 are direct RGB555 (mode 3 always frame 0).
+                    let base = if mode == 3 { 0 } else { frame };
+                    let o = base + (ty * bw as usize + tx) * 2;
+                    u16::from_le_bytes([self.vram[o], self.vram[o + 1]]) & 0x7FFF
                 }
-            }
+            };
         }
     }
 
@@ -851,6 +858,29 @@ mod tests {
         p.render_line(0);
         assert_eq!(p.framebuffer[0], 0x001F);
         assert_eq!(p.framebuffer[7], 0x001F);
+    }
+
+    #[test]
+    fn bitmap_mode3_samples_through_bg2_affine() {
+        // In modes 3/4/5 the bitmap is BG2, sampled through its affine matrix.
+        let mut p = Ppu::new();
+        put16(&mut p.vram, 0, 0x001F); // texel (0,0) = red
+        put16(&mut p.vram, 2, 0x03E0); // texel (1,0) = green
+        p.write_reg16(0x00, 0x0403); // DISPCNT: mode 3 + BG2
+        p.write_reg16(0x20, 0x0100); // BG2PA = 1.0 (identity)
+        p.write_reg16(0x26, 0x0100); // BG2PD = 1.0
+        p.begin_line(0);
+        p.render_line(0);
+        assert_eq!(p.framebuffer[0], 0x001F, "identity: screen x0 = texel 0");
+        assert_eq!(p.framebuffer[1], 0x03E0, "identity: screen x1 = texel 1");
+        // 2x magnification (PA = 0.5): two screen pixels per source texel, so the
+        // small bitmap fills the screen instead of sitting 1:1 in the corner.
+        p.write_reg16(0x20, 0x0080); // BG2PA = 0.5
+        p.begin_line(0);
+        p.render_line(0);
+        assert_eq!(p.framebuffer[0], 0x001F, "magnify: x0 = texel 0");
+        assert_eq!(p.framebuffer[1], 0x001F, "magnify: x1 still texel 0 (2x)");
+        assert_eq!(p.framebuffer[2], 0x03E0, "magnify: x2 = texel 1");
     }
 
     #[test]

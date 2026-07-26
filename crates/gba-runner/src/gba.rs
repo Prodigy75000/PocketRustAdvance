@@ -42,11 +42,17 @@ fn write_wav(path: &std::ffi::OsStr, samples: &[i16], rate: u32) -> std::io::Res
 /// A tiny ARM program: DISPCNT = mode 3 + BG2, then fill 240*160 VRAM halfwords
 /// with an incrementing value (a gradient), then spin.
 fn test_rom() -> Vec<u8> {
-    let words: [u32; 12] = [
+    let words: [u32; 16] = [
         0xE3A00404, // MOV  R0, #0x04000000      ; DISPCNT
         0xE3A01003, // MOV  R1, #3               ; mode 3
         0xE3811B01, // ORR  R1, R1, #0x400       ; + BG2 enable
         0xE1C010B0, // STRH R1, [R0]
+        // Bitmap modes sample BG2 through its affine matrix, so set it to the
+        // identity (PA=PD=1.0) or the bitmap would not display 1:1.
+        0xE3800020, // ORR  R0, R0, #0x20        ; R0 = 0x04000020 (BG2PA)
+        0xE3A01C01, // MOV  R1, #0x100           ; 1.0 in 8.8 fixed-point
+        0xE1C010B0, // STRH R1, [R0]             ; BG2PA = 0x100
+        0xE1C010B6, // STRH R1, [R0, #6]         ; BG2PD = 0x100
         0xE3A00406, // MOV  R0, #0x06000000      ; VRAM
         0xE3A02000, // MOV  R2, #0               ; colour = 0
         0xE3A03C96, // MOV  R3, #0x9600          ; 38400 pixels
@@ -310,6 +316,11 @@ fn main() {
     // internal discontinuity (a "blip"), to correlate blips with what the game
     // did to the sound registers / DISPCNT around a screen transition.
     let apulog = std::env::var_os("GBA_APULOG").is_some();
+    // GBA_BGLOG: per-frame background register snapshot (DISPCNT, BGxCNT, scrolls,
+    // BG2 affine matrix) — printed only when it changes, to find how a scene sets
+    // up its backgrounds. Used to diagnose torn/mis-scaled background rendering.
+    let bglog = std::env::var_os("GBA_BGLOG").is_some();
+    let mut prev_bg = String::new();
     let mut prev_sound = (0u8, 0u16, 0u16, 0u16);
     let (mut lp, mut lu, mut lr) = (0u64, 0u64, 0u64);
     let mut lirq = 0u64;
@@ -320,6 +331,20 @@ fn main() {
             gba.set_button(gba_core::Button::Start, p);
         }
         let fb = gba.run_frame().to_vec();
+        if bglog {
+            let p = &gba.bus.ppu;
+            let r = |o: u32| p.read_reg16(o);
+            let s = format!(
+                "DISP={:04X} mode{} | BGCNT {:04X} {:04X} {:04X} {:04X} | BG2 PA={:04X} PB={:04X} PC={:04X} PD={:04X} X={:04X}{:04X} Y={:04X}{:04X} | BG3 PA={:04X} PB={:04X} PC={:04X} PD={:04X} X={:04X}{:04X} Y={:04X}{:04X}",
+                r(0), r(0) & 7, r(8), r(0xA), r(0xC), r(0xE),
+                r(0x20), r(0x22), r(0x24), r(0x26), r(0x2A), r(0x28), r(0x2E), r(0x2C),
+                r(0x30), r(0x32), r(0x34), r(0x36), r(0x3A), r(0x38), r(0x3E), r(0x3C),
+            );
+            if s != prev_bg {
+                println!("  f{f:>4} {s}");
+                prev_bg = s;
+            }
+        }
         let a = gba.take_audio();
         if apulog {
             let blip = a
@@ -465,7 +490,9 @@ fn main() {
         // GBA_DUMP=<hexaddr>: dump 64 bytes of IWRAM/EWRAM as 32-bit words.
         if let Ok(a) = std::env::var("GBA_DUMP") {
             let addr = u32::from_str_radix(a.trim_start_matches("0x"), 16).unwrap_or(0x0300_0000);
-            let (name, mem, off) = if addr >= 0x0300_0000 {
+            let (name, mem, off) = if (0x0600_0000..0x0700_0000).contains(&addr) {
+                ("VRAM", &gba.bus.ppu.vram[..], (addr & 0x1_FFFF) as usize)
+            } else if addr >= 0x0300_0000 {
                 ("IWRAM", &gba.bus.iwram[..], (addr & 0x7FFF) as usize)
             } else {
                 ("EWRAM", &gba.bus.ewram[..], (addr & 0x3_FFFF) as usize)
