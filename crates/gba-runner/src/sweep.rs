@@ -43,9 +43,17 @@ fn distinct(fb: &[u16]) -> usize {
 
 /// Boot one ROM and return (peak distinct colours, frame of that peak, CPU
 /// steps, non-zero audio samples). Panics propagate to the caller's catch.
-fn run_one(rom: Vec<u8>, frames: u32) -> (usize, u32, u64, u64) {
-    let mut gba = Gba::new(rom, Vec::new()); // HLE direct-boot (shipping config)
-    let (mut best, mut best_frame, mut audio_nz) = (0usize, 0u32, 0u64);
+/// With `bios` empty this is HLE direct-boot (the shipping config); pass a real
+/// 16 KB BIOS (via GBA_BIOS) to measure how many failures are BIOS-dependent.
+fn run_one(rom: Vec<u8>, bios: &[u8], frames: u32) -> (usize, u32, u64, usize) {
+    let mut gba = Gba::new(rom, bios.to_vec());
+    let (mut best, mut best_frame) = (0usize, 0u32);
+    // `late` = peak distinct colours over the final ~30 frames. Unlike the
+    // all-frames peak, this is immune to the BIOS boot-logo animation (which
+    // makes every cart colourful early), so it reflects whether the *game* is
+    // actually drawing when we stop, not just that something flashed at boot.
+    let late_from = frames.saturating_sub(30);
+    let mut late = 0usize;
     for f in 0..frames {
         let p = f % 24 < 4; // pulse A+Start to advance logos / title / dialogue
         gba.set_button(Button::A, p);
@@ -55,9 +63,12 @@ fn run_one(rom: Vec<u8>, frames: u32) -> (usize, u32, u64, u64) {
             best = d;
             best_frame = f;
         }
-        audio_nz += gba.take_audio().iter().filter(|&&s| s != 0).count() as u64;
+        if f >= late_from && d > late {
+            late = d;
+        }
+        let _ = gba.take_audio();
     }
-    (best, best_frame, gba.steps, audio_nz)
+    (best, best_frame, gba.steps, late)
 }
 
 fn main() {
@@ -68,6 +79,9 @@ fn main() {
     let workers: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
         std::thread::available_parallelism().map(|n| n.get().saturating_sub(2).max(1)).unwrap_or(4)
     });
+
+    // Optional real/open BIOS (GBA_BIOS=<path>); empty = HLE direct-boot.
+    let bios = std::env::var("GBA_BIOS").ok().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
 
     let mut roms = Vec::new();
     collect_gba(&root, &mut roms);
@@ -85,8 +99,9 @@ fn main() {
     }
     let todo: Vec<PathBuf> = roms.into_iter().filter(|p| !done.contains(&p.to_string_lossy().to_string())).collect();
     eprintln!(
-        "sweep: {} ROMs found, {} already done, {} to run, {} frames, {} workers",
-        total_found, done.len(), todo.len(), frames, workers
+        "sweep: {} ROMs found, {} already done, {} to run, {} frames, {} workers, bios={}",
+        total_found, done.len(), todo.len(), frames, workers,
+        if bios.is_empty() { "HLE" } else { "yes" }
     );
 
     // Capture each panic's location + message (per worker thread) instead of
@@ -118,12 +133,12 @@ fn main() {
                     break;
                 }
                 let path = &todo[i];
-                // Columns: path, status, distinct, best_frame, steps, audio_nz, note
+                // Columns: path, status, peak_distinct, best_frame, steps, late_distinct, note
                 let line = match std::fs::read(path) {
                     Err(e) => format!("{}\tREADERR\t0\t0\t0\t0\t{}\n", path.display(), e),
-                    Ok(rom) => match panic::catch_unwind(AssertUnwindSafe(|| run_one(rom, frames))) {
-                        Ok((d, bf, steps, anz)) => {
-                            format!("{}\tOK\t{}\t{}\t{}\t{}\t\n", path.display(), d, bf, steps, anz)
+                    Ok(rom) => match panic::catch_unwind(AssertUnwindSafe(|| run_one(rom, &bios, frames))) {
+                        Ok((d, bf, steps, late)) => {
+                            format!("{}\tOK\t{}\t{}\t{}\t{}\t\n", path.display(), d, bf, steps, late)
                         }
                         Err(_) => {
                             let msg = LAST_PANIC.with(|p| p.borrow().clone());

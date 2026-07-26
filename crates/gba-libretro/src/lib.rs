@@ -4,9 +4,10 @@
 //! by any libretro host (RetroArch, Trophy Hub's libretro host, ...). The core
 //! runs single-threaded, so all state lives in a thread-local `State`.
 //!
-//! The core boots directly into the cartridge with an HLE BIOS (no BIOS image
-//! required) and produces an RGB555 framebuffer, which we expand to XRGB8888
-//! for the host. Audio and save-states are not wired yet.
+//! The core boots through a real `gba_bios.bin` if the frontend's system dir
+//! provides one (needed by titles that read the BIOS ROM directly), otherwise
+//! it HLE direct-boots. It produces an RGB555 framebuffer, which we expand to
+//! XRGB8888 for the host. Audio and save-states are wired.
 
 #![allow(non_camel_case_types)]
 #![allow(clippy::missing_safety_doc)]
@@ -63,6 +64,7 @@ struct retro_game_info {
 }
 
 // Environment command + pixel-format constants we use.
+const RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY: u32 = 9;
 const RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: u32 = 10;
 const RETRO_PIXEL_FORMAT_XRGB8888: i32 = 1;
 
@@ -86,6 +88,7 @@ const RETRO_DEVICE_ID_JOYPAD_R: u32 = 11;
 struct State {
     gba: Option<Gba>,
     rom: Vec<u8>,    // kept so retro_reset can rebuild the machine
+    bios: Vec<u8>,   // resolved once at load, reused by retro_reset
     frame: Vec<u32>, // XRGB8888, SCREEN_W*SCREEN_H
     env: retro_environment_t,
     video: retro_video_refresh_t,
@@ -99,6 +102,7 @@ impl State {
         State {
             gba: None,
             rom: Vec::new(),
+            bios: Vec::new(),
             frame: Vec::new(),
             env: None,
             video: None,
@@ -213,11 +217,33 @@ pub extern "C" fn retro_set_input_state(cb: retro_input_state_t) {
 #[no_mangle]
 pub extern "C" fn retro_set_controller_port_device(_port: u32, _device: u32) {}
 
+/// Resolve the BIOS to boot through: a real `gba_bios.bin` from the frontend's
+/// system directory if the host provides one (this fixes titles that read live
+/// data straight out of the BIOS ROM — an open-source reimplementation has
+/// different bytes there and does not serve them), otherwise an empty vector,
+/// which makes [`Gba::new`] HLE direct-boot (the proven default).
+unsafe fn resolve_bios(env: retro_environment_t) -> Vec<u8> {
+    if let Some(env) = env {
+        let mut dir: *const c_char = ptr::null();
+        let ok = env(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &mut dir as *mut *const c_char as *mut c_void);
+        if ok && !dir.is_null() {
+            if let Ok(dir) = std::ffi::CStr::from_ptr(dir).to_str() {
+                if let Ok(data) = std::fs::read(format!("{dir}/gba_bios.bin")) {
+                    if data.len() >= 0x4000 {
+                        return data; // real BIOS present → boot through it
+                    }
+                }
+            }
+        }
+    }
+    Vec::new() // no BIOS → HLE direct-boot
+}
+
 #[no_mangle]
 pub extern "C" fn retro_reset() {
     with_state(|s| {
         if !s.rom.is_empty() {
-            s.gba = Some(Gba::new(s.rom.clone(), Vec::new()));
+            s.gba = Some(Gba::new(s.rom.clone(), s.bios.clone()));
         }
     });
 }
@@ -239,8 +265,11 @@ pub unsafe extern "C" fn retro_load_game(info: *const retro_game_info) -> bool {
             );
         }
         s.rom = rom.clone();
-        // Direct boot with the HLE BIOS (no BIOS image needed).
-        s.gba = Some(Gba::new(rom, Vec::new()));
+        // Boot through a BIOS (real hardware behaviour): a system-dir gba_bios.bin
+        // if the host has one, else the bundled open BIOS. Fixes titles that read
+        // the BIOS ROM / depend on BIOS-initialised state.
+        s.bios = resolve_bios(s.env);
+        s.gba = Some(Gba::new(rom, s.bios.clone()));
     });
     true
 }
