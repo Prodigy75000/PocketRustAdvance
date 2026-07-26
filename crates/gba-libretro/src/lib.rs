@@ -4,10 +4,11 @@
 //! by any libretro host (RetroArch, Trophy Hub's libretro host, ...). The core
 //! runs single-threaded, so all state lives in a thread-local `State`.
 //!
-//! The core boots through a real `gba_bios.bin` if the frontend's system dir
-//! provides one (needed by titles that read the BIOS ROM directly), otherwise
-//! it HLE direct-boots. It produces an RGB555 framebuffer, which we expand to
-//! XRGB8888 for the host. Audio and save-states are wired.
+//! The core boots through a BIOS: the bundled open-source BIOS by default (no
+//! install needed, matches gpSP), or a real `gba_bios.bin` from the frontend's
+//! system dir when present (also serves titles that read the BIOS ROM directly).
+//! It produces an RGB555 framebuffer, expanded to XRGB8888 for the host. Audio
+//! and save-states are wired.
 
 #![allow(non_camel_case_types)]
 #![allow(clippy::missing_safety_doc)]
@@ -67,6 +68,14 @@ struct retro_game_info {
 const RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY: u32 = 9;
 const RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: u32 = 10;
 const RETRO_PIXEL_FORMAT_XRGB8888: i32 = 1;
+
+/// Bundled open-source GBA BIOS (Normmatt's clean-room reimplementation — the
+/// same freely-redistributable image gpSP ships). We boot through it by default
+/// so no BIOS install is needed and behaviour matches gpSP. It cannot serve
+/// titles that read the *real* BIOS ROM's bytes directly (a reimplementation has
+/// different bytes at those offsets); for those, a real `gba_bios.bin` in the
+/// system directory overrides this.
+static OPEN_BIOS: &[u8] = include_bytes!("../open_gba_bios.bin");
 
 const RETRO_MEMORY_SAVE_RAM: u32 = 0;
 
@@ -218,10 +227,9 @@ pub extern "C" fn retro_set_input_state(cb: retro_input_state_t) {
 pub extern "C" fn retro_set_controller_port_device(_port: u32, _device: u32) {}
 
 /// Resolve the BIOS to boot through: a real `gba_bios.bin` from the frontend's
-/// system directory if the host provides one (this fixes titles that read live
-/// data straight out of the BIOS ROM — an open-source reimplementation has
-/// different bytes there and does not serve them), otherwise an empty vector,
-/// which makes [`Gba::new`] HLE direct-boot (the proven default).
+/// system directory if the host provides one (this additionally fixes titles
+/// that read live data straight out of the real BIOS ROM), otherwise the bundled
+/// open BIOS. No BIOS install is required for the common case.
 unsafe fn resolve_bios(env: retro_environment_t) -> Vec<u8> {
     if let Some(env) = env {
         let mut dir: *const c_char = ptr::null();
@@ -230,13 +238,13 @@ unsafe fn resolve_bios(env: retro_environment_t) -> Vec<u8> {
             if let Ok(dir) = std::ffi::CStr::from_ptr(dir).to_str() {
                 if let Ok(data) = std::fs::read(format!("{dir}/gba_bios.bin")) {
                     if data.len() >= 0x4000 {
-                        return data; // real BIOS present → boot through it
+                        return data; // real BIOS present → prefer it
                     }
                 }
             }
         }
     }
-    Vec::new() // no BIOS → HLE direct-boot
+    OPEN_BIOS.to_vec() // bundled open BIOS (default; no install needed)
 }
 
 #[no_mangle]
