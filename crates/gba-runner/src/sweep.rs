@@ -84,7 +84,19 @@ fn main() {
     let bios = std::env::var("GBA_BIOS").ok().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
 
     let mut roms = Vec::new();
-    collect_gba(&root, &mut roms);
+    if root.extension().map(|e| e == "txt").unwrap_or(false) {
+        // Listfile mode: one ROM path per line (lets us sweep an exact subset).
+        if let Ok(f) = File::open(&root) {
+            for line in BufReader::new(f).lines().map_while(Result::ok) {
+                let p = line.trim();
+                if !p.is_empty() {
+                    roms.push(PathBuf::from(p));
+                }
+            }
+        }
+    } else {
+        collect_gba(&root, &mut roms);
+    }
     roms.sort();
     let total_found = roms.len();
 
