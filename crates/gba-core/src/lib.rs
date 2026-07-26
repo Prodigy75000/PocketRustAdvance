@@ -63,9 +63,25 @@ impl Gba {
         let mut bus = GbaBus::new(rom, bios);
         let mut cpu = Arm7tdmi::new();
 
-        if has_bios {
-            // Reset entry: Supervisor mode at the reset vector, IRQ/FIQ masked.
+        if has_bios && std::env::var_os("GBA_FULLBOOT").is_some() {
+            // Full BIOS boot (reset vector, Supervisor, IRQ/FIQ masked): runs the
+            // whole BIOS boot sequence + logo. Opt-in via GBA_FULLBOOT — a few
+            // titles depend on the boot-time state it sets up (Pitfall Mayan
+            // Adventure, Super Robot Taisen A, ...) that fast-boot skips.
             cpu.load_full(0x13 | (1 << 7) | (1 << 6), [0; 16], [0; 7], [0; 2], [0; 2], [0; 2], [0; 2], [0; 5]);
+        } else if has_bios {
+            // Fast/direct boot WITH the BIOS still loaded (DEFAULT): jump straight
+            // to the cartridge with post-BIOS register state, skipping the BIOS
+            // boot animation, but leave the BIOS image in place so SWIs run the
+            // BIOS's own code and BIOS-ROM reads work. gpSP-style — no ~2 s boot
+            // logo, and it rescues more games than full-boot (incl. titles that
+            // loop the boot). hle_bios stays false.
+            let mut r = [0u32; 16];
+            r[13] = 0x0300_7F00;
+            r[15] = 0x0800_0000;
+            let svc = [0x0300_7FE0, 0];
+            let irq = [0x0300_7FA0, 0];
+            cpu.load_full(0x1F, r, [0; 7], svc, [0, 0], irq, [0; 2], [0; 5]);
         } else {
             // Direct boot: System mode at the cartridge entry, standard stacks.
             let mut r = [0u32; 16];
