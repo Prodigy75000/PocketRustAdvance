@@ -275,7 +275,11 @@ fn lz77_uncomp<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, vram: bool) {
                     if out.len() >= size {
                         break;
                     }
-                    let byte = out[out.len() - disp];
+                    // A back-reference before the output start reads the memory
+                    // preceding the destination on real hardware (uninitialised,
+                    // effectively 0). Guard the usize underflow rather than panic.
+                    let idx = out.len().wrapping_sub(disp);
+                    let byte = out.get(idx).copied().unwrap_or(0);
                     out.push(byte);
                 }
             } else {

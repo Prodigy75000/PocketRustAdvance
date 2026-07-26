@@ -251,7 +251,17 @@ impl Ppu {
 
     pub fn vram_index(addr: u32) -> usize {
         // 128 KB window; the top 32 KB mirror the 0x10000..0x18000 range.
-        let o = (addr & 0x1_FFFF) as usize;
+        Self::vram_fold((addr & 0x1_FFFF) as usize)
+    }
+
+    /// Fold a raw VRAM byte offset into the backing 96 KB, applying the same
+    /// 128 KB-window mirror as [`vram_index`]. Render-path tile/sprite fetches
+    /// compute offsets (char_base + tile*size + ...) that can legitimately run
+    /// past 96 KB; hardware mirrors rather than faulting, so fold instead of
+    /// indexing out of bounds.
+    #[inline]
+    pub fn vram_fold(o: usize) -> usize {
+        let o = o & 0x1_FFFF;
         if o >= 0x18000 {
             o - 0x8000
         } else {
@@ -575,9 +585,9 @@ impl Ppu {
                 let base = 0x1_0000 + unit * 32;
                 let (px, py) = (tex_x % 8, tex_y % 8);
                 let idx = if is_8bpp {
-                    self.vram[base + py * 8 + px] as usize
+                    self.vram[Self::vram_fold(base + py * 8 + px)] as usize
                 } else {
-                    let b = self.vram[base + py * 4 + px / 2];
+                    let b = self.vram[Self::vram_fold(base + py * 4 + px / 2)];
                     (if px & 1 == 0 { b & 0xF } else { b >> 4 }) as usize
                 };
                 if idx != 0 {
@@ -625,8 +635,8 @@ impl Ppu {
                 continue; // outside the map, transparent
             }
             let (tx, ty) = (tx as usize, ty as usize);
-            let tile = self.vram[screen_base + (ty / 8) * map_tiles + tx / 8] as usize;
-            let pal = self.vram[char_base + tile * 64 + (ty % 8) * 8 + (tx % 8)] as usize;
+            let tile = self.vram[Self::vram_fold(screen_base + (ty / 8) * map_tiles + tx / 8)] as usize;
+            let pal = self.vram[Self::vram_fold(char_base + tile * 64 + (ty % 8) * 8 + (tx % 8))] as usize;
             if pal == 0 {
                 continue; // transparent
             }
@@ -675,15 +685,16 @@ impl Ppu {
             };
             let tx = (bgx % 256) / 8;
             let map = screen_base + sb * 0x800 + (ty * 32 + tx) * 2;
-            let entry = u16::from_le_bytes([self.vram[map], self.vram[map + 1]]);
+            let entry =
+                u16::from_le_bytes([self.vram[Self::vram_fold(map)], self.vram[Self::vram_fold(map + 1)]]);
             let tile = (entry & 0x3FF) as usize;
             let px = if entry & 0x400 != 0 { 7 - (bgx % 8) } else { bgx % 8 };
             let py = if entry & 0x800 != 0 { 7 - py } else { py };
 
             let idx = if is_8bpp {
-                self.vram[char_base + tile * 64 + py * 8 + px] as usize
+                self.vram[Self::vram_fold(char_base + tile * 64 + py * 8 + px)] as usize
             } else {
-                let b = self.vram[char_base + tile * 32 + py * 4 + px / 2];
+                let b = self.vram[Self::vram_fold(char_base + tile * 32 + py * 4 + px / 2)];
                 (if px & 1 == 0 { b & 0xF } else { b >> 4 }) as usize
             };
             if idx == 0 {
@@ -790,9 +801,9 @@ impl Ppu {
                 let base = 0x1_0000 + unit * 32;
                 let (px, py) = (tex_x % 8, tex_y % 8);
                 let idx = if is_8bpp {
-                    self.vram[base + py * 8 + px] as usize
+                    self.vram[Self::vram_fold(base + py * 8 + px)] as usize
                 } else {
-                    let b = self.vram[base + py * 4 + px / 2];
+                    let b = self.vram[Self::vram_fold(base + py * 4 + px / 2)];
                     (if px & 1 == 0 { b & 0xF } else { b >> 4 }) as usize
                 };
                 if idx == 0 {
