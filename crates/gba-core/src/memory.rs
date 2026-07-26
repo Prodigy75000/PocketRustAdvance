@@ -457,6 +457,11 @@ impl GbaBus {
         }
         u16::from_le_bytes([self.read8_raw(addr), self.read8_raw(addr + 1)])
     }
+    /// Debug-only word read (no cycle cost, no side effects).
+    pub fn read32_dbg(&self, addr: u32) -> u32 {
+        self.read32_raw(addr)
+    }
+
     #[inline]
     fn read32_raw(&self, addr: u32) -> u32 {
         // The bus always returns the word-aligned value; the CPU rotates it for
@@ -507,6 +512,15 @@ impl GbaBus {
     // --- Writes: width-aware so display-memory quirks are honored --------------
 
     fn write(&mut self, addr: u32, val: u32, width: u32) {
+        // 0x10000000-0xFFFFFFFF is unused address space (the upper region-decode
+        // nibble is not mapped): writes there are ignored on hardware. Bailing
+        // here is essential — otherwise a wild/uninitialised pointer store (which
+        // real hardware harmlessly drops) would alias down into a real region and
+        // corrupt it. Motocross Maniacs et al. store to such a scratch pointer and
+        // would otherwise clobber their own copied IRQ handler in IWRAM.
+        if addr >= 0x1000_0000 {
+            return;
+        }
         if self.watch_addr != 0 && addr >= self.watch_addr && addr < self.watch_addr + 0x4
             && self.watch_hits.len() < 200
         {
@@ -637,6 +651,23 @@ mod tests {
 
     fn bus() -> GbaBus {
         GbaBus::new(vec![0; 0x100], Vec::new())
+    }
+
+    #[test]
+    fn unused_high_addresses_do_not_alias_into_ram() {
+        // Addresses >= 0x10000000 are unused space (the upper region-decode nibble
+        // is not mapped); writes there must be dropped, NOT folded into a real
+        // region. Before the fix, 0xE3A00057 aliased to IWRAM 0x0057 via a 4-bit
+        // region mask and clobbered whatever lived there (e.g. a copied IRQ
+        // handler), turning a harmless wild-pointer store into a boot crash.
+        let mut b = bus();
+        b.write32(0x0300_0054, 0xE28C_C004, Access::NonSeq); // real IWRAM word
+        b.write32(0xE3A0_0057, 0x0000_0000, Access::NonSeq); // wild pointer store
+        assert_eq!(
+            b.read32(0x0300_0054, Access::NonSeq),
+            0xE28C_C004,
+            "a store to unused space (0xE3A00057) must not touch IWRAM"
+        );
     }
 
     #[test]

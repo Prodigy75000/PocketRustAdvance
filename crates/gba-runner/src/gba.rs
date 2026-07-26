@@ -179,6 +179,37 @@ fn main() {
         .and_then(|p| std::fs::read(p).ok())
         .unwrap_or_default();
 
+    // GBA_ROMFIND=<hex32>: scan the ROM for the first occurrence of this 32-bit
+    // little-endian word and dump 32 words from there. Used to compare a copied
+    // IWRAM routine against its ROM source (copy-corruption diagnosis).
+    if let Ok(h) = std::env::var("GBA_ROMFIND") {
+        let needle = u32::from_str_radix(h.trim_start_matches("0x"), 16).unwrap_or(0);
+        let nb = needle.to_le_bytes();
+        let mut at = None;
+        let mut i = 0;
+        while i + 4 <= rom.len() {
+            if rom[i..i + 4] == nb {
+                at = Some(i);
+                break;
+            }
+            i += 4;
+        }
+        match at {
+            Some(off) => {
+                println!("ROMFIND {needle:08X} at file-offset {off:06X} (rom 0x{:08X}):", 0x0800_0000 + off);
+                for k in 0..32 {
+                    let o = off + k * 4;
+                    if o + 4 <= rom.len() {
+                        let w = u32::from_le_bytes([rom[o], rom[o + 1], rom[o + 2], rom[o + 3]]);
+                        println!("  +{:03X}  {w:08X}", k * 4);
+                    }
+                }
+            }
+            None => println!("ROMFIND {needle:08X}: not found"),
+        }
+        return;
+    }
+
     let is_cart = rom.len() >= 0xC0 && label.ends_with(".gba");
     if is_cart {
         dump_header(&rom);
@@ -219,6 +250,49 @@ fn main() {
     }
     if std::env::var_os("GBA_NOWINDOW").is_some() {
         gba.bus.ppu.no_window = true;
+    }
+    // GBA_ITRACE=<n>: single-step the CPU for n instructions and print every
+    // non-sequential PC change (a taken branch / exception / return). Used to
+    // pinpoint where a boot runs away into the weeds. Prints then exits.
+    if let Ok(n) = std::env::var("GBA_ITRACE") {
+        let cap: u64 = n.parse().unwrap_or(20000);
+        // GBA_BREAK=<hexaddr>: dump all registers each time this instruction runs.
+        let brk = std::env::var("GBA_BREAK").ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+        let mut prev_exec: u32 = 0;
+        for i in 0..cap {
+            {
+                let back = if gba.cpu.thumb() { 4 } else { 8 };
+                let exec = gba.cpu.r[15].wrapping_sub(back);
+                if Some(exec) == brk {
+                    let r = &gba.cpu.r;
+                    println!("  [{i:>6}] BREAK @{exec:08X}  r0={:08X} r1={:08X} r2={:08X} r3={:08X} r4={:08X} r5={:08X} lr={:08X}",
+                        r[0], r[1], r[2], r[3], r[4], r[5], r[14]);
+                }
+            }
+            if gba.bus.irq_pending() && gba.cpu.irq_ready() {
+                let from = gba.cpu.r[15];
+                gba.cpu.take_irq(&mut gba.bus);
+                println!("  [{i:>6}] IRQ  from PC~{from:08X} -> {:08X}", gba.cpu.r[15]);
+                gba.bus.halted = false;
+            }
+            let back = if gba.cpu.thumb() { 4 } else { 8 };
+            let exec = gba.cpu.r[15].wrapping_sub(back);
+            let width = if gba.cpu.thumb() { 2 } else { 4 };
+            // A branch: this instruction is not the sequential successor of the
+            // last one we executed.
+            if prev_exec != 0 && exec != prev_exec.wrapping_add(width) {
+                let mode = if gba.cpu.thumb() { "T" } else { "A" };
+                println!("  [{i:>6}] {mode} {prev_exec:08X} -> {exec:08X}");
+            }
+            prev_exec = exec;
+            gba.cpu.step(&mut gba.bus);
+            // Also advance timers/ppu coarsely so anything gated on them can move.
+            if i % 1000 == 0 {
+                gba.bus.step_timers();
+            }
+        }
+        return;
     }
     // Track the most "interesting" frame (most distinct colours) so a single PNG
     // lands on a real rendered screen, not a blank/forced-blank transition frame.
@@ -385,6 +459,24 @@ fn main() {
         println!("  OBJ pal[0..16]: {}", row(0x100));
         // Search EWRAM/IWRAM for the rug-green 0x5BF4 to find the source palette
         // buffer, and show whether it is paired there or clean (distinct).
+        // GBA_DUMP=<hexaddr>: dump 64 bytes of IWRAM/EWRAM as 32-bit words.
+        if let Ok(a) = std::env::var("GBA_DUMP") {
+            let addr = u32::from_str_radix(a.trim_start_matches("0x"), 16).unwrap_or(0x0300_0000);
+            let (name, mem, off) = if addr >= 0x0300_0000 {
+                ("IWRAM", &gba.bus.iwram[..], (addr & 0x7FFF) as usize)
+            } else {
+                ("EWRAM", &gba.bus.ewram[..], (addr & 0x3_FFFF) as usize)
+            };
+            print!("  {name}@{addr:08X}:");
+            for i in 0..16 {
+                let o = off + i * 4;
+                if o + 4 <= mem.len() {
+                    let w = u32::from_le_bytes([mem[o], mem[o + 1], mem[o + 2], mem[o + 3]]);
+                    print!(" {w:08X}");
+                }
+            }
+            println!();
+        }
         if let Ok(hexs) = std::env::var("GBA_FINDHALF") {
             let needle = u16::from_str_radix(&hexs, 16).unwrap_or(0x5BF4);
             for (name, mem) in [("EWRAM", &gba.bus.ewram[..]), ("IWRAM", &gba.bus.iwram[..])] {
