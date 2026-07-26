@@ -521,6 +521,19 @@ impl GbaBus {
         if addr >= 0x1000_0000 {
             return;
         }
+        // ARM7TDMI force-aligns store addresses to the access width: STR writes at
+        // addr & ~3, STRH at addr & ~1 (unlike LDR, a store does NOT rotate — the
+        // register value just lands at the aligned address). Without this, a word
+        // store to an unaligned address splits across the aligned slot's neighbour
+        // and corrupts it. DBZ Legacy of Goku registers a DMA2 IRQ handler with an
+        // unaligned STR to its ISR table; the raw-address write mangled the entry's
+        // top byte, so the first DMA2 IRQ vectored into garbage and ran away. (The
+        // load side of this was fixed earlier in read32_raw.)
+        let addr = match width {
+            4 => addr & !3,
+            2 => addr & !1,
+            _ => addr,
+        };
         if self.watch_addr != 0 && addr >= self.watch_addr && addr < self.watch_addr + 0x4
             && self.watch_hits.len() < 200
         {
@@ -668,6 +681,30 @@ mod tests {
             0xE28C_C004,
             "a store to unused space (0xE3A00057) must not touch IWRAM"
         );
+    }
+
+    #[test]
+    fn unaligned_word_store_force_aligns() {
+        // ARM7TDMI STR ignores the low address bits: a word store to 0x...3 lands
+        // at the word-aligned slot (0x...0), it does NOT straddle into the next
+        // word. DBZ Legacy of Goku registers an IRQ handler this way; the raw
+        // (unaligned) write corrupted the neighbouring ISR-table entry.
+        let mut b = bus();
+        b.write32(0x0300_0010, 0xAAAA_AAAA, Access::NonSeq); // neighbour slot
+        b.write32(0x0300_000F, 0x0800_996D, Access::NonSeq); // unaligned -> 0x...0C
+        assert_eq!(
+            b.read32(0x0300_000C, Access::NonSeq),
+            0x0800_996D,
+            "unaligned word store must land at the aligned slot"
+        );
+        assert_eq!(
+            b.read32(0x0300_0010, Access::NonSeq),
+            0xAAAA_AAAA,
+            "unaligned word store must not corrupt the next word"
+        );
+        // Halfword stores force-align to & ~1 the same way.
+        b.write16(0x0300_0021, 0x1234, Access::NonSeq); // -> 0x...20
+        assert_eq!(b.read16(0x0300_0020, Access::NonSeq), 0x1234);
     }
 
     #[test]

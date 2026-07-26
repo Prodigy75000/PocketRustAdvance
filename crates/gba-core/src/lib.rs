@@ -53,6 +53,14 @@ pub struct Gba {
     /// heavy graphics-DMA frame can't over-pump the FIFO and run the sample-buffer
     /// pointer off the end (which played garbage during screen transitions).
     audio_clock: u64,
+    /// Debug: when set, `run_frame` reports the first time the CPU executes from
+    /// unused address space (>= 0x10000000 = definitely a crashed/runaway PC),
+    /// printing the branch that jumped there. Off by default (one cheap compare
+    /// per instruction when enabled, nothing otherwise).
+    pub trap_unused: bool,
+    trap_prev: u32,
+    trap_from: u32,
+    trapped: bool,
 }
 
 impl Gba {
@@ -101,6 +109,10 @@ impl Gba {
             steps: 0,
             render_enabled: true,
             audio_clock: 0,
+            trap_unused: false,
+            trap_prev: 0,
+            trap_from: 0,
+            trapped: false,
         }
     }
 
@@ -160,6 +172,23 @@ impl Gba {
                     self.cpu.take_irq(&mut self.bus);
                     self.bus.halted = false;
                     self.irqs_taken += 1;
+                }
+                if self.trap_unused && !self.trapped {
+                    let back = if self.cpu.thumb() { 4 } else { 8 };
+                    let exec = self.cpu.r[15].wrapping_sub(back);
+                    let width = if self.cpu.thumb() { 2 } else { 4 };
+                    if exec >= 0x1000_0000 {
+                        eprintln!(
+                            "TRAP: PC jumped into unused space: {:08X} -> {exec:08X} (prev branch from {:08X}, irqs={})",
+                            self.trap_prev, self.trap_from, self.irqs_taken
+                        );
+                        self.trapped = true;
+                    } else {
+                        if self.trap_prev != 0 && exec != self.trap_prev.wrapping_add(width) {
+                            self.trap_from = self.trap_prev; // last in-range branch source
+                        }
+                        self.trap_prev = exec;
+                    }
                 }
                 if self.bus.halted {
                     // Parked waiting for an interrupt: skip to the end of the line

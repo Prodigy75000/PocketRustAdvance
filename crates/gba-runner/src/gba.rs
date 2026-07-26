@@ -300,6 +300,9 @@ fn main() {
     let mut best_distinct = 0usize;
     let mut best_frame = 0u32;
     let trace = std::env::var("GBA_TRACE").is_ok();
+    if std::env::var_os("GBA_TRAP").is_some() {
+        gba.trap_unused = true;
+    }
     // Auto-advance menus: hold A/Start in short pulses to reach in-game scenes.
     let autoinput = std::env::var_os("GBA_AUTOINPUT").is_some();
     let mut audio: Vec<i16> = Vec::new();
