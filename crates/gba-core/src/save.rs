@@ -255,6 +255,12 @@ impl Save {
         let ab = self.ee_addr_bits;
         // Address follows the 2 command bits.
         let addr = ((bits >> (n - 2 - ab)) & ((1u128 << ab) - 1)) as usize;
+        if std::env::var_os("GBA_EELOG").is_some() {
+            eprintln!(
+                "  EE {} addr={addr} (n={n} ab={ab} cmd={cmd:02b})",
+                if cmd == 0b11 { "READ " } else if cmd == 0b10 { "WRITE" } else { "?????" }
+            );
+        }
         let block = (addr & (self.data.len() / 8 - 1)) * 8;
         if cmd == 0b11 {
             // Read: queue 4 dummy bits then the 64 data bits, MSB first.
