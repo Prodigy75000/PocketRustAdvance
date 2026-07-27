@@ -244,6 +244,16 @@ fn main() {
             }
             Err(e) => eprintln!("could not read state {:?}: {e}", path),
         }
+        // Snapshot the display setup exactly as restored (before the game runs a
+        // frame and possibly re-initialises it), so we see the captured scene.
+        let p = &gba.bus.ppu;
+        eprintln!(
+            "  LOADED DISP={:04X} mode{} | BGCNT {:04X} {:04X} {:04X} {:04X} | BG2 PA={:04X} PD={:04X} X={:04X}{:04X} Y={:04X}{:04X} | BG3 PA={:04X} PD={:04X} X={:04X}{:04X} Y={:04X}{:04X}",
+            p.read_reg16(0), p.read_reg16(0) & 7,
+            p.read_reg16(8), p.read_reg16(0xA), p.read_reg16(0xC), p.read_reg16(0xE),
+            p.read_reg16(0x20), p.read_reg16(0x26), p.read_reg16(0x2A), p.read_reg16(0x28), p.read_reg16(0x2E), p.read_reg16(0x2C),
+            p.read_reg16(0x30), p.read_reg16(0x36), p.read_reg16(0x3A), p.read_reg16(0x38), p.read_reg16(0x3E), p.read_reg16(0x3C),
+        );
     }
     if let Ok(a) = std::env::var("GBA_WATCHW") {
         gba.bus.watch_addr = u32::from_str_radix(a.trim_start_matches("0x"), 16).unwrap_or(0);
