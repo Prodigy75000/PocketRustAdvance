@@ -267,6 +267,32 @@ fn main() {
     if std::env::var_os("GBA_NOWINDOW").is_some() {
         gba.bus.ppu.no_window = true;
     }
+    // GBA_RENDERONLY: render the framebuffer straight from the loaded PPU state
+    // WITHOUT running the CPU, then write the PNG and exit. Shows a save-state's
+    // captured scene exactly, bypassing any re-init the game does after resume.
+    if std::env::var_os("GBA_RENDERONLY").is_some() {
+        for y in 0..gba_core::SCREEN_H as u32 {
+            gba.bus.ppu.begin_line(y);
+            gba.bus.ppu.render_line(y as usize);
+        }
+        let fb: Vec<u16> = gba.bus.ppu.framebuffer.to_vec();
+        println!("  render-only: {} distinct colours", distinct_count(&fb));
+        let mut rgb = Vec::with_capacity(fb.len() * 3);
+        for &p in fb.iter() {
+            rgb.extend_from_slice(&[
+                ((p & 0x1F) << 3) as u8,
+                (((p >> 5) & 0x1F) << 3) as u8,
+                (((p >> 10) & 0x1F) << 3) as u8,
+            ]);
+        }
+        let file = File::create("gba_frame.png").expect("create png");
+        let mut enc = png::Encoder::new(BufWriter::new(file), SCREEN_W as u32, SCREEN_H as u32);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&rgb).unwrap();
+        println!("wrote gba_frame.png (render-only)");
+        return;
+    }
     // GBA_ITRACE=<n>: single-step the CPU for n instructions and print every
     // non-sequential PC change (a taken branch / exception / return). Used to
     // pinpoint where a boot runs away into the weeds. Prints then exits.
