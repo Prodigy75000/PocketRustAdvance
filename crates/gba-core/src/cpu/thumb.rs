@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! 16-bit Thumb instruction execution.
 //!
 //! Thumb is a second, denser encoding whose 19 formats decode down to the same

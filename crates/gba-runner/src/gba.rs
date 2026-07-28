@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! Runs the GBA core for a few frames and writes the framebuffer to a PNG.
 //!
 //! With no argument it runs a built-in, hand-assembled mode-3 test ROM (set

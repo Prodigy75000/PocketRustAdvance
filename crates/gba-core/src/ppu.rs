@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! The LCD video controller (PPU).
 //!
 //! This first cut owns the display memory (VRAM / palette / OAM) and the LCD I/O

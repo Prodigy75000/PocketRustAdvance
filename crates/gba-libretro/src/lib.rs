@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! libretro front-end ABI for gba-core.
 //!
 //! Exposes the standard `retro_*` C entry points so the GBA core can be loaded

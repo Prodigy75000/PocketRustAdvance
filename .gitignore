@@ -11,3 +11,9 @@ dumps/
 # Generated frame dumps from the gba runner.
 *.png
 gba_frame.png
+
+# Third-party reference docs (copyrighted by ARM / Martin Korth): kept locally
+# for development but not redistributed. Download them from the Sources listed
+# in docs/README.md.
+docs/*.pdf
+docs/*.htm

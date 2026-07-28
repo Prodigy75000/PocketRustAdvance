@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! Parser for the SingleStepTests ARM7TDMI `.json.bin` binary vector format.
 //!
 //! Layout (little-endian), mirrored from the repo's `transcode_json.py`:

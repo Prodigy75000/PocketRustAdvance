@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! Cartridge backup memory: SRAM, Flash (64/128 KB) and EEPROM (512 B / 8 KB).
 //!
 //! The type is detected from the ID string every commercial ROM embeds

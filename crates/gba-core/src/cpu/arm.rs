@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! 32-bit ARM instruction execution.
 //!
 //! First format online: **data processing** (the 16 ALU operations). The rest

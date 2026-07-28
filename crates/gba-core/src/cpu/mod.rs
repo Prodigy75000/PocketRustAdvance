@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! The ARM7TDMI: an ARMv4T core with a 3-stage pipeline and two instruction
 //! sets (32-bit ARM, 16-bit Thumb).
 //!

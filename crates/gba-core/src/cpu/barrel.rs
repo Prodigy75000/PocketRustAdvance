@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! The barrel shifter.
 //!
 //! Produces `(value, carry_out)` for the four shift types plus the ARM

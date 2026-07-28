@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! Bulk compatibility sweep: boot every ROM under a directory headless and
 //! record a cheap health signal per ROM, so we can gauge core maturity across
 //! thousands of games and surface the hard failures (no-boot / blank screen /

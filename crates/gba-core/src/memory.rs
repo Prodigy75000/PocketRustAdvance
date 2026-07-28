@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! The real GBA memory bus: the 8 regions, their mirroring, cycle costs, and
 //! I/O dispatch. Implements [`crate::bus::Bus`] so the CPU drives it exactly as
 //! it drove the test harness. Region layout and mirroring follow GBATEK.

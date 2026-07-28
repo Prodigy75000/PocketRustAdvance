@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! High-level emulation of the GBA BIOS SWI functions.
 //!
 //! On direct boot (no real BIOS image) the CPU has nothing at the SWI vector to

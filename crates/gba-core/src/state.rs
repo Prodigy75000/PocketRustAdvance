@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! Minimal binary (de)serialization for save-states. No external deps: each
 //! component writes its fields in a fixed order via [`Writer`] and reads them
 //! back via [`Reader`]. Reads are bounds-checked; a short/corrupt buffer sets

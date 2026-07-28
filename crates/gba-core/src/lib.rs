@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! gba-core: a clean-room Game Boy Advance emulator, written from scratch in
 //! Rust.
 //!

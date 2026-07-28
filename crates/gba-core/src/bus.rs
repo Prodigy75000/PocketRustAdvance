@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! The CPU/memory boundary.
 //!
 //! This trait is the single most important architectural decision in the core:

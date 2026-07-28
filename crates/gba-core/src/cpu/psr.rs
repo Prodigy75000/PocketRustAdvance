@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! Program Status Register (CPSR/SPSR) and processor modes.
 
 /// The seven ARM7TDMI operating modes, encoded by the low 5 bits of the PSR.

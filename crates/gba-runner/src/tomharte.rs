@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! TomHarte ARM7TDMI conformance runner.
 //!
 //! Loads a SingleStepTests `.json.bin` file, runs each vector through a real

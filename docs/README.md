@@ -5,6 +5,11 @@ part), plus the community hardware reference for the rest of the console.
 These are the authoritative inputs for clean-room implementation: read behavior
 from the spec, never from another emulator's source.
 
+> **The document files themselves are not committed** — they are copyrighted by
+> ARM Ltd. / Martin Korth and only referenced here. Download them into this
+> `docs/` folder from the **Sources** links at the bottom if you want them
+> locally; the repository ships only this index.
+
 ## Official ARM documentation
 
 | File | ARM doc # | Pages | What it's for |

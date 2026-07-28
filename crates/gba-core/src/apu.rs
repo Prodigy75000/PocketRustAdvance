@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Prodigy75000
+
 //! Clean-room GBA APU: the four PSG channels (identical to the DMG's sound
 //! hardware) plus the two 8-bit Direct Sound FIFO channels. Implemented from
 //! GBATEK's register maps and frequency formulas.
