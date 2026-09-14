@@ -166,8 +166,24 @@ fn darken(a: u16, evy: u16) -> u16 {
 
 impl Default for Ppu {
     fn default() -> Self {
+        // The affine matrices (BG2PA/PD, BG3PA/PD) reset to 1.0 in 8.8 fixed
+        // point, not to 0. Everything else powers up zeroed.
+        //
+        // This matters because BG2 goes through the affine unit in the bitmap
+        // modes (3/4/5) as well as the affine tile modes. A game that only ever
+        // uses mode 3/4/5 as a plain 1:1 framebuffer never writes the matrix at
+        // all: Killer 3D Pool, Shanghai Advance, Speedball 2 and Sky Dancers all
+        // switch to mode 4 with the matrix untouched. With the matrix left at 0,
+        // every screen pixel samples texel (0,0) and the whole frame collapses to
+        // one flat colour. Identity makes the affine path degenerate exactly to
+        // the 1:1 blit those games expect, while still honouring a matrix that a
+        // game does write.
+        let mut regs = [0u16; 0x40];
+        for off in [0x20, 0x26, 0x30, 0x36] {
+            regs[off >> 1] = 0x0100; // BG2PA, BG2PD, BG3PA, BG3PD = 1.0
+        }
         Ppu {
-            regs: [0; 0x40],
+            regs,
             vram: vec![0; 96 * 1024].into_boxed_slice(),
             palram: vec![0; 1024].into_boxed_slice(),
             oam: vec![0; 1024].into_boxed_slice(),
@@ -884,6 +900,32 @@ mod tests {
         assert_eq!(p.framebuffer[0], 0x001F, "magnify: x0 = texel 0");
         assert_eq!(p.framebuffer[1], 0x001F, "magnify: x1 still texel 0 (2x)");
         assert_eq!(p.framebuffer[2], 0x03E0, "magnify: x2 = texel 1");
+    }
+
+    #[test]
+    fn bitmap_mode_blits_1to1_with_the_matrix_untouched() {
+        // Regression: the affine matrix resets to 1.0, not 0. Plenty of bitmap
+        // games (Killer 3D Pool, Shanghai Advance, Speedball 2, Sky Dancers)
+        // switch to mode 3/4/5 and treat BG2 as a plain framebuffer, never
+        // writing BG2PA/PD at all. If the matrix starts at 0 every screen pixel
+        // samples texel (0,0) and the frame collapses to one flat colour.
+        //
+        // Deliberately does NOT write 0x20/0x26 -- the sibling test above does,
+        // which is why that one stayed green while these games went blank.
+        let mut p = Ppu::new();
+        assert_eq!(p.read_reg16(0x20), 0x0100, "BG2PA resets to 1.0");
+        assert_eq!(p.read_reg16(0x26), 0x0100, "BG2PD resets to 1.0");
+        assert_eq!(p.read_reg16(0x30), 0x0100, "BG3PA resets to 1.0");
+        assert_eq!(p.read_reg16(0x36), 0x0100, "BG3PD resets to 1.0");
+        put16(&mut p.vram, 0, 0x001F); // texel (0,0) = red
+        put16(&mut p.vram, 2, 0x03E0); // texel (1,0) = green
+        put16(&mut p.vram, 4, 0x7C00); // texel (2,0) = blue
+        p.write_reg16(0x00, 0x0403); // DISPCNT: mode 3 + BG2, matrix untouched
+        p.begin_line(0);
+        p.render_line(0);
+        assert_eq!(p.framebuffer[0], 0x001F, "x0 = texel 0");
+        assert_eq!(p.framebuffer[1], 0x03E0, "x1 = texel 1, not a repeat of texel 0");
+        assert_eq!(p.framebuffer[2], 0x7C00, "x2 = texel 2");
     }
 
     #[test]
