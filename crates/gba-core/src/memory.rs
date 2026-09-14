@@ -34,6 +34,13 @@ pub struct GbaBus {
     dma_src: [u32; 4],
     dma_dst: [u32; 4],
     dma_count: [u32; 4],
+    /// True while a transfer is running, so a DMA that writes into the DMA
+    /// control registers queues the newly enabled channel instead of nesting.
+    /// Transient (always false at a frame boundary), so it stays out of the
+    /// save-state and `format_version` is unaffected.
+    dma_active: bool,
+    /// Channels enabled from inside a running transfer, drained after it ends.
+    dma_pending: u8,
     /// Free-running cycle counter; drives the frame/scanline pacing.
     pub cycles: u64,
     /// CPU halted (by the HLE Halt / IntrWait SWIs) until the next IRQ.
@@ -118,6 +125,8 @@ impl GbaBus {
             dma_src: [0; 4],
             dma_dst: [0; 4],
             dma_count: [0; 4],
+            dma_active: false,
+            dma_pending: 0,
             cycles: 0,
             halted: false,
             cur_pc: 0,
@@ -254,9 +263,45 @@ impl GbaBus {
         for ch in 0..4 {
             let control = self.io_u16(0xB0 + ch as u32 * 12 + 10);
             if control & 0x8000 != 0 && (control >> 12) & 3 == timing {
-                self.run_dma(ch);
+                self.run_dma_guarded(ch);
             }
         }
+    }
+
+    /// Run a channel, then drain any channel that channel enabled.
+    ///
+    /// A transfer writes through the normal bus, so a DMA whose destination is
+    /// the DMA control block re-enters `start_dma` and, unguarded, recurses once
+    /// per transferred word. Hardware cannot do that: DMA is a state machine with
+    /// four fixed-priority channels, and enabling a channel from inside a running
+    /// transfer just schedules it. Unguarded this overflowed the stack outright,
+    /// which is worse than a hang because a stack overflow aborts the process and
+    /// `catch_unwind` cannot see it: it silently truncated the 6118-ROM sweep at
+    /// whatever ROM it happened to reach (263 ROMs never ran). Kaisertal (Europe)
+    /// (Demo) is the cheap repro.
+    fn run_dma_guarded(&mut self, ch: usize) {
+        if self.dma_active {
+            self.dma_pending |= 1 << ch;
+            return;
+        }
+        self.dma_active = true;
+        self.run_dma(ch);
+        // Lowest channel number first, matching hardware DMA priority. Bounded:
+        // a channel whose destination is its OWN control register re-arms itself
+        // every pass, so an unbounded drain would trade the stack overflow for a
+        // hang inside a single store. Hardware spends real cycles per transfer
+        // and the rest of the machine keeps advancing; we cannot yield from here,
+        // so we cap the drain and let the frame loop pick the channel up again on
+        // its next timing trigger.
+        let mut drained = 0;
+        while self.dma_pending != 0 && drained < 32 {
+            let c = self.dma_pending.trailing_zeros() as usize;
+            self.dma_pending &= !(1 << c);
+            self.run_dma(c);
+            drained += 1;
+        }
+        self.dma_pending = 0;
+        self.dma_active = false;
     }
 
     fn run_dma(&mut self, ch: usize) {
@@ -339,7 +384,7 @@ impl GbaBus {
         let max = if ch == 3 { 0x1_0000 } else { 0x4000 };
         self.dma_count[ch] = if cl == 0 { max } else { cl };
         if (control >> 12) & 3 == 0 {
-            self.run_dma(ch); // immediate
+            self.run_dma_guarded(ch); // immediate
         }
     }
 
@@ -715,6 +760,61 @@ mod tests {
         // Halfword stores force-align to & ~1 the same way.
         b.write16(0x0300_0021, 0x1234, Access::NonSeq); // -> 0x...20
         assert_eq!(b.read16(0x0300_0020, Access::NonSeq), 0x1234);
+    }
+
+    #[test]
+    fn dma_writing_dma_registers_queues_instead_of_recursing() {
+        // A transfer goes through the normal bus, so a DMA whose destination is
+        // the DMA control block re-enters start_dma. Unguarded that recursed once
+        // per transferred word and overflowed the stack, which aborts the process
+        // outright rather than panicking. Kaisertal (Europe) (Demo) does it.
+        //
+        // DMA3 writes one word into DMA0's SAD..CNT block, arming DMA0 to copy a
+        // marker into IWRAM. DMA0 must run exactly once, after DMA3 finishes.
+        let mut b = bus();
+        b.write32(0x0300_0100, 0xFEED_FACE, Access::NonSeq); // DMA0's future source
+        b.write32(0x0300_0200, 0x0000_0000, Access::NonSeq); // DMA0's future dest
+
+        // Pre-load DMA0's SAD/DAD; DMA3 supplies the count+control word.
+        b.write32(0x0400_00B0, 0x0300_0100, Access::NonSeq); // DMA0SAD
+        b.write32(0x0400_00B4, 0x0300_0200, Access::NonSeq); // DMA0DAD
+
+        // The word DMA3 stores over DMA0CNT (count in the low half, control in
+        // the high half): 1 word, enable + 32-bit + immediate. It has to be one
+        // aligned word because stores force-align, so writing CNT_H alone at
+        // 0xBA would slide down to 0xB8 and land in CNT_L.
+        b.write32(0x0300_0300, 0x8400_0001, Access::NonSeq);
+
+        b.write32(0x0400_00D4, 0x0300_0300, Access::NonSeq); // DMA3SAD
+        b.write32(0x0400_00D8, 0x0400_00B8, Access::NonSeq); // DMA3DAD = DMA0CNT
+        b.write16(0x0400_00DC, 1, Access::NonSeq); // DMA3CNT_L = 1
+        b.write16(0x0400_00DE, 0x8400, Access::NonSeq); // enable + 32-bit + immediate
+
+        assert_eq!(
+            b.read32(0x0300_0200, Access::NonSeq),
+            0xFEED_FACE,
+            "the DMA armed from inside a transfer must still run"
+        );
+        assert!(!b.dma_active, "the guard must be released once the drain ends");
+        assert_eq!(b.dma_pending, 0, "nothing may be left queued");
+    }
+
+    #[test]
+    fn self_rearming_dma_terminates() {
+        // The pathological shape: a channel whose destination IS its own control
+        // register, with a source word that sets the enable bit again. Every
+        // transfer re-arms the channel. Unguarded this recursed once per word and
+        // overflowed the stack, aborting the process outright (uncatchable by
+        // catch_unwind, which is how it silently truncated a 6118-ROM sweep). The
+        // guard queues instead of nesting, and the drain is capped so the re-arm
+        // cannot spin forever either. Reaching the assertions at all is the point.
+        let mut b = bus();
+        b.write32(0x0300_0300, 0x8400_0001, Access::NonSeq); // count 1, enable+32bit+immediate
+        b.write32(0x0400_00B0, 0x0300_0300, Access::NonSeq); // DMA0SAD
+        b.write32(0x0400_00B4, 0x0400_00B8, Access::NonSeq); // DMA0DAD = its own CNT
+        b.write32(0x0400_00B8, 0x8400_0001, Access::NonSeq); // count + enable, fires now
+        assert!(!b.dma_active, "the guard must be released");
+        assert_eq!(b.dma_pending, 0, "the drain must leave nothing queued");
     }
 
     #[test]
