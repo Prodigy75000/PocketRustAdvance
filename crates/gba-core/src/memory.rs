@@ -660,6 +660,73 @@ impl GbaBus {
                 }
             }
         }
+        // SIOCNT's start bit is in the LOW byte but the mode select is in the
+        // HIGH byte, so this has to run after the whole store has landed rather
+        // than per byte the way the DMA enable does.
+        if off < 0x12A && off + width > 0x128 {
+            self.sio_transfer();
+        }
+    }
+
+    /// Complete a serial transfer with nothing on the other end of the cable.
+    ///
+    /// The SIO registers used to be plain storage, so the start/busy bit stayed
+    /// set forever and any game that polls it waiting for the transfer to finish
+    /// spun there forever. Hardware always finishes: a lone GBA drives SD high in
+    /// Multi-Player mode, transfers, and reports the absent players as FFFF.
+    ///
+    /// Completion is immediate rather than paced at the selected baud rate. That
+    /// matches how this core already runs DMA, and it is safe because IF is only
+    /// examined at instruction boundaries by the frame loop, so raising the IRQ
+    /// from inside the store cannot re-enter a handler. It will have to become
+    /// real timing when there is an actual link partner to stay in step with,
+    /// since then the two ends have to agree on when a transfer lands.
+    fn sio_transfer(&mut self) {
+        let cnt = self.io_u16(0x128);
+        if cnt & 0x0080 == 0 {
+            return; // start/busy not set: nothing to do
+        }
+        if cnt & 0x3000 == 0x2000 {
+            // Multi-Player. SIOMULTI0-3 reset to FFFF on start, then each unit's
+            // own send data lands in its own slot. We are the parent (ID 0) and
+            // alone, so slots 1-3 stay FFFF, which is how a game sees "no peer".
+            let send = self.io_u16(0x12A);
+            self.set_io16(0x120, send);
+            self.set_io16(0x122, 0xFFFF);
+            self.set_io16(0x124, 0xFFFF);
+            self.set_io16(0x126, 0xFFFF);
+            // Clear SI (bit 2, parent), ID (4-5), error (6) and start (7);
+            // set SD (bit 3), which a lone unit in Multi-Player mode does drive.
+            self.set_io16(0x128, (cnt & !0x00F4) | 0x0008);
+        } else {
+            // Normal mode. Bit 0 selects the shift clock: with an EXTERNAL clock
+            // we are the slave, and with nothing plugged in there is no clock, so
+            // no bits move and the start bit legitimately stays set. Completing
+            // it anyway invents a reply: Derby Stallion Advance and JGTO Golf
+            // Master Mobile both probe for the Mobile Adapter GB that way, and a
+            // fake completion sent them down the adapter path and blanked them
+            // (late 41 -> 2 and 257 -> 1) when they had been fine before.
+            if cnt & 0x0001 == 0 {
+                return;
+            }
+            // An idle line reads high, so all-ones shifts in.
+            if cnt & 0x1000 != 0 {
+                self.set_io16(0x120, 0xFFFF); // SIODATA32_L
+                self.set_io16(0x122, 0xFFFF); // SIODATA32_H
+            } else {
+                self.io[0x12A] = 0xFF; // SIODATA8
+            }
+            // Clear start (bit 7), set SI state (bit 2) = High/None.
+            self.set_io16(0x128, (cnt & !0x0080) | 0x0004);
+        }
+        if cnt & 0x4000 != 0 {
+            self.if_ |= 1 << 7; // serial IRQ on completion
+        }
+    }
+
+    fn set_io16(&mut self, off: u32, val: u16) {
+        self.io[off as usize] = val as u8;
+        self.io[off as usize + 1] = (val >> 8) as u8;
     }
 
     fn display_write(&mut self, region: DisplayRegion, addr: u32, val: u32, width: u32) {
@@ -815,6 +882,93 @@ mod tests {
         b.write32(0x0400_00B8, 0x8400_0001, Access::NonSeq); // count + enable, fires now
         assert!(!b.dma_active, "the guard must be released");
         assert_eq!(b.dma_pending, 0, "the drain must leave nothing queued");
+    }
+
+    #[test]
+    fn multiplayer_transfer_completes_with_no_peer() {
+        // The SIO registers were plain storage, so the start/busy bit stayed set
+        // and a game polling it hung. A lone GBA still completes the transfer.
+        let mut b = bus();
+        b.write16(0x0400_012A, 0xBEEF, Access::NonSeq); // SIOMLT_SEND
+        // SIOCNT: Multi-Player (bit13), IRQ enable (bit14), start (bit7).
+        b.write16(0x0400_0128, 0x2000 | 0x4000 | 0x0080, Access::NonSeq);
+
+        let cnt = b.read16(0x0400_0128, Access::NonSeq);
+        assert_eq!(cnt & 0x0080, 0, "start/busy must clear when the transfer ends");
+        assert_eq!(cnt & 0x0004, 0, "SI low: a lone unit is the parent");
+        assert_eq!(cnt & 0x0008, 0x0008, "SD high: Multi-Player mode drives it");
+        assert_eq!(cnt & 0x0030, 0, "multi-player ID 0 (parent)");
+        assert_eq!(cnt & 0x0040, 0, "no error flag");
+
+        assert_eq!(
+            b.read16(0x0400_0120, Access::NonSeq),
+            0xBEEF,
+            "our own send data lands in our own slot"
+        );
+        for (i, off) in [0x0400_0122u32, 0x0400_0124, 0x0400_0126].iter().enumerate() {
+            assert_eq!(
+                b.read16(*off, Access::NonSeq),
+                0xFFFF,
+                "absent player {} reads FFFF",
+                i + 1
+            );
+        }
+        assert!(b.if_ & (1 << 7) != 0, "completion raises the serial IRQ");
+    }
+
+    #[test]
+    fn normal_mode_master_transfer_completes_and_shifts_in_ones() {
+        // Normal mode, internal clock (bit 0 = master), 32-bit, IRQ disabled.
+        let mut b = bus();
+        b.write16(0x0400_0128, 0x1000 | 0x0080 | 0x0001, Access::NonSeq);
+        let cnt = b.read16(0x0400_0128, Access::NonSeq);
+        assert_eq!(cnt & 0x0080, 0, "start must clear");
+        assert_eq!(cnt & 0x0004, 0x0004, "SI reads High/None with no opponent");
+        assert_eq!(b.read32(0x0400_0120, Access::NonSeq), 0xFFFF_FFFF);
+        assert_eq!(b.if_ & (1 << 7), 0, "IRQ disabled, so none raised");
+
+        // 8-bit variant lands in SIODATA8.
+        let mut b = bus();
+        b.write16(0x0400_0128, 0x0080 | 0x0001, Access::NonSeq);
+        assert_eq!(b.read8(0x0400_012A, Access::NonSeq), 0xFF);
+    }
+
+    #[test]
+    fn normal_mode_slave_does_not_invent_a_reply() {
+        // External clock with nothing plugged in means no clock, so no bits move
+        // and the start bit stays set, exactly as on hardware. Completing it
+        // anyway fabricates a peer: that is how Derby Stallion Advance and JGTO
+        // Golf Master Mobile, which both probe for the Mobile Adapter GB this
+        // way, got pushed down the adapter path and blanked.
+        let mut b = bus();
+        b.set_io16(0x120, 0x1234);
+        // 32-bit, start, IRQ enable, bit 0 clear = external clock (slave).
+        b.write16(0x0400_0128, 0x1000 | 0x0080 | 0x4000, Access::NonSeq);
+        assert_eq!(
+            b.read16(0x0400_0128, Access::NonSeq) & 0x0080,
+            0x0080,
+            "a slave with no clock stays busy"
+        );
+        assert_eq!(
+            b.read16(0x0400_0120, Access::NonSeq),
+            0x1234,
+            "no data may be shifted in"
+        );
+        assert_eq!(b.if_ & (1 << 7), 0, "and no completion IRQ");
+    }
+
+    #[test]
+    fn sio_does_nothing_without_the_start_bit() {
+        // Writing mode/baud bits alone must not fake a transfer or an IRQ.
+        let mut b = bus();
+        b.set_io16(0x120, 0x1234);
+        b.write16(0x0400_0128, 0x2000 | 0x4000, Access::NonSeq); // multi + IRQ, no start
+        assert_eq!(
+            b.read16(0x0400_0120, Access::NonSeq),
+            0x1234,
+            "SIOMULTI0 untouched with no transfer"
+        );
+        assert_eq!(b.if_ & (1 << 7), 0, "no IRQ without a transfer");
     }
 
     #[test]
