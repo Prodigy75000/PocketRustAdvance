@@ -359,6 +359,10 @@ fn main() {
     // BG2 affine matrix) — printed only when it changes, to find how a scene sets
     // up its backgrounds. Used to diagnose torn/mis-scaled background rendering.
     let bglog = std::env::var_os("GBA_BGLOG").is_some();
+    // Per-frame interrupt accounting: how many V-blank requests the PPU raised
+    // versus which sources the CPU actually took. Diagnoses "game polls a flag
+    // its IRQ handler never sets" hangs.
+    let irqlog = std::env::var_os("GBA_IRQLOG").is_some();
     let mut prev_bg = String::new();
     let mut prev_sound = (0u8, 0u16, 0u16, 0u16);
     let (mut lp, mut lu, mut lr) = (0u64, 0u64, 0u64);
@@ -370,6 +374,16 @@ fn main() {
             gba.set_button(gba_core::Button::Start, p);
         }
         let fb = gba.run_frame().to_vec();
+        if irqlog {
+            let d = &gba.bus.dbg_irq_src;
+            println!(
+                "f{:<4} vbl_raised={:<5} taken: vbl={} hbl={} vcnt={} tmr={} ser={} dma0={} dma1={} dma2={} dma3={} key={} cart={} | IE={:04X} IF={:04X} IME={} DISPSTAT={:04X}",
+                f, gba.bus.dbg_vbl_raised,
+                d[0], d[1], d[2], d[3] + d[4] + d[5] + d[6], d[7],
+                d[8], d[9], d[10], d[11], d[12], d[13],
+                gba.bus.ie, gba.bus.if_, gba.bus.ime & 1, gba.bus.ppu.dispstat()
+            );
+        }
         if bglog {
             let p = &gba.bus.ppu;
             let r = |o: u32| p.read_reg16(o);

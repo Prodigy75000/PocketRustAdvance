@@ -172,6 +172,12 @@ impl Gba {
                 // Take a pending IRQ at the instruction boundary; taking one also
                 // wakes the CPU from a HLE Halt / IntrWait.
                 if self.bus.irq_pending() && self.cpu.irq_ready() {
+                    let pend = self.bus.ie & self.bus.if_;
+                    for b in 0..16 {
+                        if pend & (1 << b) != 0 {
+                            self.bus.dbg_irq_src[b] += 1;
+                        }
+                    }
                     self.cpu.take_irq(&mut self.bus);
                     self.bus.halted = false;
                     self.irqs_taken += 1;

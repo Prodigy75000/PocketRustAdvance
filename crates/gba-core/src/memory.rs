@@ -45,6 +45,10 @@ pub struct GbaBus {
     pub watch_hits: Vec<(u32, u32, u32)>,
     /// Debug counter: sound-FIFO DMA refills (4-word transfers) since boot.
     pub dbg_fifo_refills: u64,
+    /// Debug counter: times the PPU raised the V-blank IRQ request (IF bit 0).
+    pub dbg_vbl_raised: u64,
+    /// Debug counter: IRQs actually taken by the CPU, indexed by IF bit.
+    pub dbg_irq_src: [u64; 16],
 }
 
 #[derive(Clone, Copy, Default)]
@@ -120,6 +124,8 @@ impl GbaBus {
             watch_addr: 0,
             watch_hits: Vec::new(),
             dbg_fifo_refills: 0,
+            dbg_vbl_raised: 0,
+            dbg_irq_src: [0; 16],
         }
     }
 
@@ -395,6 +401,7 @@ impl GbaBus {
         let stat = self.ppu.dispstat();
         if line == 160 && stat & 0x08 != 0 {
             self.if_ |= 1 << 0; // V-blank
+            self.dbg_vbl_raised += 1;
         }
         if stat & 0x10 != 0 {
             self.if_ |= 1 << 1; // H-blank (every line, approximate timing)
