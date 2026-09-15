@@ -666,6 +666,31 @@ impl GbaBus {
         if off < 0x12A && off + width > 0x128 {
             self.sio_transfer();
         }
+        // GBA_SIOLOG: every store that lands on the serial block, with the mode
+        // decoded. A game hung waiting on a serial IRQ looks exactly like one
+        // that never asked for a transfer, and only the register trace tells the
+        // two apart.
+        if off < 0x136 && off + width > 0x120 && std::env::var_os("GBA_SIOLOG").is_some() {
+            let cnt = self.io_u16(0x128);
+            let rcnt = self.io_u16(0x134);
+            let mode = if rcnt & 0x8000 != 0 {
+                if rcnt & 0x4000 != 0 { "JOYBUS" } else { "GPIO" }
+            } else {
+                match cnt & 0x3000 {
+                    0x0000 => "NORMAL8",
+                    0x1000 => "NORMAL32",
+                    0x2000 => "MULTI",
+                    _ => "UART",
+                }
+            };
+            eprintln!(
+                "  SIO w{width} @{off:03X} SIOCNT={cnt:04X} RCNT={rcnt:04X} mode={mode} start={} irq={} send={:04X} multi={:04X},{:04X},{:04X},{:04X}",
+                (cnt >> 7) & 1,
+                (cnt >> 14) & 1,
+                self.io_u16(0x12A),
+                self.io_u16(0x120), self.io_u16(0x122), self.io_u16(0x124), self.io_u16(0x126),
+            );
+        }
     }
 
     /// Complete a serial transfer with nothing on the other end of the cable.

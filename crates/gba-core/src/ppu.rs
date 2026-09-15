@@ -20,6 +20,10 @@ pub const DOTS_PER_LINE: u32 = 308;
 pub const TOTAL_LINES: u32 = 228;
 pub const CYCLES_PER_DOT: u32 = 4;
 pub const CYCLES_PER_LINE: u32 = DOTS_PER_LINE * CYCLES_PER_DOT; // 1232
+/// Visible dots per scanline; the other 68 dots are H-blank. Cycle 960 of each
+/// line is where H-blank begins.
+pub const HDRAW_DOTS: u32 = 240;
+pub const HDRAW_CYCLES: u32 = HDRAW_DOTS * CYCLES_PER_DOT; // 960
 
 pub struct Ppu {
     /// LCD I/O registers 0x04000000..0x04000060 as halfwords.
@@ -345,6 +349,17 @@ impl Ppu {
             stat |= 0x0004; // V-counter match
         }
         self.regs[DISPSTAT] = stat;
+    }
+
+    /// Enter H-blank on the current line: set DISPSTAT's H-blank status bit
+    /// (bit 1), which `begin_line` clears again at the top of the next line.
+    ///
+    /// Without this the bit reads 0 for the entire frame, so software that waits
+    /// for H-blank by polling DISPSTAT instead of taking the H-blank IRQ spins
+    /// forever. Konami Krazy Racers hangs in exactly that loop at 0x080451D4
+    /// (`ldrh r1,[DISPSTAT]; and #2; beq -12`) before it draws anything.
+    pub fn enter_hblank(&mut self) {
+        self.regs[DISPSTAT] |= 0x0002;
     }
 
     // --- Rendering ------------------------------------------------------------

@@ -167,52 +167,63 @@ impl Gba {
             if line < SCREEN_H as u32 {
                 self.bus.trigger_dma(2); // H-blank DMA (approximate timing)
             }
-            let target = self.bus.cycles + ppu::CYCLES_PER_LINE as u64;
-            while self.bus.cycles < target {
-                // Take a pending IRQ at the instruction boundary; taking one also
-                // wakes the CPU from a HLE Halt / IntrWait.
-                if self.bus.irq_pending() && self.cpu.irq_ready() {
-                    let pend = self.bus.ie & self.bus.if_;
-                    for b in 0..16 {
-                        if pend & (1 << b) != 0 {
-                            self.bus.dbg_irq_src[b] += 1;
+            // Each scanline runs in two phases so DISPSTAT's H-blank status bit
+            // is set for the part of the line that actually is H-blank. Running
+            // all 1232 cycles in one go left bit 1 reading 0 always, and any
+            // game that waits on H-blank by polling DISPSTAT spun there forever.
+            let line_start = self.bus.cycles;
+            for phase in 0..2 {
+                let target = line_start
+                    + if phase == 0 { ppu::HDRAW_CYCLES as u64 } else { ppu::CYCLES_PER_LINE as u64 };
+                if phase == 1 {
+                    self.bus.ppu.enter_hblank();
+                }
+                while self.bus.cycles < target {
+                    // Take a pending IRQ at the instruction boundary; taking one also
+                    // wakes the CPU from a HLE Halt / IntrWait.
+                    if self.bus.irq_pending() && self.cpu.irq_ready() {
+                        let pend = self.bus.ie & self.bus.if_;
+                        for b in 0..16 {
+                            if pend & (1 << b) != 0 {
+                                self.bus.dbg_irq_src[b] += 1;
+                            }
+                        }
+                        self.cpu.take_irq(&mut self.bus);
+                        self.bus.halted = false;
+                        self.irqs_taken += 1;
+                    }
+                    if self.trap_unused && !self.trapped {
+                        let back = if self.cpu.thumb() { 4 } else { 8 };
+                        let exec = self.cpu.r[15].wrapping_sub(back);
+                        let width = if self.cpu.thumb() { 2 } else { 4 };
+                        if exec >= 0x1000_0000 {
+                            eprintln!(
+                                "TRAP: PC jumped into unused space: {:08X} -> {exec:08X} (prev branch from {:08X}, irqs={})",
+                                self.trap_prev, self.trap_from, self.irqs_taken
+                            );
+                            self.trapped = true;
+                        } else {
+                            if self.trap_prev != 0 && exec != self.trap_prev.wrapping_add(width) {
+                                self.trap_from = self.trap_prev; // last in-range branch source
+                            }
+                            self.trap_prev = exec;
                         }
                     }
-                    self.cpu.take_irq(&mut self.bus);
-                    self.bus.halted = false;
-                    self.irqs_taken += 1;
-                }
-                if self.trap_unused && !self.trapped {
-                    let back = if self.cpu.thumb() { 4 } else { 8 };
-                    let exec = self.cpu.r[15].wrapping_sub(back);
-                    let width = if self.cpu.thumb() { 2 } else { 4 };
-                    if exec >= 0x1000_0000 {
-                        eprintln!(
-                            "TRAP: PC jumped into unused space: {:08X} -> {exec:08X} (prev branch from {:08X}, irqs={})",
-                            self.trap_prev, self.trap_from, self.irqs_taken
-                        );
-                        self.trapped = true;
-                    } else {
-                        if self.trap_prev != 0 && exec != self.trap_prev.wrapping_add(width) {
-                            self.trap_from = self.trap_prev; // last in-range branch source
-                        }
-                        self.trap_prev = exec;
+                    if self.bus.halted {
+                        // Parked waiting for an interrupt: skip to the end of the line
+                        // (the next scanline may raise the IRQ that wakes us).
+                        self.bus.cycles = target;
+                        break;
                     }
+                    // Debug watchpoint bookkeeping (zero-cost unless a watch is set):
+                    // the executing instruction sits two fetches behind R15.
+                    if self.bus.watch_addr != 0 {
+                        let back = if self.cpu.thumb() { 4 } else { 8 };
+                        self.bus.cur_pc = self.cpu.r[15].wrapping_sub(back);
+                    }
+                    self.cpu.step(&mut self.bus);
+                    self.steps += 1;
                 }
-                if self.bus.halted {
-                    // Parked waiting for an interrupt: skip to the end of the line
-                    // (the next scanline may raise the IRQ that wakes us).
-                    self.bus.cycles = target;
-                    break;
-                }
-                // Debug watchpoint bookkeeping (zero-cost unless a watch is set):
-                // the executing instruction sits two fetches behind R15.
-                if self.bus.watch_addr != 0 {
-                    let back = if self.cpu.thumb() { 4 } else { 8 };
-                    self.bus.cur_pc = self.cpu.r[15].wrapping_sub(back);
-                }
-                self.cpu.step(&mut self.bus);
-                self.steps += 1;
             }
             if line < SCREEN_H as u32 && self.render_enabled {
                 self.bus.ppu.render_line(line as usize);
@@ -272,5 +283,39 @@ mod tests {
 
         // A garbage blob is rejected, not panicked on.
         assert!(!b.load_state(&[1, 2, 3]));
+    }
+
+    /// The CPU must be able to see DISPSTAT's H-blank flag (bit 1) go high and
+    /// come back down within a frame. Games wait on H-blank by polling this bit
+    /// as often as by taking the IRQ, and while it was hard-wired to 0 they
+    /// spun forever (Konami Krazy Racers never left its boot loop).
+    ///
+    /// The ROM is six ARM instructions: count the polls where bit 1 is set (r1)
+    /// against the total polls (r3). Both bounds matter. r1 == 0 is the bug this
+    /// fixes; r1 == r3 would be a flag stuck on, which breaks the other half of
+    /// the games (the ones that wait for H-blank to *end*).
+    #[test]
+    fn hblank_flag_is_visible_to_the_cpu_and_clears_again() {
+        let code: [u32; 8] = [
+            0xE3A0_0404, // mov  r0, #0x04000000
+            0xE3A0_1000, // mov  r1, #0            ; polls that saw H-blank
+            0xE3A0_3000, // mov  r3, #0            ; polls total
+            0xE1D0_20B4, // ldrh r2, [r0, #4]      ; DISPSTAT
+            0xE312_0002, // tst  r2, #2
+            0x1281_1001, // addne r1, r1, #1
+            0xE283_3001, // add  r3, r3, #1
+            0xEAFF_FFFA, // b    -> the ldrh
+        ];
+        let mut rom = vec![0u8; 0x2000];
+        for (i, w) in code.iter().enumerate() {
+            rom[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let mut gba = Gba::new(rom, Vec::new());
+        gba.run_frame();
+
+        let (seen, total) = (gba.cpu.r[1], gba.cpu.r[3]);
+        assert!(total > 0, "the poll loop should have run at all");
+        assert!(seen > 0, "H-blank flag never read as set in a whole frame");
+        assert!(seen < total, "H-blank flag never read as clear: stuck on");
     }
 }
