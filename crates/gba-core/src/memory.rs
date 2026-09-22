@@ -21,6 +21,12 @@ pub struct GbaBus {
     pub apu: Apu,
     /// Catch-all for I/O registers not yet modeled (DMA/timers/IRQ/sound).
     io: Box<[u8]>, // 0x400
+    /// Decoded WAITCNT, kept in step with `io[0x204]` by `write`.
+    waits: Waits,
+    /// Cycles the Game Pak prefetch unit has been free to run ahead since the
+    /// last ROM access, in units of bus cycles. Derived state, not serialized:
+    /// worst case after a load is one under-credited fetch.
+    prefetch_credit: u64,
     /// KEYINPUT (0x4000130): bits are active-low, 1 = released.
     pub keyinput: u16,
     /// Interrupt controller: enable mask, request flags, master enable.
@@ -96,6 +102,53 @@ const HLE_IRQ: &[(usize, u32)] = &[
     (0x34, 0xE25E_F004), // subs pc, lr, #4
 ];
 
+/// WAITCNT (0x4000204) decoded into cycle counts, recomputed whenever the
+/// register is written and after a state load. Not serialized: it is derived
+/// entirely from `io[0x204]`, which is, so the save-state format is unchanged.
+#[derive(Clone, Copy)]
+struct Waits {
+    /// Cost of a 16-bit access to each ROM wait-state region, [WS0, WS1, WS2],
+    /// non-sequential and sequential.
+    rom_n: [u64; 3],
+    rom_s: [u64; 3],
+    sram: u64,
+    /// WAITCNT bit 14. Games set it (Mario Kart writes 0x4497, Fire Emblem
+    /// 0x45B4) and it is the difference between code from ROM costing a couple
+    /// of cycles and costing one.
+    prefetch: bool,
+}
+
+impl Default for Waits {
+    fn default() -> Self {
+        Self::from_reg(0)
+    }
+}
+
+impl Waits {
+    fn from_reg(w: u16) -> Self {
+        // GBATEK: the wait values are cycle counts added to the 1-cycle access.
+        const N: [u64; 4] = [4, 3, 2, 8];
+        const S0: [u64; 2] = [2, 1];
+        const S1: [u64; 2] = [4, 1];
+        const S2: [u64; 2] = [8, 1];
+        let w = w as usize;
+        Waits {
+            rom_n: [
+                1 + N[(w >> 2) & 3],
+                1 + N[(w >> 5) & 3],
+                1 + N[(w >> 8) & 3],
+            ],
+            rom_s: [
+                1 + S0[(w >> 4) & 1],
+                1 + S1[(w >> 7) & 1],
+                1 + S2[(w >> 10) & 1],
+            ],
+            sram: 1 + N[w & 3],
+            prefetch: w & 0x4000 != 0,
+        }
+    }
+}
+
 impl GbaBus {
     pub fn new(rom: Vec<u8>, bios: Vec<u8>) -> Self {
         let mut b = vec![0u8; 16 * 1024];
@@ -116,6 +169,8 @@ impl GbaBus {
             ppu: Ppu::new(),
             apu: Apu::new(),
             io: vec![0; 0x400].into_boxed_slice(),
+            waits: Waits::default(),
+            prefetch_credit: 0,
             keyinput: 0x03FF,
             ie: 0,
             if_: 0,
@@ -187,6 +242,7 @@ impl GbaBus {
         r.bytes_into(&mut self.ewram);
         r.bytes_into(&mut self.iwram);
         r.bytes_into(&mut self.io);
+        self.waits = Waits::from_reg(self.io_u16(0x204)); // derived, not stored
         self.save.deserialize(r);
         self.ppu.deserialize(r);
         // The APU block was appended after the state format shipped; only read it
@@ -456,15 +512,85 @@ impl GbaBus {
         }
     }
 
-    fn access_cycles(addr: u32, word: bool) -> u64 {
-        // Approximate wait-states (refined once WAITCNT + prefetch are modeled).
+    /// Cycles for one access, honouring WAITCNT and whether the access is
+    /// sequential.
+    ///
+    /// This used to be a flat 5 cycles for every 16-bit ROM access and 8 for
+    /// every 32-bit one, with the `Access` the CPU already passes thrown away.
+    /// That charges a sequential opcode fetch the price of a random one, and it
+    /// is the reason the emulated CPU got through far less work per frame than
+    /// real hardware: measured on Mario Kart Super Circuit, 85379 instructions
+    /// per frame against the ~152000 the game expects, which is the half speed
+    /// it shows in gameplay.
+    ///
+    /// ROM is one 16-bit bus, so a 32-bit access is two of them: the first pays
+    /// N or S depending on how we arrived, the second is always sequential.
+    fn access_cycles(&mut self, addr: u32, word: bool, seq: bool) -> u64 {
         match (addr >> 24) & 0xF {
             0x2 => if word { 6 } else { 3 },       // EWRAM (16-bit bus, 2 WS)
             0x5 | 0x6 => if word { 2 } else { 1 }, // PALRAM / VRAM (16-bit bus)
-            0x8..=0xD => if word { 8 } else { 5 }, // ROM
-            0xE | 0xF => 5,                        // SRAM
-            _ => 1,                                // BIOS / IWRAM / I/O / OAM
+            region @ 0x8..=0xD => {
+                // 8/9 = WS0, A/B = WS1, C/D = WS2.
+                let ws = ((region - 8) >> 1) as usize;
+                let halves = if word { 2 } else { 1 };
+                let mut total = 0;
+                for i in 0..halves {
+                    // Only the first half of a 32-bit access can be
+                    // non-sequential; the second always follows on.
+                    let sequential = seq || i > 0;
+                    total += self.rom_half(ws, sequential);
+                }
+                total
+            }
+            0xE | 0xF => {
+                self.prefetch_credit = 0;
+                self.waits.sram
+            }
+            _ => {
+                // The ROM bus is idle during this access, so the prefetch unit
+                // gets to run. This is most of where prefetching pays: code in
+                // ROM that touches IWRAM or I/O buys its next opcodes for free.
+                self.credit_prefetch(1);
+                1 // BIOS / IWRAM / I/O / OAM
+            }
         }
+    }
+
+    /// One 16-bit ROM access, through the prefetch unit.
+    ///
+    /// The unit holds 8 halfwords and fills at the sequential rate whenever the
+    /// CPU is not using the Game Pak bus. So a sequential fetch is nearly free
+    /// if the unit has had time to run ahead, and costs the full sequential
+    /// wait if it has not. Modelling it as a flat 1 cycle instead would be too
+    /// generous: in a tight loop of sequential code with no spare cycles the
+    /// prefetcher cannot fill faster than it is drained, and real hardware gets
+    /// no benefit there either.
+    ///
+    /// A non-sequential access is a jump, which empties the buffer.
+    fn rom_half(&mut self, ws: usize, seq: bool) -> u64 {
+        let s = self.waits.rom_s[ws];
+        if !seq || !self.waits.prefetch {
+            self.prefetch_credit = 0;
+            return if seq { s } else { self.waits.rom_n[ws] };
+        }
+        if self.prefetch_credit >= s {
+            // Already fetched ahead: hand it over in one cycle.
+            self.prefetch_credit -= s;
+            1
+        } else {
+            self.prefetch_credit = 0;
+            s
+        }
+    }
+
+    /// Give the prefetch unit `n` cycles of bus time, capped at the 8-halfword
+    /// buffer so an idle stretch cannot bank unlimited free fetches.
+    fn credit_prefetch(&mut self, n: u64) {
+        if !self.waits.prefetch {
+            return;
+        }
+        let cap = 8 * self.waits.rom_s[0];
+        self.prefetch_credit = (self.prefetch_credit + n).min(cap);
     }
 
     // --- Reads: composed little-endian from raw bytes (no side effects) --------
@@ -660,6 +786,11 @@ impl GbaBus {
                 }
             }
         }
+        // WAITCNT decides what every ROM access costs, so re-decode it as soon as
+        // it lands rather than re-reading the register on each access.
+        if off < 0x206 && off + width > 0x204 {
+            self.waits = Waits::from_reg(self.io_u16(0x204));
+        }
         // SIOCNT's start bit is in the LOW byte but the mode select is in the
         // HIGH byte, so this has to run after the whole store has landed rather
         // than per byte the way the DMA enable does.
@@ -811,6 +942,67 @@ mod tests {
 
     fn bus() -> GbaBus {
         GbaBus::new(vec![0; 0x100], Vec::new())
+    }
+
+    /// ROM access cost has to come from WAITCNT and from whether the access is
+    /// sequential. It used to be a flat 5 cycles for every 16-bit ROM read and
+    /// 8 for every 32-bit one, with the `Access` the CPU already passes thrown
+    /// away, which charged a sequential opcode fetch the price of a random one.
+    /// Mario Kart Super Circuit ran its own race clock at half speed as a
+    /// result: 4.99 seconds of in-game time per 10 seconds of real time.
+    #[test]
+    fn rom_cost_follows_waitcnt_and_sequentiality() {
+        let mut b = bus();
+
+        // Reset value: WS0 is 4 wait states non-sequential, 2 sequential.
+        assert_eq!(b.access_cycles(0x0800_0000, false, false), 5, "default N");
+        assert_eq!(b.access_cycles(0x0800_0000, false, true), 3, "default S");
+
+        // What Mario Kart actually asks for: WS0 N = 3 waits, S = 1 wait.
+        b.write(0x0400_0204, 0x4497, 2);
+        assert_eq!(b.access_cycles(0x0800_0000, false, false), 4, "N = 1 + 3");
+        assert_eq!(b.access_cycles(0x0800_0000, false, true), 2, "S = 1 + 1");
+        // ROM is a 16-bit bus, so a 32-bit access is two halves: N then S.
+        assert_eq!(b.access_cycles(0x0800_0000, true, false), 6, "32-bit = N + S");
+
+        // WS1 and WS2 have their own wait fields and their own regions, and
+        // their sequential tables are not the same as WS0's. Happy Feet's
+        // 0x4014 is a value that tells the three apart: WS0 S = 1 wait,
+        // WS1 S = 4, WS2 S = 8.
+        b.write(0x0400_0204, 0x4014, 2);
+        assert_eq!(b.access_cycles(0x0800_0000, false, true), 2, "WS0 S = 1 + 1");
+        assert_eq!(b.access_cycles(0x0A00_0000, false, true), 5, "WS1 S = 1 + 4");
+        assert_eq!(b.access_cycles(0x0C00_0000, false, true), 9, "WS2 S = 1 + 8");
+    }
+
+    /// The prefetch unit only pays off when the Game Pak bus was actually idle
+    /// long enough to have run ahead. Charging a flat 1 cycle for every
+    /// sequential fetch instead would be too generous: in a tight loop of
+    /// sequential ROM code there are no spare cycles, and real hardware gets no
+    /// benefit there either.
+    #[test]
+    fn prefetch_only_pays_when_the_bus_was_idle() {
+        let mut b = bus();
+        b.write(0x0400_0204, 0x4497, 2); // prefetch enabled (bit 14), WS0 S = 2 cycles
+
+        // Straight back-to-back sequential fetches: nothing has run ahead.
+        b.prefetch_credit = 0;
+        assert_eq!(b.access_cycles(0x0800_0000, false, true), 2, "no credit, full S");
+
+        // Now give the unit some idle bus time, as an internal CPU cycle or an
+        // access somewhere other than the cartridge would.
+        b.credit_prefetch(8);
+        assert_eq!(b.access_cycles(0x0800_0000, false, true), 1, "credited, near free");
+
+        // A jump empties the buffer, so the next sequential fetch pays again.
+        b.credit_prefetch(8);
+        b.access_cycles(0x0800_0000, false, false); // non-sequential = branch
+        assert_eq!(b.access_cycles(0x0800_0000, false, true), 2, "buffer flushed by a jump");
+
+        // With prefetch disabled the credit must never apply.
+        b.write(0x0400_0204, 0x0497, 2);
+        b.credit_prefetch(64);
+        assert_eq!(b.access_cycles(0x0800_0000, false, true), 2, "bit 14 clear, no benefit");
     }
 
     #[test]
@@ -1027,40 +1219,43 @@ mod tests {
 }
 
 impl Bus for GbaBus {
-    fn read8(&mut self, addr: u32, _a: Access) -> u8 {
-        self.cycles += Self::access_cycles(addr, false);
+    fn read8(&mut self, addr: u32, a: Access) -> u8 {
+        self.cycles += self.access_cycles(addr, false, a == Access::Seq);
         self.read8_raw(addr)
     }
-    fn read16(&mut self, addr: u32, _a: Access) -> u16 {
-        self.cycles += Self::access_cycles(addr, false);
+    fn read16(&mut self, addr: u32, a: Access) -> u16 {
+        self.cycles += self.access_cycles(addr, false, a == Access::Seq);
         // Direct EEPROM access (e.g. a game polling write-ready).
         if self.save.is_eeprom() && (addr >> 24) == 0xD {
             return self.save.eeprom_read_bit() as u16;
         }
         self.read16_raw(addr)
     }
-    fn read32(&mut self, addr: u32, _a: Access) -> u32 {
-        self.cycles += Self::access_cycles(addr, true);
+    fn read32(&mut self, addr: u32, a: Access) -> u32 {
+        self.cycles += self.access_cycles(addr, true, a == Access::Seq);
         self.read32_raw(addr)
     }
-    fn write8(&mut self, addr: u32, val: u8, _a: Access) {
-        self.cycles += Self::access_cycles(addr, false);
+    fn write8(&mut self, addr: u32, val: u8, a: Access) {
+        self.cycles += self.access_cycles(addr, false, a == Access::Seq);
         self.write(addr, val as u32, 1);
     }
-    fn write16(&mut self, addr: u32, val: u16, _a: Access) {
-        self.cycles += Self::access_cycles(addr, false);
+    fn write16(&mut self, addr: u32, val: u16, a: Access) {
+        self.cycles += self.access_cycles(addr, false, a == Access::Seq);
         if self.save.is_eeprom() && (addr >> 24) == 0xD {
             self.save.eeprom_write_bit(val as u8);
             return;
         }
         self.write(addr, val as u32, 2);
     }
-    fn write32(&mut self, addr: u32, val: u32, _a: Access) {
-        self.cycles += Self::access_cycles(addr, true);
+    fn write32(&mut self, addr: u32, val: u32, a: Access) {
+        self.cycles += self.access_cycles(addr, true, a == Access::Seq);
         self.write(addr, val, 4);
     }
     fn tick(&mut self, n: u32) {
         self.cycles += n as u64;
+        // Internal CPU cycles (shifts, multiplies, branches) leave the Game Pak
+        // bus free, which is exactly when the prefetch unit earns its keep.
+        self.credit_prefetch(n as u64);
     }
     fn set_halted(&mut self, halted: bool) {
         self.halted = halted;
