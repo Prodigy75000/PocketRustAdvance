@@ -7,7 +7,9 @@ edition = "2021"
 # cdylib -> libgbacore_libretro.so; renamed to the libretro convention on deploy
 # (pocketrust_gba). Deploys to Trophy Hub as a separate .so from the GB core.
 name = "gbacore_libretro"
-crate-type = ["cdylib"]
+# rlib as well so the crate can be unit tested: the memory map published here
+# is a RetroAchievements correctness contract, not just plumbing.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 gba-core = { path = "../gba-core" }

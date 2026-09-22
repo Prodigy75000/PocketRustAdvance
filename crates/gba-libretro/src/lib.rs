@@ -16,9 +16,10 @@
 #![allow(non_camel_case_types)]
 #![allow(clippy::missing_safety_doc)]
 
+use gba_core::save::SaveKind;
 use gba_core::{Button, Gba, SCREEN_H, SCREEN_W};
 use std::cell::UnsafeCell;
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_uint, c_void};
 use std::ptr;
 
 // --- libretro C types we need -------------------------------------------------
@@ -70,7 +71,33 @@ struct retro_game_info {
 // Environment command + pixel-format constants we use.
 const RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY: u32 = 9;
 const RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: u32 = 10;
+const RETRO_ENVIRONMENT_SET_MEMORY_MAPS: u32 = 36;
 const RETRO_PIXEL_FORMAT_XRGB8888: i32 = 1;
+
+const RETRO_MEMDESC_SYSTEM_RAM: u64 = 1 << 2;
+const RETRO_MEMDESC_SAVE_RAM: u64 = 1 << 3;
+
+/// One entry of the address-space table published through SET_MEMORY_MAPS.
+/// `select` = 0 means the front-end matches an address explicitly against
+/// `[start, start + len)`, which is what we want: the GBA regions are plain
+/// disjoint blocks with no mirroring to describe.
+#[repr(C)]
+struct retro_memory_descriptor {
+    flags: u64,
+    ptr: *mut c_void,
+    offset: usize,
+    start: usize,
+    select: usize,
+    disconnect: usize,
+    len: usize,
+    addrspace: *const c_char,
+}
+
+#[repr(C)]
+struct retro_memory_map {
+    descriptors: *const retro_memory_descriptor,
+    num_descriptors: c_uint,
+}
 
 /// Bundled open-source GBA BIOS (Normmatt's clean-room reimplementation — the
 /// same freely-redistributable image gpSP ships). We boot through it by default
@@ -81,6 +108,7 @@ const RETRO_PIXEL_FORMAT_XRGB8888: i32 = 1;
 static OPEN_BIOS: &[u8] = include_bytes!("../open_gba_bios.bin");
 
 const RETRO_MEMORY_SAVE_RAM: u32 = 0;
+const RETRO_MEMORY_SYSTEM_RAM: u32 = 2;
 
 // Device + button ids.
 const RETRO_DEVICE_JOYPAD: u32 = 1;
@@ -281,8 +309,92 @@ pub unsafe extern "C" fn retro_load_game(info: *const retro_game_info) -> bool {
         // the BIOS ROM / depend on BIOS-initialised state.
         s.bios = resolve_bios(s.env);
         s.gba = Some(Gba::new(rom, s.bios.clone()));
+        publish_memory_map(s);
     });
     true
+}
+
+/// Publish the address space so the front-end can read emulated memory by GBA
+/// address. RetroAchievements needs this: without it rc_libretro_memory_init
+/// fails, and the Trophy Hub host parks on "waiting for core memory map"
+/// forever rather than evaluating a single achievement. Reported from a device
+/// on 2026-09-22 against Knights' Kingdom, where gpSP resolved the title fine
+/// and we hung.
+///
+/// rcheevos maps the GBA in an order that is not the obvious one: IWRAM is at
+/// RA address 0 and EWRAM follows it, so the descriptors are matched by their
+/// real addresses rather than by the order they appear here.
+///
+/// ```text
+/// RA 0x000000  32 KB   real 0x03000000   IWRAM
+/// RA 0x008000  256 KB  real 0x02000000   EWRAM
+/// RA 0x048000  64 KB   real 0x0E000000   cartridge SRAM
+/// ```
+///
+/// The host deep-copies the table and the addrspace strings, so these may be
+/// locals; only `ptr` has to outlive the call, and it points into the Gba that
+/// was just constructed. Called on every load, because a new Gba means new
+/// buffers and the previous pointers are dangling.
+fn publish_memory_map(s: &mut State) {
+    let Some(env) = s.env else { return };
+    let Some(gba) = s.gba.as_mut() else { return };
+
+    let mut descs = vec![
+        retro_memory_descriptor {
+            flags: RETRO_MEMDESC_SYSTEM_RAM,
+            ptr: gba.bus.iwram.as_mut_ptr() as *mut c_void,
+            offset: 0,
+            start: 0x0300_0000,
+            select: 0,
+            disconnect: 0,
+            len: gba.bus.iwram.len(),
+            addrspace: c"IWRAM".as_ptr(),
+        },
+        retro_memory_descriptor {
+            flags: RETRO_MEMDESC_SYSTEM_RAM,
+            ptr: gba.bus.ewram.as_mut_ptr() as *mut c_void,
+            offset: 0,
+            start: 0x0200_0000,
+            select: 0,
+            disconnect: 0,
+            len: gba.bus.ewram.len(),
+            addrspace: c"EWRAM".as_ptr(),
+        },
+    ];
+
+    // Only SRAM and Flash live at 0x0E000000. EEPROM is not memory mapped at
+    // all, it is clocked in a bit at a time through region 0xD, so publishing
+    // it at the SRAM address would hand the achievement runtime bytes that are
+    // real but mean something else. A wrong mapping is worse than a missing
+    // one: it unlocks value achievements against garbage instead of failing
+    // visibly.
+    if matches!(
+        gba.bus.save.kind,
+        SaveKind::Sram | SaveKind::Flash64 | SaveKind::Flash128
+    ) && !gba.bus.save.data.is_empty()
+    {
+        descs.push(retro_memory_descriptor {
+            flags: RETRO_MEMDESC_SAVE_RAM,
+            ptr: gba.bus.save.data.as_mut_ptr() as *mut c_void,
+            offset: 0,
+            start: 0x0E00_0000,
+            select: 0,
+            disconnect: 0,
+            len: gba.bus.save.data.len(),
+            addrspace: c"SRAM".as_ptr(),
+        });
+    }
+
+    let map = retro_memory_map {
+        descriptors: descs.as_ptr(),
+        num_descriptors: descs.len() as c_uint,
+    };
+    unsafe {
+        env(
+            RETRO_ENVIRONMENT_SET_MEMORY_MAPS,
+            &map as *const retro_memory_map as *mut c_void,
+        );
+    }
 }
 
 #[no_mangle]
@@ -344,22 +456,32 @@ pub extern "C" fn retro_run() {
 
 #[no_mangle]
 pub extern "C" fn retro_get_memory_data(id: u32) -> *mut c_void {
-    if id != RETRO_MEMORY_SAVE_RAM {
-        return ptr::null_mut();
-    }
-    with_state(|s| match &mut s.gba {
-        Some(gba) if !gba.bus.save.data.is_empty() => {
-            gba.bus.save.data.as_mut_ptr() as *mut c_void
+    with_state(|s| {
+        let Some(gba) = s.gba.as_mut() else {
+            return ptr::null_mut();
+        };
+        match id {
+            // EWRAM is what every other GBA core reports as system RAM, and
+            // some front-ends (and the cheat engine) ask for it instead of
+            // walking the memory map.
+            RETRO_MEMORY_SYSTEM_RAM => gba.bus.ewram.as_mut_ptr() as *mut c_void,
+            RETRO_MEMORY_SAVE_RAM if !gba.bus.save.data.is_empty() => {
+                gba.bus.save.data.as_mut_ptr() as *mut c_void
+            }
+            _ => ptr::null_mut(),
         }
-        _ => ptr::null_mut(),
     })
 }
 #[no_mangle]
 pub extern "C" fn retro_get_memory_size(id: u32) -> usize {
-    if id != RETRO_MEMORY_SAVE_RAM {
-        return 0;
-    }
-    with_state(|s| s.gba.as_ref().map(|g| g.bus.save.data.len()).unwrap_or(0))
+    with_state(|s| {
+        let Some(gba) = s.gba.as_ref() else { return 0 };
+        match id {
+            RETRO_MEMORY_SYSTEM_RAM => gba.bus.ewram.len(),
+            RETRO_MEMORY_SAVE_RAM => gba.bus.save.data.len(),
+            _ => 0,
+        }
+    })
 }
 
 // --- Save states: not implemented yet ----------------------------------------
@@ -411,4 +533,82 @@ pub unsafe extern "C" fn retro_load_game_special(
 #[no_mangle]
 pub extern "C" fn retro_get_region() -> u32 {
     0 // RETRO_REGION_NTSC
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static mut CAPTURED: Option<Vec<(u64, usize, usize)>> = None;
+
+    unsafe extern "C" fn fake_env(cmd: u32, data: *mut c_void) -> bool {
+        if cmd == RETRO_ENVIRONMENT_SET_MEMORY_MAPS {
+            let map = &*(data as *const retro_memory_map);
+            let descs =
+                std::slice::from_raw_parts(map.descriptors, map.num_descriptors as usize);
+            CAPTURED = Some(descs.iter().map(|d| (d.flags, d.start, d.len)).collect());
+        }
+        false
+    }
+
+    /// A ROM carrying the save-type marker the detector looks for.
+    fn rom_with(marker: &[u8]) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x2000];
+        rom[0x1000..0x1000 + marker.len()].copy_from_slice(marker);
+        rom
+    }
+
+    fn load(marker: &[u8]) -> Vec<(u64, usize, usize)> {
+        unsafe {
+            CAPTURED = None;
+            retro_set_environment(Some(fake_env));
+            let rom = rom_with(marker);
+            let info = retro_game_info {
+                path: ptr::null(),
+                data: rom.as_ptr() as *const c_void,
+                size: rom.len(),
+                meta: ptr::null(),
+            };
+            assert!(retro_load_game(&info));
+            CAPTURED.take().expect("core published no memory map")
+        }
+    }
+
+    /// Without this map the Trophy Hub host's rc_libretro_memory_init fails and
+    /// it parks on "waiting for core memory map" forever. rcheevos matches the
+    /// descriptors by REAL address, and its GBA layout puts IWRAM at RA address
+    /// 0 with EWRAM after it, so both blocks have to be published with their
+    /// true bases rather than in RA order.
+    ///
+    /// One test, not three, because the core keeps its state in a process
+    /// global and cargo runs tests on parallel threads.
+    #[test]
+    fn publishes_the_memory_map_rcheevos_needs() {
+        let sram = load(b"SRAM_V113");
+        let iwram = sram.iter().find(|d| d.1 == 0x0300_0000).expect("IWRAM descriptor");
+        let ewram = sram.iter().find(|d| d.1 == 0x0200_0000).expect("EWRAM descriptor");
+        assert_eq!(iwram.2, 32 * 1024, "IWRAM is 32 KB");
+        assert_eq!(ewram.2, 256 * 1024, "EWRAM is 256 KB");
+        assert_eq!(iwram.0, RETRO_MEMDESC_SYSTEM_RAM);
+        assert_eq!(ewram.0, RETRO_MEMDESC_SYSTEM_RAM);
+
+        // A cart with SRAM is memory mapped at 0x0E000000 and should be offered.
+        let save = sram.iter().find(|d| d.1 == 0x0E00_0000).expect("SRAM descriptor");
+        assert_eq!(save.0, RETRO_MEMDESC_SAVE_RAM);
+
+        // EEPROM is NOT memory mapped: it is clocked in through region 0xD. If
+        // it were published at the SRAM address the achievement runtime would
+        // read real bytes that mean something else, which unlocks value
+        // achievements against garbage instead of failing visibly. A wrong
+        // mapping is worse than a missing one.
+        let eeprom = load(b"EEPROM_V122");
+        assert!(
+            eeprom.iter().all(|d| d.1 != 0x0E00_0000),
+            "EEPROM must not be published as SRAM at 0x0E000000"
+        );
+        assert!(
+            eeprom.iter().any(|d| d.1 == 0x0300_0000),
+            "work RAM is still published for an EEPROM cart"
+        );
+    }
 }
