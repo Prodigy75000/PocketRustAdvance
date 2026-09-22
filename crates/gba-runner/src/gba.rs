@@ -350,6 +350,69 @@ fn main() {
     }
     // Auto-advance menus: hold A/Start in short pulses to reach in-game scenes.
     let autoinput = std::env::var_os("GBA_AUTOINPUT").is_some();
+    // GBA_INPUT=<frame>:<buttons>[,...] presses an exact sequence, because
+    // GBA_AUTOINPUT cannot reach a bug that lives behind a menu choice. It
+    // pulses A and Start together forever, which re-enters a title screen as
+    // fast as it confirms one, so a game can sit on its main menu for 1800
+    // frames looking healthy while the defect is one button press away.
+    //
+    // Buttons: A B S(tart) E(select) U D L R  and lowercase l r for the
+    // shoulders. Held for `GBA_INPUT_HOLD` frames (default 8), which is long
+    // enough for a game polling at 60 Hz to see it and short enough not to
+    // register as a repeat.
+    //
+    //   GBA_INPUT=900:A,1100:A  -- tap A at frame 900 and again at 1100
+    let input_script: Vec<(u32, Vec<gba_core::Button>)> = std::env::var("GBA_INPUT")
+        .ok()
+        .map(|spec| {
+            spec.split(',')
+                .filter_map(|step| {
+                    let (f, keys) = step.split_once(':')?;
+                    let frame: u32 = f.trim().parse().ok()?;
+                    let buttons = keys
+                        .trim()
+                        .chars()
+                        .filter_map(|c| match c {
+                            'A' => Some(gba_core::Button::A),
+                            'B' => Some(gba_core::Button::B),
+                            'S' => Some(gba_core::Button::Start),
+                            'E' => Some(gba_core::Button::Select),
+                            'U' => Some(gba_core::Button::Up),
+                            'D' => Some(gba_core::Button::Down),
+                            'L' => Some(gba_core::Button::Left),
+                            'R' => Some(gba_core::Button::Right),
+                            'l' => Some(gba_core::Button::L),
+                            'r' => Some(gba_core::Button::R),
+                            other => {
+                                eprintln!("GBA_INPUT: ignoring unknown button '{other}'");
+                                None
+                            }
+                        })
+                        .collect();
+                    Some((frame, buttons))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let hold: u32 = std::env::var("GBA_INPUT_HOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    if !input_script.is_empty() {
+        println!("  input script: {} step(s), {hold}-frame holds", input_script.len());
+    }
+    const ALL_BUTTONS: [gba_core::Button; 10] = [
+        gba_core::Button::A,
+        gba_core::Button::B,
+        gba_core::Button::Start,
+        gba_core::Button::Select,
+        gba_core::Button::Up,
+        gba_core::Button::Down,
+        gba_core::Button::Left,
+        gba_core::Button::Right,
+        gba_core::Button::L,
+        gba_core::Button::R,
+    ];
     let mut audio: Vec<i16> = Vec::new();
     // GBA_APULOG: per-frame sound state, and flag frames whose audio has a large
     // internal discontinuity (a "blip"), to correlate blips with what the game
@@ -372,6 +435,20 @@ fn main() {
             let p = f % 24 < 4; // pulse A + Start to advance title and dialogue
             gba.set_button(gba_core::Button::A, p);
             gba.set_button(gba_core::Button::Start, p);
+        }
+        if !input_script.is_empty() {
+            // The script owns the pad outright, so a step that has expired
+            // releases its buttons rather than leaving them stuck down.
+            for b in ALL_BUTTONS {
+                gba.set_button(b, false);
+            }
+            for (at, buttons) in &input_script {
+                if f >= *at && f < at + hold {
+                    for b in buttons {
+                        gba.set_button(*b, true);
+                    }
+                }
+            }
         }
         let fb = gba.run_frame().to_vec();
         if irqlog {
