@@ -551,9 +551,10 @@ fn software_interrupt<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool 
     if cpu.hle_bios {
         return super::hle::swi(cpu, bus, num);
     }
-    // A zero divisor is answered here rather than in BIOS code, because the
-    // bundled open BIOS hangs on the one case hardware returns from.
-    if super::hle::intercept_div_by_zero(cpu, num) {
+    // The bundled open BIOS gets Div wrong twice: it hangs on 0/0, and it never
+    // writes r3, which the contract says is abs(quotient). Both are repaired
+    // around the BIOS rather than instead of it. See hle::patch_div.
+    if super::hle::patch_div(cpu, num) {
         return false;
     }
     // Return address is the instruction after the SWI (R15 is PC+4 in Thumb).

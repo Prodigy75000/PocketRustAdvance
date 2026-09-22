@@ -102,6 +102,12 @@ fn intr_wait<B: Bus>(_cpu: &mut Arm7tdmi, bus: &mut B) {
 
 /// SWI 06h/07h Div: signed 32-bit division. r0 = num/den, r1 = num%den,
 /// r3 = |num/den|.
+///
+/// r3 is not optional and not decorative. Measured 100/7 against a real BIOS
+/// dump: r0=14, r1=2, r3=14. The bundled open BIOS returns r0 and r1 correctly
+/// and leaves r3 untouched, so a game that uses it reads back whatever it
+/// happened to be holding. Puppy Luv does exactly that and ends up with a stale
+/// pointer in its interrupt-handler table, which it then branches to.
 fn div(cpu: &mut Arm7tdmi, number: i32, denom: i32) {
     if denom == 0 {
         divide_by_zero(cpu, number);
@@ -147,13 +153,33 @@ fn divide_by_zero(cpu: &mut Arm7tdmi, number: i32) -> bool {
 /// the case hardware itself defines. The third-party binary stays untouched.
 ///
 /// Returns true when the call was answered and must not reach the vector.
-pub fn intercept_div_by_zero(cpu: &mut Arm7tdmi, num: u8) -> bool {
+pub fn patch_div(cpu: &mut Arm7tdmi, num: u8) -> bool {
     let (number, denom) = match num {
         0x06 => (cpu.r[0] as i32, cpu.r[1] as i32),
         0x07 => (cpu.r[1] as i32, cpu.r[0] as i32), // DivArm: args swapped
         _ => return false,
     };
-    denom == 0 && divide_by_zero(cpu, number)
+    if denom == 0 {
+        // 0/0 is answered outright, because the open BIOS spins on it forever
+        // where hardware returns. N/0 falls through and hangs in the BIOS,
+        // which is also what hardware does, so we leave it alone.
+        return divide_by_zero(cpu, number);
+    }
+    // An ordinary divide is NOT taken over. Only r3 is seeded, and then the
+    // BIOS runs and does the arithmetic itself.
+    //
+    // Doing the whole division here instead was measured and rejected: our
+    // answer is right (it matches a real BIOS dump on every edge case tried,
+    // including i32::MIN / -1), but returning instantly where the BIOS burns a
+    // shift-and-subtract loop gives a timing profile that neither a real BIOS
+    // nor full HLE has, and Happy Feet lost its title screen to it in both
+    // regions. Seeding r3 leaves every cycle where it was.
+    //
+    // This works because the open BIOS preserves r3 across the call rather than
+    // writing it, which is the defect; a BIOS that does write r3 simply
+    // overwrites this with the same value, so the seed is inert there.
+    cpu.r[3] = number.wrapping_div(denom).unsigned_abs();
+    false
 }
 
 /// SWI 08h Sqrt: integer square root of an unsigned 32-bit value.

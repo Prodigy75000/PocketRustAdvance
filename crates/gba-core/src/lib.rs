@@ -368,6 +368,52 @@ mod tests {
         }
     }
 
+    /// A stand-in BIOS whose every vector returns immediately without touching
+    /// r0-r3. It models the defect exactly: a BIOS that runs the call and
+    /// leaves r3 alone.
+    fn returning_bios() -> Vec<u8> {
+        0xE1B0_F00Eu32.to_le_bytes().repeat(0x4000 / 4) // movs pc, lr
+    }
+
+    /// Div returns three registers, not two: r0 = quotient, r1 = remainder and
+    /// r3 = abs(quotient). Measured 100/7 against a real BIOS dump: 14, 2, 14.
+    ///
+    /// r3 is the one the bundled open BIOS forgets, and forgetting it is not
+    /// visibly wrong: r0 and r1 are right, so the game computes correctly until
+    /// it uses r3, and then it has whatever it was holding. Puppy Luv puts that
+    /// stale value in its interrupt-handler table and branches to it.
+    ///
+    /// Note what this does NOT assert. r0 stays 100 here, because the stand-in
+    /// BIOS never divides and we deliberately do not divide for it: the real
+    /// BIOS is left to do the arithmetic and spend the cycles, and only r3 is
+    /// seeded. Taking the whole call over instead was measured and cost Happy
+    /// Feet its title screen in both regions, so "we did not compute r0" is a
+    /// property worth pinning rather than an omission.
+    #[test]
+    fn divide_seeds_r3_without_taking_over_the_call() {
+        let code: [u32; 9] = [
+            0xE3A0_0064, // mov r0, #100
+            0xE3A0_1007, // mov r1, #7
+            0xE3A0_30FF, // mov r3, #0xFF     sentinel: untouched means not set
+            0xEF06_0000, // swi 0x06          Div
+            0xE3A0_4403, // mov r4, #0x03000000
+            0xE584_0000, // str r0, [r4]
+            0xE584_1004, // str r1, [r4, #4]
+            0xE584_3008, // str r3, [r4, #8]
+            0xEAFF_FFFE, // b .
+        ];
+        let mut rom = vec![0u8; 0x2000];
+        for (i, w) in code.iter().enumerate() {
+            rom[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let mut gba = Gba::new(rom, returning_bios());
+        for _ in 0..2 {
+            gba.run_frame();
+        }
+        assert_eq!(gba.cpu.r[3], 14, "r3 must be seeded with abs(quotient)");
+        assert_eq!(gba.cpu.r[0], 100, "the divide itself is left to the BIOS");
+    }
+
     #[test]
     fn nonzero_over_zero_still_reaches_the_bios() {
         let mut gba = Gba::new(div_by_zero_rom(5), hanging_bios());
