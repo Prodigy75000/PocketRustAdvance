@@ -38,6 +38,33 @@ pub mod thumb;
 use crate::bus::{Access, Bus};
 use psr::{Cond, Flags, Mode};
 
+/// GBA_SWILOG=<max lines>: trace every BIOS call, with the caller and the
+/// argument registers. A game that runs under one BIOS image and hangs under
+/// another diverges at a single SWI, and diffing two traces is what names it.
+/// From outside, "the BIOS returned something different" and "the game took a
+/// different branch" look exactly alike.
+///
+/// Capped because Div and the decompression calls run in the thousands per
+/// frame; the default 2000 lines covers a boot.
+pub(crate) fn swilog(num: u8, caller: u32, r: &[u32; 16]) {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| match std::env::var("GBA_SWILOG") {
+        Ok(v) => v.parse().unwrap_or(2000),
+        Err(_) => 0,
+    });
+    if limit == 0 {
+        return;
+    }
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < limit {
+        eprintln!(
+            "  SWI {num:02X} from {caller:08X} r0={:08X} r1={:08X} r2={:08X} r3={:08X}",
+            r[0], r[1], r[2], r[3]
+        );
+    }
+}
+
 /// R13 (SP), R14 (LR), R15 (PC) have their usual conventional indices.
 pub const SP: usize = 13;
 pub const LR: usize = 14;

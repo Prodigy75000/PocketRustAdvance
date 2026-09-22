@@ -104,13 +104,56 @@ fn intr_wait<B: Bus>(_cpu: &mut Arm7tdmi, bus: &mut B) {
 /// r3 = |num/den|.
 fn div(cpu: &mut Arm7tdmi, number: i32, denom: i32) {
     if denom == 0 {
-        return; // hardware behavior is undefined; leave registers untouched
+        divide_by_zero(cpu, number);
+        return;
     }
     let q = number.wrapping_div(denom);
     let r = number.wrapping_rem(denom);
     cpu.r[0] = q as u32;
     cpu.r[1] = r as u32;
     cpu.r[3] = q.unsigned_abs();
+}
+
+/// The divide-by-zero answer, measured against a real BIOS dump rather than
+/// assumed. 0/0 returns r0=1, r1=0, r3=1 and returns normally; N/0 for any
+/// nonzero N parks the real BIOS in a loop at 0x03D0 and never comes back.
+///
+/// Only the 0/0 answer is something a shipped game can depend on, since a game
+/// doing N/0 would hang on hardware too. So that is the only case answered
+/// here: N/0 leaves the registers alone rather than inventing a value the
+/// console never produces, which would mask a bogus divisor coming from a bug
+/// of our own.
+///
+/// Returns true when the call was answered.
+fn divide_by_zero(cpu: &mut Arm7tdmi, number: i32) -> bool {
+    if number != 0 {
+        return false;
+    }
+    cpu.r[0] = 1;
+    cpu.r[1] = 0;
+    cpu.r[3] = 1;
+    true
+}
+
+/// Answer SWI 06h/07h with a zero divisor without vectoring into BIOS code.
+///
+/// This exists for the BIOS-boot path, which normally runs the BIOS's own
+/// instructions. The bundled open BIOS (Normmatt's) has no divide-by-zero guard
+/// at all, so 0/0 spins in its normalization loop forever where hardware
+/// returns. Blackthorne makes exactly one such call about ten frames into its
+/// boot, and the rest of the Blizzard/Interplay port family does the same.
+///
+/// Scoped as narrowly as it can be: one SWI pair, one operand value, and only
+/// the case hardware itself defines. The third-party binary stays untouched.
+///
+/// Returns true when the call was answered and must not reach the vector.
+pub fn intercept_div_by_zero(cpu: &mut Arm7tdmi, num: u8) -> bool {
+    let (number, denom) = match num {
+        0x06 => (cpu.r[0] as i32, cpu.r[1] as i32),
+        0x07 => (cpu.r[1] as i32, cpu.r[0] as i32), // DivArm: args swapped
+        _ => return false,
+    };
+    denom == 0 && divide_by_zero(cpu, number)
 }
 
 /// SWI 08h Sqrt: integer square root of an unsigned 32-bit value.

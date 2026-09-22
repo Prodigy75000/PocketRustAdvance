@@ -545,9 +545,16 @@ fn long_branch_link(cpu: &mut Arm7tdmi, op: u32) -> bool {
 
 /// Format 17: Thumb SWI — identical exception entry to ARM SWI.
 fn software_interrupt<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool {
+    let num = (op & 0xFF) as u8;
+    super::swilog(num, cpu.r[15].wrapping_sub(4), &cpu.r);
     // With an HLE BIOS there is nothing at the vector; emulate the call directly.
     if cpu.hle_bios {
-        return super::hle::swi(cpu, bus, (op & 0xFF) as u8);
+        return super::hle::swi(cpu, bus, num);
+    }
+    // A zero divisor is answered here rather than in BIOS code, because the
+    // bundled open BIOS hangs on the one case hardware returns from.
+    if super::hle::intercept_div_by_zero(cpu, num) {
+        return false;
     }
     // Return address is the instruction after the SWI (R15 is PC+4 in Thumb).
     let return_addr = cpu.r[15].wrapping_sub(2);

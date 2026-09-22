@@ -318,4 +318,65 @@ mod tests {
         assert!(seen > 0, "H-blank flag never read as set in a whole frame");
         assert!(seen < total, "H-blank flag never read as clear: stuck on");
     }
+
+    /// Build a ROM that divides `number` by zero through SWI 06h and then parks.
+    fn div_by_zero_rom(number: u32) -> Vec<u8> {
+        let code: [u32; 4] = [
+            0xE3A0_0000 | number, // mov r0, #number
+            0xE3A0_1000,          // mov r1, #0
+            0xEF06_0000,          // swi 0x06        Div
+            0xEAFF_FFFE,          // b .
+        ];
+        let mut rom = vec![0u8; 0x2000];
+        for (i, w) in code.iter().enumerate() {
+            rom[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        rom
+    }
+
+    /// A stand-in BIOS in which every vector is an infinite loop. Any SWI that
+    /// actually reaches 0x08 never returns, so "did the core answer this call
+    /// itself?" becomes observable without shipping a real BIOS image into the
+    /// test.
+    fn hanging_bios() -> Vec<u8> {
+        0xEAFF_FFFEu32.to_le_bytes().repeat(0x4000 / 4)
+    }
+
+    /// Measured against a real BIOS dump: 0/0 returns r0=1, r1=0, r3=1, and
+    /// every other divide by zero hangs the BIOS forever. The bundled open BIOS
+    /// hangs on 0/0 as well, which is what kept Blackthorne and the rest of the
+    /// Blizzard/Interplay ports from booting in the shipping configuration.
+    ///
+    /// Both bounds are checked. 0/0 must be answered without reaching the
+    /// vector, and N/0 must still reach it, because widening the interception
+    /// to N/0 would invent a result the console never produces.
+    #[test]
+    fn zero_over_zero_is_answered_without_entering_the_bios() {
+        for bios in [Vec::new(), hanging_bios()] {
+            let mut gba = Gba::new(div_by_zero_rom(0), bios.clone());
+            for _ in 0..2 {
+                gba.run_frame();
+            }
+            let tag = if bios.is_empty() { "HLE" } else { "BIOS" };
+            assert_eq!(gba.cpu.r[0], 1, "{tag}: 0/0 quotient");
+            assert_eq!(gba.cpu.r[1], 0, "{tag}: 0/0 remainder");
+            assert_eq!(gba.cpu.r[3], 1, "{tag}: 0/0 abs quotient");
+            assert!(
+                gba.cpu.r[15] >= 0x0800_0000,
+                "{tag}: should have returned to the cartridge, not parked in the BIOS"
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_over_zero_still_reaches_the_bios() {
+        let mut gba = Gba::new(div_by_zero_rom(5), hanging_bios());
+        for _ in 0..2 {
+            gba.run_frame();
+        }
+        assert!(
+            gba.cpu.r[15] < 0x0800_0000,
+            "N/0 must not be intercepted: hardware hangs here, so we must too"
+        );
+    }
 }
