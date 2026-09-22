@@ -68,6 +68,26 @@ echo "[3/3] ./gradlew :app:assembleDebug"
 APK="$ANDROID/app/build/outputs/apk/debug/app-debug.apk"
 echo "APK: $APK"
 
+# Installing the APK is NOT enough to test this core, and the failure is silent:
+# you get a working GBA game running on the wrong emulator. The app's
+# coreSlotForPlatform maps "gba" to gpSP unconditionally, and the swap to this
+# core happens later from a preference that defaults OFF, so a fresh install
+# packages this .so and never dlopen's it. Flagged by TH-Android 2026-09-22
+# after it nearly invalidated a smoke test.
+cat <<'NOTE'
+
+  ------------------------------------------------------------------
+  THE CORE IS NOT LIVE UNTIL YOU FLIP THE TOGGLE. On the device:
+
+      Settings -> Consoles -> Game Boy Advance
+        -> "Use PocketRust Advance core (beta)"
+
+  It defaults OFF, and it applies on the NEXT ROM LOAD, not immediately.
+  Without it the app runs gpSP and any result you get is gpSP's.
+  ------------------------------------------------------------------
+
+NOTE
+
 # The debug APK always lives at this fixed Drive slot, replacing the current one,
 # so a phone/tablet can pull it without a cable (Drive for Desktop syncs it up).
 DRIVE_SLOT="${TROPHYHUB_DEBUG_APK:-/g/My Drive/Trophy Hub/TrophyHub-debug.apk}"
