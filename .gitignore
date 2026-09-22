@@ -17,3 +17,4 @@ gba_frame.png
 # in docs/README.md.
 docs/*.pdf
 docs/*.htm
+out/
