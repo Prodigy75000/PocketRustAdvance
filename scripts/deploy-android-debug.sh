@@ -15,6 +15,14 @@
 # The .so files under the app's jniLibs are gitignored and untracked there, so
 # this drops a build artifact rather than writing to another repo's history.
 #
+# AUTHORIZATION BOUNDARY (TH-Android, 2026-09-22). assembleDebug and installDebug
+# are standing authorization in TrophyHubAndroid, which is why this script ends
+# in a gradle call rather than handing back. RELEASE is NOT: assembleRelease,
+# bundleRelease and bundle-deploy.mjs go through the owner manually and must
+# never be added here. Whoever runs this should also say what they built and
+# when, because jniLibs and the Drive APK slot have several writers and an
+# unattributed artifact is how two near-misses happened that day.
+#
 # This core is DEBUG-ONLY for now: it is still being brought up against the
 # commercial library and must not go into a Play AAB while gpSP is the shipping
 # GBA core. The app keeps libgpsp_libretro.so alongside it.
