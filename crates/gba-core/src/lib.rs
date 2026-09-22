@@ -48,6 +48,18 @@ pub struct Gba {
     pub irqs_taken: u64,
     /// Diagnostics: CPU instructions executed since boot.
     pub steps: u64,
+    /// Diagnostics: cycles the CPU spent halted, i.e. the game had finished its
+    /// work for that stretch and was waiting for an interrupt.
+    ///
+    /// This is a SPEED HEADROOM measure and the only one that scales past a
+    /// handful of titles. A game that keeps up finishes its frame and idles; a
+    /// game the emulated CPU is starving never idles at all. Finding Mario Kart
+    /// running at half speed needed the owner's save state and an on-screen race
+    /// timer, which does not generalise to thousands of ROMs.
+    ///
+    /// Read it as a screen, not a verdict: a game that busy-polls DISPSTAT
+    /// instead of halting shows zero idle while being perfectly healthy.
+    pub halt_cycles: u64,
     /// When false, scanline rendering is skipped (for profiling CPU vs PPU).
     pub render_enabled: bool,
     /// A fixed-rate audio clock: it advances by exactly one scanline's worth of
@@ -110,6 +122,7 @@ impl Gba {
             bus,
             irqs_taken: 0,
             steps: 0,
+            halt_cycles: 0,
             render_enabled: true,
             audio_clock: 0,
             trap_unused: false,
@@ -209,9 +222,18 @@ impl Gba {
                             self.trap_prev = exec;
                         }
                     }
+                    // Leaving Halt is NOT the same condition as taking an
+                    // interrupt: hardware wakes on any enabled-and-requested
+                    // interrupt, whether or not IME lets the CPU vector to the
+                    // handler. Gating the wake on IME would park a game forever
+                    // the moment it halted with interrupts masked.
+                    if self.bus.halted && (self.bus.ie & self.bus.if_) != 0 {
+                        self.bus.halted = false;
+                    }
                     if self.bus.halted {
                         // Parked waiting for an interrupt: skip to the end of the line
                         // (the next scanline may raise the IRQ that wakes us).
+                        self.halt_cycles += target.saturating_sub(self.bus.cycles);
                         self.bus.cycles = target;
                         break;
                     }

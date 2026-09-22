@@ -777,6 +777,21 @@ impl GbaBus {
                         _ => t.control = (t.control & 0x00FF) | ((byte as u16) << 8),
                     }
                 }
+                // HALTCNT: bit 7 clear = Halt, set = Stop. Either way the CPU
+                // parks until an interrupt it has enabled arrives.
+                //
+                // This was unhandled, and only the HLE SWI path ever set
+                // `halted`. In the configuration we actually ship a BIOS is
+                // loaded, so Halt and IntrWait run the BIOS's own code, which
+                // writes here, and we ignored it. The CPU therefore never
+                // parked: it spun inside the BIOS wait loop for the whole idle
+                // part of every frame. The emulated game kept correct time, so
+                // nothing looked wrong, but the host burned real cycles
+                // emulating a spin that does nothing.
+                0x301 => {
+                    self.io[o as usize] = byte;
+                    self.halted = true;
+                }
                 _ => {
                     self.io[o as usize] = byte;
                     // A DMA control high byte (enable bit) may start a channel.

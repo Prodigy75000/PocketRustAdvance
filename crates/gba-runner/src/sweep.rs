@@ -48,7 +48,7 @@ fn distinct(fb: &[u16]) -> usize {
 /// steps, non-zero audio samples). Panics propagate to the caller's catch.
 /// With `bios` empty this is HLE direct-boot (the shipping config); pass a real
 /// 16 KB BIOS (via GBA_BIOS) to measure how many failures are BIOS-dependent.
-fn run_one(rom: Vec<u8>, bios: &[u8], frames: u32) -> (usize, u32, u64, usize) {
+fn run_one(rom: Vec<u8>, bios: &[u8], frames: u32) -> (usize, u32, u64, usize, u64) {
     let mut gba = Gba::new(rom, bios.to_vec());
     let (mut best, mut best_frame) = (0usize, 0u32);
     // `late` = peak distinct colours over the final ~30 frames. Unlike the
@@ -71,7 +71,13 @@ fn run_one(rom: Vec<u8>, bios: &[u8], frames: u32) -> (usize, u32, u64, usize) {
         }
         let _ = gba.take_audio();
     }
-    (best, best_frame, gba.steps, late)
+    // Percent of the run the CPU spent halted, which is the headroom the game
+    // has left. 0 means it never once caught up with itself.
+    let total = frames as u64
+        * gba_core::ppu::CYCLES_PER_LINE as u64
+        * gba_core::TOTAL_LINES as u64;
+    let idle = if total > 0 { gba.halt_cycles * 100 / total } else { 0 };
+    (best, best_frame, gba.steps, late, idle)
 }
 
 fn main() {
@@ -148,12 +154,12 @@ fn main() {
                     break;
                 }
                 let path = &todo[i];
-                // Columns: path, status, peak_distinct, best_frame, steps, late_distinct, note
+                // Columns: path, status, peak_distinct, best_frame, steps, late_distinct, idle%
                 let line = match std::fs::read(path) {
                     Err(e) => format!("{}\tREADERR\t0\t0\t0\t0\t{}\n", path.display(), e),
                     Ok(rom) => match panic::catch_unwind(AssertUnwindSafe(|| run_one(rom, &bios, frames))) {
-                        Ok((d, bf, steps, late)) => {
-                            format!("{}\tOK\t{}\t{}\t{}\t{}\t\n", path.display(), d, bf, steps, late)
+                        Ok((d, bf, steps, late, idle)) => {
+                            format!("{}\tOK\t{}\t{}\t{}\t{}\t{}\n", path.display(), d, bf, steps, late, idle)
                         }
                         Err(_) => {
                             let msg = LAST_PANIC.with(|p| p.borrow().clone());

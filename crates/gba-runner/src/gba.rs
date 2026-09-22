@@ -533,6 +533,24 @@ fn main() {
     if best_distinct > 1 {
         println!("  best frame: #{best_frame} with {best_distinct} distinct colours (saved to PNG)");
     }
+    // Speed headroom: the share of the run the CPU spent halted, i.e. the game
+    // had finished its work and was waiting for an interrupt. A game that keeps
+    // up idles; one the emulated CPU is starving never does. Zero is only a
+    // suspicion, not a verdict, because a game that busy-polls instead of
+    // halting also reads zero while being perfectly healthy.
+    {
+        let total = frames as u64
+            * gba_core::ppu::CYCLES_PER_LINE as u64
+            * gba_core::TOTAL_LINES as u64;
+        if total > 0 {
+            println!(
+                "  idle: {}% of the run halted ({} of {} cycles)",
+                gba.halt_cycles * 100 / total,
+                gba.halt_cycles,
+                total
+            );
+        }
+    }
     // Audio stats (measurable, no judgement): sample count, peak, RMS, and how
     // many samples were non-zero. GBA_WAV=<file> also dumps a 16-bit stereo WAV.
     {
