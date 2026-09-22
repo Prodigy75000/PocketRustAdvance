@@ -313,6 +313,9 @@ mod tests {
     #[test]
     fn detects_each_type() {
         assert_eq!(Save::detect(&rom_with(b"SRAM_V112")).kind, SaveKind::Sram);
+        // FRAM. Distinct marker, same part as far as the game is concerned, and
+        // "SRAM_V" does not appear inside "SRAM_F_V" so it needs its own test.
+        assert_eq!(Save::detect(&rom_with(b"SRAM_F_V103")).kind, SaveKind::Sram);
         assert_eq!(Save::detect(&rom_with(b"FLASH_V124")).kind, SaveKind::Flash64);
         assert_eq!(Save::detect(&rom_with(b"FLASH1M_V103")).kind, SaveKind::Flash128);
         assert_eq!(Save::detect(&rom_with(b"EEPROM_V124")).kind, SaveKind::Eeprom);
@@ -393,7 +396,20 @@ fn detect_kind(rom: &[u8]) -> SaveKind {
         SaveKind::Flash128
     } else if has(b"FLASH512_V") || has(b"FLASH_V") {
         SaveKind::Flash64
-    } else if has(b"SRAM_V") {
+    } else if has(b"SRAM_V") || has(b"SRAM_F_V") {
+        // SRAM_F_V is FRAM, a ferroelectric part that the cartridge presents on
+        // the same byte-wide bus as SRAM and that behaves identically from the
+        // game's side, so it is the same save kind.
+        //
+        // It was missed because "SRAM_V" is not a substring of "SRAM_F_V", so
+        // these carts fell through to SaveKind::None and got no save memory at
+        // all. That is not a quiet loss of saves: the games check their save
+        // hardware at boot and refuse to start, which on device looks like a
+        // plain black screen. Seven of the titles the owner confirmed dead are
+        // this one line: Hikaru no Go 1 and 2, Hamtaro Ham-Ham Heartbreak in
+        // both regions, D&D Eye of the Beholder in both, Tottoko Hamutarou 3
+        // and Yu-Gi-Oh Destiny Board Traveler. The corpus holds 127 SRAM_F_V
+        // titles, the worst-performing save type measured before this.
         SaveKind::Sram
     } else {
         SaveKind::None
