@@ -96,12 +96,49 @@ cat <<'NOTE'
 
 NOTE
 
-# The debug APK always lives at this fixed Drive slot, replacing the current one,
-# so a phone/tablet can pull it without a cable (Drive for Desktop syncs it up).
-DRIVE_SLOT="${TROPHYHUB_DEBUG_APK:-/g/My Drive/Trophy Hub/TrophyHub-debug.apk}"
+# The APK goes to a slot NAMED FOR THIS REPO, and deliberately not to the shared
+# TrophyHub-debug.apk.
+#
+# That shared path has a companion TrophyHub-debug-BUILD-NOTES.txt naming the
+# build's commit and md5 and saying what to smoke. The owner reads it to decide
+# what to test. Overwriting the APK from another repo leaves the notes describing
+# a file that is no longer there, and nothing in the folder admits they disagree:
+# a wrong md5 next to a real APK is worse than no md5 at all. It happened on
+# 2026-09-28 when MegaRust's script replaced the owner's build, and five repos
+# including this one were still defaulting to the shared slot (found by
+# TH-Android, who owns that file and cuts its notes).
+#
+# If a build of this repo should go in front of the owner in the SHARED slot,
+# ask TH-Android to cut it with matching notes, or set TROPHYHUB_DEBUG_APK
+# explicitly and update the notes in the same breath. Do not just overwrite it.
+DRIVE_DIR="${TROPHYHUB_DRIVE_DIR:-/g/My Drive/Trophy Hub}"
+DRIVE_SLOT="${TROPHYHUB_DEBUG_APK:-$DRIVE_DIR/TrophyHub-debug-pocketrustadvance.apk}"
 if [ -d "$(dirname "$DRIVE_SLOT")" ]; then
   cp "$APK" "$DRIVE_SLOT"
   echo "Drive: $DRIVE_SLOT (replaced)"
+  # Sidecar notes, so this artifact describes itself the way the shared one does.
+  # Same principle as stamping the core: an APK on a shared drive with several
+  # writers and no version in it is how the whole problem started.
+  NOTES="${DRIVE_SLOT%.apk}-NOTES.txt"
+  {
+    echo "PocketRustAdvance debug build, $(date '+%Y-%m-%d %H:%M')"
+    echo "======================================================"
+    echo
+    # stderr silenced: git warns about CRLF here and it would land in the notes.
+    echo "PocketRustAdvance @ $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)$(git -C "$REPO" diff --quiet 2>/dev/null || echo ' (DIRTY, tree had uncommitted changes)')"
+    echo "$(stat -c%s "$APK") bytes"
+    echo "md5 $(md5sum "$APK" | cut -d' ' -f1)"
+    echo "GBA core: $(strings -a "$SRC" | grep -m1 'build=' || echo 'unstamped')"
+    echo
+    echo "THE CORE IS NOT LIVE UNTIL YOU FLIP THE TOGGLE:"
+    echo "  Settings -> Consoles -> Game Boy Advance -> \"Use PocketRust Advance core (beta)\""
+    echo "  Defaults OFF, applies on the NEXT ROM load. Without it you are testing gpSP."
+    echo
+    echo "This file is cut by PocketRustAdvance/scripts/deploy-android-debug.sh and"
+    echo "describes THIS apk only. The shared TrophyHub-debug.apk and its notes are"
+    echo "TH-Android's and are not touched by this script."
+  } > "$NOTES"
+  echo "Drive: $NOTES (notes written)"
 else
   echo "note: Drive slot dir missing, skipped ($DRIVE_SLOT)"
 fi
