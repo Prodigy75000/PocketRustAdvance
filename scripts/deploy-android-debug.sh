@@ -111,6 +111,32 @@ NOTE
 # If a build of this repo should go in front of the owner in the SHARED slot,
 # ask TH-Android to cut it with matching notes, or set TROPHYHUB_DEBUG_APK
 # explicitly and update the notes in the same breath. Do not just overwrite it.
+#
+# THE OWNER SETTLED THIS ON 2026-09-30 and chose "leave it exactly as it is", so
+# this repo-named slot is a decision and not a divergence. Do not convert it back
+# on the strength of the README below, which is the thing that will tempt you.
+#
+# Because there IS a README saying otherwise, and the next reader will find it
+# before they find this comment. "G:/My Drive/Trophy Hub/README-LAYOUT.md", under
+# "Frozen paths, verified 2026-09-25", lists Trophy Hub/TrophyHub-debug.apk as
+# written by scripts/deploy-android-debug.sh in ALL SEVEN CORE REPOS. That was
+# true when it was checked. The 2026-09-28 incident above is three days LATER,
+# and is why five of those seven repos have since moved off the shared slot. The
+# README is not wrong, it is older than the reason.
+#
+# THE INVARIANT THAT HOLDS EITHER WAY, agreed with TH-Android 2026-09-30:
+# WHOEVER WRITES THE APK OWNS THE NOTES BESIDE IT, in the same pass. The 09-28
+# failure was not that another repo wrote the shared slot, it was that the notes
+# went on describing a file that was no longer there, md5 included. So if this
+# script is ever pointed at the shared slot, regenerate
+# TrophyHub-debug-BUILD-NOTES.txt here rather than leaving it for the agent who
+# owns that file to discover the mismatch later.
+#
+# PRA artifacts that are NOT the APK (ROM sets, save states, smoke folders) belong
+# in the ROOT-LEVEL "G:/My Drive/PocketRustAdvance/", not under "Trophy Hub/".
+# The 2026-09-25 reorg moved them out of "Trophy Hub/PocketRustAdvance/"
+# specifically so core artifacts stop living in two places under the same name.
+# This script has put sensor ROM sets in the wrong one of those before.
 DRIVE_DIR="${TROPHYHUB_DRIVE_DIR:-/g/My Drive/Trophy Hub}"
 DRIVE_SLOT="${TROPHYHUB_DEBUG_APK:-$DRIVE_DIR/TrophyHub-debug-pocketrustadvance.apk}"
 if [ -d "$(dirname "$DRIVE_SLOT")" ]; then
