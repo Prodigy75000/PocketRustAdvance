@@ -152,6 +152,55 @@ impl Waits {
     }
 }
 
+/// Six words of the bundled open BIOS, and what they become.
+///
+/// Normmatt's IntrWait keeps the I/O base in r2 and parks 0x208 in r12. Real
+/// hardware's BIOS keeps the base in r12, and so does mGBA's hand-written HLE
+/// BIOS, so games were written expecting it there: Elevator Action Old and New
+/// ends its interrupt handler with `strneh r0, [r12, #-8]`, which is the BIOS
+/// interrupt check flags at 0x03FFFFF8 only if r12 holds 0x04000000. With 0x208
+/// in it the store lands on 0x200 instead, which is BIOS ROM and read-only, so
+/// the flag never appears and IntrWait never returns. The cartridge spins in the
+/// BIOS forever while its handler keeps running and looking perfectly healthy.
+///
+/// The repair swaps which register holds which constant. r2 and r12 trade places
+/// in the halt loop, and the three stores that index off them swap operands to
+/// match. Instruction for instruction it is the same routine: same control flow,
+/// same cycle count, same register footprint on return. Only the value a halted
+/// IntrWait leaves in r12 changes, from 0x208 to 0x04000000.
+///
+/// Rewriting the routine outright was tried first and rejected. A faithful
+/// reimplementation of IntrWait fixed the same games and broke Tennis no
+/// Ouji-sama 2004 in both regional builds, which boots on Normmatt's version
+/// and on a real BIOS dump. Swapping two registers cannot do that.
+///
+/// `(offset, expected, replacement)`.
+#[rustfmt::skip]
+const OPEN_BIOS_R12: &[(usize, u32, u32)] = &[
+    (0x488, 0xE3A0_2301, 0xE3A0_C301), // mov r2, #0x04000000   -> mov r12, #0x04000000
+    (0x48C, 0xE3A0_CF82, 0xE3A0_2F82), // mov r12, #0x208        -> mov r2, #0x208
+    (0x49C, 0xE5C2_5301, 0xE5CC_5301), // strb r5, [r2, #0x301]  -> strb r5, [r12, #0x301]
+    (0x4A0, 0xE182_70BC, 0xE18C_70B2), // strh r7, [r2, r12]     -> strh r7, [r12, r2]
+    (0x4BC, 0xE182_60BC, 0xE18C_60B2), // strh r6, [r2, r12]     -> strh r6, [r12, r2]
+    (0x4CC, 0xE182_60BC, 0xE18C_60B2), // strh r6, [r2, r12]     -> strh r6, [r12, r2]
+];
+
+/// Apply [`OPEN_BIOS_R12`], but only to a BIOS image that is byte-for-byte the
+/// one it was measured against.
+///
+/// Every word is checked before any word is written, so a real BIOS dump, a
+/// different build of the open BIOS, or the HLE stub is left exactly as it came
+/// in. The image on disk is never touched; this edits the copy in memory.
+fn hold_io_base_in_r12(bios: &mut [u8]) {
+    let word = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    if !OPEN_BIOS_R12.iter().all(|&(o, want, _)| o + 4 <= bios.len() && word(bios, o) == want) {
+        return;
+    }
+    for &(o, _, patched) in OPEN_BIOS_R12 {
+        bios[o..o + 4].copy_from_slice(&patched.to_le_bytes());
+    }
+}
+
 impl GbaBus {
     pub fn new(rom: Vec<u8>, bios: Vec<u8>) -> Self {
         let mut b = vec![0u8; 16 * 1024];
@@ -162,6 +211,7 @@ impl GbaBus {
                 b[off..off + 4].copy_from_slice(&word.to_le_bytes());
             }
         }
+        hold_io_base_in_r12(&mut b);
         let save = Save::detect(&rom);
         let sensors = crate::sensor::Sensors::new(&rom);
         GbaBus {
@@ -1003,6 +1053,73 @@ mod tests {
 
     fn bus() -> GbaBus {
         GbaBus::new(vec![0; 0x100], Vec::new())
+    }
+
+    /// Build a 16 KB image carrying only the six words the r12 repair targets.
+    fn open_bios_shaped(words: &[(usize, u32, u32)]) -> Vec<u8> {
+        let mut b = vec![0u8; 16 * 1024];
+        for &(o, original, _) in words {
+            b[o..o + 4].copy_from_slice(&original.to_le_bytes());
+        }
+        b
+    }
+
+    /// The r12 repair must rewrite an image it recognises and refuse every other
+    /// one, including an image that matches in all but one word.
+    ///
+    /// Recognising too little silently un-fixes Elevator Action Old and New and
+    /// the Bubble Bobble Old and New family. Recognising too much rewrites six
+    /// words of somebody's real BIOS dump, which is far worse.
+    #[test]
+    fn the_r12_repair_only_touches_the_bios_it_was_measured_against() {
+        let word = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+
+        let mut good = open_bios_shaped(OPEN_BIOS_R12);
+        hold_io_base_in_r12(&mut good);
+        for &(o, original, patched) in OPEN_BIOS_R12 {
+            assert_eq!(
+                word(&good, o),
+                patched,
+                "word at {o:#X} should have been rewritten from {original:#X}"
+            );
+        }
+
+        // One word off is a different BIOS, and none of it may be touched.
+        let mut near = open_bios_shaped(OPEN_BIOS_R12);
+        let spoiled = OPEN_BIOS_R12[3].0;
+        near[spoiled..spoiled + 4].copy_from_slice(&0xE1A0_0000u32.to_le_bytes());
+        let before = near.clone();
+        hold_io_base_in_r12(&mut near);
+        assert_eq!(
+            near, before,
+            "a BIOS that differs anywhere must be left byte-identical"
+        );
+
+        // And an unrelated image, e.g. a real dump or the HLE stub.
+        let mut zeros = vec![0u8; 16 * 1024];
+        hold_io_base_in_r12(&mut zeros);
+        assert!(zeros.iter().all(|&x| x == 0), "an unrecognised BIOS must be untouched");
+    }
+
+    /// The rewritten words must be the same instructions with r2 and r12 swapped,
+    /// not merely different bytes: same opcode, same condition, same operand
+    /// count. A wrong encoding here executes as some other instruction inside a
+    /// BIOS we cannot single-step, and the symptom would be a hang with no clue.
+    #[test]
+    fn the_r12_repair_swaps_registers_and_changes_nothing_else() {
+        for &(off, original, patched) in OPEN_BIOS_R12 {
+            assert_eq!(
+                original & 0xFFF0_0000,
+                patched & 0xFFF0_0000,
+                "condition and instruction class must survive at {off:#X}"
+            );
+            assert_ne!(original, patched, "every listed word must actually change");
+        }
+        // The two constants keep their values and only trade destination register.
+        assert_eq!(OPEN_BIOS_R12[0].1 & 0xFFFF_0FFF, OPEN_BIOS_R12[0].2 & 0xFFFF_0FFF);
+        assert_eq!(OPEN_BIOS_R12[1].1 & 0xFFFF_0FFF, OPEN_BIOS_R12[1].2 & 0xFFFF_0FFF);
+        assert_eq!((OPEN_BIOS_R12[0].2 >> 12) & 0xF, 12, "the I/O base must land in r12");
+        assert_eq!((OPEN_BIOS_R12[1].2 >> 12) & 0xF, 2, "and 0x208 in r2");
     }
 
     /// ROM access cost has to come from WAITCNT and from whether the access is
