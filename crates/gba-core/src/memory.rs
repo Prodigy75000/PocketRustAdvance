@@ -21,6 +21,9 @@ pub struct GbaBus {
     pub apu: Apu,
     /// Catch-all for I/O registers not yet modeled (DMA/timers/IRQ/sound).
     io: Box<[u8]>, // 0x400
+    /// Cartridge motion sensors, when the cartridge has any. Detected from the
+    /// game code, so an ordinary cart never sees any of this.
+    pub sensors: crate::sensor::Sensors,
     /// Decoded WAITCNT, kept in step with `io[0x204]` by `write`.
     waits: Waits,
     /// Cycles the Game Pak prefetch unit has been free to run ahead since the
@@ -160,7 +163,9 @@ impl GbaBus {
             }
         }
         let save = Save::detect(&rom);
+        let sensors = crate::sensor::Sensors::new(&rom);
         GbaBus {
+            sensors,
             bios: b.into_boxed_slice(),
             ewram: vec![0; 256 * 1024].into_boxed_slice(),
             iwram: vec![0; 32 * 1024].into_boxed_slice(),
@@ -218,6 +223,7 @@ impl GbaBus {
         self.save.serialize(w);
         self.ppu.serialize(w);
         self.apu.serialize(w);
+        self.sensors.serialize(w);
     }
 
     pub fn deserialize(&mut self, r: &mut crate::state::Reader) {
@@ -249,6 +255,12 @@ impl GbaBus {
         // when the blob actually carries it, so pre-APU states still load.
         if r.remaining() > 8 {
             self.apu.deserialize(r);
+        }
+        // Appended after the format shipped, like the APU block before it, so a
+        // state written by an older build still loads: the sensors simply start
+        // from their reset values, which is one frame of staleness at worst.
+        if r.remaining() >= 17 {
+            self.sensors.deserialize(r);
         }
     }
 
@@ -606,9 +618,23 @@ impl GbaBus {
             0x7 => self.ppu.read_oam8(addr),
             0x8..=0xD => {
                 let o = (addr & 0x01FF_FFFF) as usize;
+                // GPIO half-words, when the cart has the hardware AND the game
+                // has switched the port to readable. Otherwise this falls
+                // through to ROM, which is zero-filled here, exactly as the
+                // write-only mode is specified to read back.
+                if (0xC4..0xCA).contains(&o) {
+                    if let Some(v) = self.sensors.gpio_read((o & !1) as u32) {
+                        return if o & 1 == 0 { v as u8 } else { (v >> 8) as u8 };
+                    }
+                }
                 *self.rom.get(o).unwrap_or(&0)
             }
-            0xE | 0xF => self.save.read(addr),
+            // The tilt ADC sits in the top half of the SRAM window on the carts
+            // that have it; those all save to EEPROM, so nothing is displaced.
+            0xE | 0xF => match self.sensors.tilt_read(addr) {
+                Some(v) => v,
+                None => self.save.read(addr),
+            },
             _ => 0,
         }
     }
@@ -622,6 +648,11 @@ impl GbaBus {
             0x0 => Some((&self.bios, (addr & 0x3FFF) as usize)),
             0x2 => Some((&self.ewram, (addr & 0x3_FFFF) as usize)),
             0x3 => Some((&self.iwram, (addr & 0x7FFF) as usize)),
+            // The GPIO port lives inside the ROM window at 0x080000C4..C9, so
+            // a cart that has one must drop off the linear fast path there.
+            // Gated on the cart actually having the hardware, so every other
+            // game pays a single predictable compare.
+            0x8..=0xD if self.sensors.has_gpio() && (addr & 0x01FF_FFFF) < 0x100 => None,
             0x8..=0xD => Some((&self.rom, (addr & 0x01FF_FFFF) as usize)),
             _ => None,
         }
@@ -729,7 +760,22 @@ impl GbaBus {
             0x6 => self.display_write(DisplayRegion::Vram, addr, val, width),
             0x7 => self.display_write(DisplayRegion::Oam, addr, val, width),
             // SRAM/Flash: an 8-bit bus, so only the low byte is written per byte.
-            0xE | 0xF => self.save.write(addr, val as u8),
+            0xE | 0xF => {
+                if !self.sensors.tilt_write(addr, val as u8) {
+                    self.save.write(addr, val as u8);
+                }
+            }
+            // ROM is read-only, except for the cartridge GPIO port. GBATEK: the
+            // ROM bus takes 16- and 32-bit writes only, STRB is ignored.
+            0x8..=0xD if width >= 2 => {
+                let o = addr & 0x01FF_FFFF;
+                if (0xC4..0xCA).contains(&o) {
+                    self.sensors.gpio_write(o & !1, val as u16);
+                    if width == 4 {
+                        self.sensors.gpio_write((o & !1) + 2, (val >> 16) as u16);
+                    }
+                }
+            }
             _ => {} // BIOS / ROM are read-only
         }
     }

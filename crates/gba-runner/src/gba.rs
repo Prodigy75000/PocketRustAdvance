@@ -436,6 +436,17 @@ fn main() {
             gba.set_button(gba_core::Button::A, p);
             gba.set_button(gba_core::Button::Start, p);
         }
+        // GBA_GYRO=<rad/s> and GBA_TILT=<x>,<y> in m/s^2 stand in for a phone's
+        // sensors, so a motion cart can be exercised without a device.
+        if let Ok(v) = std::env::var("GBA_GYRO") {
+            if let Ok(z) = v.trim().parse::<f32>() {
+                gba.set_gyroscope(0.0, 0.0, z);
+            }
+        }
+        if let Ok(v) = std::env::var("GBA_TILT") {
+            let mut it = v.split(',').filter_map(|p| p.trim().parse::<f32>().ok());
+            gba.set_accelerometer(it.next().unwrap_or(0.0), it.next().unwrap_or(0.0), 0.0);
+        }
         if !input_script.is_empty() {
             // The script owns the pad outright, so a step that has expired
             // releases its buttons rather than leaving them stuck down.
@@ -532,6 +543,31 @@ fn main() {
     }
     if best_distinct > 1 {
         println!("  best frame: #{best_frame} with {best_distinct} distinct colours (saved to PNG)");
+    }
+    if gba.bus.sensors.kind != gba_core::sensor::CartSensor::None {
+        let s = &gba.bus.sensors;
+        match s.kind {
+            gba_core::sensor::CartSensor::Gyro => {
+                let (sample, _) = s.debug_gyro();
+                println!(
+                    "  cart sensor: Gyro, {} conversion(s), {} serial bit(s) clocked ({:.1}/conversion), last sample {:03X}",
+                    s.conversions,
+                    s.reads.get(),
+                    s.reads.get() as f64 / s.conversions.max(1) as f64,
+                    sample
+                );
+            }
+            _ => {
+                let (x, y) = s.debug_axes();
+                println!(
+                    "  cart sensor: Tilt, {} conversion(s), {} axis byte(s) read back, x={:03X} y={:03X}",
+                    s.conversions,
+                    s.reads.get(),
+                    x,
+                    y
+                );
+            }
+        }
     }
     // Speed headroom: the share of the run the CPU spent halted, i.e. the game
     // had finished its work and was waiting for an interrupt. A game that keeps

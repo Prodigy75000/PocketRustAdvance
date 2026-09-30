@@ -14,6 +14,7 @@ pub mod cpu;
 pub mod memory;
 pub mod ppu;
 pub mod save;
+pub mod sensor;
 pub mod state;
 
 pub use memory::GbaBus;
@@ -261,6 +262,24 @@ impl Gba {
         }
 
         &self.bus.ppu.framebuffer
+    }
+
+    /// Which motion sensor the cartridge carries, if any. The front-end asks
+    /// this so it only turns the device's sensors on for a game that reads them.
+    pub fn cart_sensor(&self) -> crate::sensor::CartSensor {
+        self.bus.sensors.kind
+    }
+
+    /// Feed the accelerometer, in m/s^2. Used by the tilt carts (Yoshi
+    /// Topsy-Turvy, Yoshi's Universal Gravitation, Koro Koro Puzzle).
+    pub fn set_accelerometer(&mut self, x: f32, y: f32, z: f32) {
+        self.bus.sensors.set_accelerometer(x, y, z);
+    }
+
+    /// Feed the gyroscope, in rad/s. Used by WarioWare Twisted, which senses
+    /// rotation about Z only.
+    pub fn set_gyroscope(&mut self, x: f32, y: f32, z: f32) {
+        self.bus.sensors.set_gyroscope(x, y, z);
     }
 
     /// Set a button's pressed state (KEYINPUT is active-low).
