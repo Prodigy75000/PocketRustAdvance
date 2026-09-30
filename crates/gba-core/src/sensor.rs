@@ -124,9 +124,33 @@ const GYRO_SIGN: f32 = -1.0;
 /// a sudden direction reversal on a hard flick, which is the symptom we were
 /// already chasing, so it is worth not reproducing.
 ///
-/// If Twisted still feels twitchy now that the direction is right, this is the
-/// knob, and TH-Android's temporary gyro logging measures the peak rate the
-/// owner's hands actually produce.
+/// MEASURED ON DEVICE 2026-09-30 and deliberately left alone. TH-Android logged
+/// 238 seconds of the owner actually playing Twisted on an S25 Ultra, 11,324
+/// samples over 119 windows:
+///
+///     median window peak |z|   1.20 rad/s
+///     p90 window peak |z|      5.34
+///     session max |z|          9.52
+///     samples past this clamp  41 of 11,324, 0.36%, in 8 of 119 windows
+///
+/// So ordinary play sits well inside the range and the ADC is not going unused.
+/// The tail does clip: his hardest flick was 39% past full scale, and because
+/// Twisted integrates rate into an angle, a clipped sample is rotation lost from
+/// the angle rather than one momentarily wrong reading.
+///
+/// Widening it anyway would cost more than it buys, for a reason that is about
+/// the reference rather than about feel. At mGBA's 262 counts per rad/s the ADC
+/// floor IS 6.83, because the centre sits at 0x700 with 1792 counts beneath it.
+/// Reaching 9.52 means either abandoning that scale or moving that centre, so the
+/// choice is between a number taken from a working implementation and a number
+/// fitted to the top 0.36% of one play session. The whole reason the sign was
+/// wrong for as long as it was is that its constants were fitted rather than
+/// referenced, so this stays referenced.
+///
+/// Raise it only if someone reports LOST ROTATION during normal play, which is
+/// what saturation would actually feel like, rather than on the strength of a
+/// peak figure. The owner's verdict on this build was that both Twisted and Yoshi
+/// work in both orientations.
 const GYRO_RATE_FULL_SCALE: f32 = 6.83;
 
 fn clamp12(v: i32) -> u16 {
