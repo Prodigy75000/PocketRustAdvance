@@ -58,36 +58,76 @@ const TILT_CENTER_Y: i32 = 0x3A0;
 const TILT_SPAN_X: i32 = 0xE3;
 const TILT_SPAN_Y: i32 = 0xDD;
 
-// Gyro centre and half-span.
+// Gyro centre and half-span, matched to mGBA.
 //
-// Unlike the tilt figures these are NOT documented: GBATEK gives the gyro's
-// wiring and its bitstream but no resting value and no range. These are a
-// calibration choice for a 12-bit ADC, checked against the game rather than
-// against a spec, which is why they are named constants and not inlined. If
-// Twisted's calibration screen ever drifts, this is the knob.
-const GYRO_CENTER: i32 = 0x6C0;
-const GYRO_SPAN: i32 = 0x500;
+// GBATEK gives the gyro's wiring and its bitstream but no resting value and no
+// range, so these cannot come from a spec. They now come from the one reference
+// implementation that consumes the SAME libretro sensor interface we do, rather
+// than from a guess: mGBA's cart/gpio.c centres the sample on 0x700 ("Normalize
+// to ~12 bits, focused on 0x700"), and its libretro port scales rad/s by -5.5e8
+// before an arithmetic shift right of 21, which is 262.26 ADC counts per rad/s.
+//
+// The half-span is the distance from the centre DOWN to zero, because that is
+// the side that runs out first: 0x700 counts below the centre is the floor,
+// while 0x8FF remain above it. Sizing the span to the narrow side means a
+// full-scale input cannot underflow the ADC.
+//
+// The previous 0x6C0 / 0x500 pair was an unmeasured guess and gave 160 counts
+// per rad/s, so every rotation under-read by roughly a third. That matters more
+// than it looks: Twisted integrates rate into an angle, so a scale error here
+// does not just feel wrong, it accumulates.
+const GYRO_CENTER: i32 = 0x700;
+const GYRO_SPAN: i32 = 0x700;
 
-/// Which way round the cartridge sees a rotation.
+/// Which way round the cartridge sees a rotation. NEGATIVE, and no longer a
+/// guess.
 ///
-/// Untested, and named rather than folded into the maths so that fixing it is
-/// one character. The input contract is settled: TH-Android's cartridge bridge
-/// publishes Android TYPE_GYROSCOPE unrotated and unconverted, which Android
-/// documents as rad/s about the device axes under the right-hand rule. What is
-/// NOT settled is whether the cartridge's idea of positive matches the phone's,
-/// because nothing has compared them against the game yet.
+/// This was +1.0, and the comment here admitted it was untested. It was wrong.
+/// WarioWare Twisted's microgames ran mirrored: the owner reported tilting the
+/// phone left and every microgame action going right, checked against footage of
+/// the real game. Its menus felt correct, which is why this took a while to
+/// believe, and that reading is still unexplained.
+///
+/// Two independent lines give the same answer.
+///
+/// The behaviour. mgba#3511 records real hardware from someone comparing
+/// against a GBA: "tilting the console right would make the airplane in the
+/// airplane microgame go right". Android TYPE_GYROSCOPE is right-handed about
+/// the device axes with +Z out of the screen, so tilting the right edge down is
+/// CLOCKWISE seen from the front, and therefore NEGATIVE z. For that to deflect
+/// the cart the way real hardware does, negative z has to read ABOVE centre,
+/// which is this sign and not the old one.
+///
+/// The code. mGBA's libretro port does the same negation explicitly, scaling
+/// GYROSCOPE_Z by -5.5e8. It reads the identical libretro interface in the
+/// identical units, so the disagreement was ours.
+///
+/// mgba#3511 is itself a DIFFERENT bug that happens to share the symptom;
+/// endrift traced it to libogc on Wii. It is cited for the hardware behaviour it
+/// records, not as a diagnosis of this one.
 ///
 /// The bridge deliberately publishes unrotated device axes and leaves cartridge
-/// coordinate conversion to the core, so if WarioWare Twisted turns out
-/// mirrored, the negation belongs HERE and not in the bridge.
-const GYRO_SIGN: f32 = 1.0;
+/// coordinate conversion to the core, so the negation belongs HERE and not in
+/// the bridge.
+const GYRO_SIGN: f32 = -1.0;
 
 /// Rotation rate, in rad/s, that deflects the sensor fully.
 ///
-/// A feel choice rather than a measurement: about 460 degrees per second, so a
-/// brisk wrist twist reaches the end of the range without a slow turn feeling
-/// dead. Lower it if Twisted feels sluggish, raise it if it feels twitchy.
-const GYRO_RATE_FULL_SCALE: f32 = 8.0;
+/// No longer a feel choice. With [`GYRO_SPAN`] this sets the scale to 0x700 over
+/// 6.83, which is 262.3 ADC counts per rad/s and matches mGBA's 5.5e8 >> 21.
+/// Full scale therefore lands where the ADC actually runs out rather than where
+/// a guess put it: 6.83 rad/s, about 391 degrees per second.
+///
+/// mGBA reaches its own limit earlier and by accident, because 5.5e8 times a
+/// rate past about 3.9 rad/s overflows the int32 it keeps the sample in. We
+/// clamp instead, which keeps its scale without the wrap. A wrap would read as
+/// a sudden direction reversal on a hard flick, which is the symptom we were
+/// already chasing, so it is worth not reproducing.
+///
+/// If Twisted still feels twitchy now that the direction is right, this is the
+/// knob, and TH-Android's temporary gyro logging measures the peak rate the
+/// owner's hands actually produce.
+const GYRO_RATE_FULL_SCALE: f32 = 6.83;
 
 fn clamp12(v: i32) -> u16 {
     v.clamp(0, 0x0FFF) as u16
@@ -175,8 +215,9 @@ impl Sensors {
     /// source, unlike the accelerometer, which turned out to be g and not the
     /// m/s^2 that looked obvious.
     ///
-    /// Two things remain unmeasured and both are single constants:
-    /// [`GYRO_RATE_FULL_SCALE`], which is a feel choice, and [`GYRO_SIGN`].
+    /// [`GYRO_SIGN`] and the [`GYRO_SPAN`] / [`GYRO_RATE_FULL_SCALE`] pair are
+    /// no longer guesses. Both are matched to mGBA, which reads this same
+    /// libretro interface in these same units; see those constants.
     pub fn set_gyroscope(&mut self, _x: f32, _y: f32, z: f32) {
         self.in_gyro_z = (GYRO_SIGN * z / GYRO_RATE_FULL_SCALE).clamp(-1.0, 1.0);
     }
@@ -432,18 +473,39 @@ mod tests {
     #[test]
     fn gyro_clocks_out_twelve_bits_after_four_dummies() {
         let mut s = Sensors::new(&rom_with_code(b"RZWE"));
-        // At rest the sample is the centre value.
-        assert_eq!(clock_out(&mut s), clamp12(GYRO_CENTER));
+        // Absolute numbers throughout, never GYRO_CENTER plus or minus
+        // something. The version of this test that shipped the inverted sign
+        // asserted against clamp12(GYRO_CENTER), so it moved with the constant
+        // it was meant to check, and its two labels were the wrong way round:
+        // it fed +100.0, which is anticlockwise, and called it clockwise. It
+        // passed under either sign, which is the only reason it passed at all.
+        assert_eq!(clock_out(&mut s), 0x700, "at rest the ADC sits at 0x700");
 
-        // Twisting one way must move it up, the other way down, and neither
-        // may leave the 12 bits the ADC actually has.
-        s.set_gyroscope(0.0, 0.0, 100.0);
-        let high = clock_out(&mut s);
+        // Tilting the console RIGHT reads ABOVE centre.
+        //
+        // Android TYPE_GYROSCOPE is right-handed about the device axes with +Z
+        // out of the screen, so the right edge going down is clockwise seen from
+        // the front, which is NEGATIVE z. mgba#3511 records what real hardware
+        // does: "tilting the console right would make the airplane in the
+        // airplane microgame go right".
         s.set_gyroscope(0.0, 0.0, -100.0);
-        let low = clock_out(&mut s);
-        assert!(high > clamp12(GYRO_CENTER), "clockwise should read above centre");
-        assert!(low < clamp12(GYRO_CENTER), "anticlockwise should read below centre");
-        assert!(high <= 0x0FFF && low <= 0x0FFF, "12-bit ADC cannot exceed 0xFFF");
+        let right = clock_out(&mut s);
+        s.set_gyroscope(0.0, 0.0, 100.0);
+        let left = clock_out(&mut s);
+        assert!(right > 0x700, "console tilted right reads above 0x700, got {right:#x}");
+        assert!(left < 0x700, "console tilted left reads below 0x700, got {left:#x}");
+        assert!(right <= 0x0FFF && left <= 0x0FFF, "12-bit ADC cannot exceed 0xFFF");
+
+        // Scale, against mGBA's figure rather than against our own constants:
+        // its libretro port maps rad/s to counts as 5.5e8 >> 21, so one rad/s
+        // is 262.26 counts of deflection. This fails if GYRO_SPAN or
+        // GYRO_RATE_FULL_SCALE is changed without meaning to.
+        s.set_gyroscope(0.0, 0.0, -1.0);
+        let one_rad = clock_out(&mut s) as i32 - 0x700;
+        assert!(
+            (one_rad - 262).abs() <= 2,
+            "1 rad/s should deflect about 262 counts (mGBA 5.5e8 >> 21), got {one_rad}"
+        );
     }
 
     #[test]
