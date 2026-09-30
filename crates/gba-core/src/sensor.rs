@@ -34,6 +34,41 @@ pub enum CartSensor {
 
 impl CartSensor {
     /// Identify the cartridge's sensor from the game code's first character.
+    ///
+    /// This is a Nintendo CONVENTION on retail codes, not a hardware field, so
+    /// anything that does not follow retail conventions can collide with it.
+    /// Measured across 6131 ROMs on 2026-09-30, every distinct R code present:
+    ///
+    /// ```text
+    /// RZWE  WARIOTWISTED   WarioWare Twisted (USA)        real gyro
+    /// RZWJ  MAWARUWARIO    Mawaru Made in Wario (Japan)   real gyro
+    /// RARE  BATTLETOADS    Battletoads (USA) (Proto)      NOT a gyro cart
+    /// RARE  DK-PILOT       Diddy Kong Pilot (Proto)       NOT a gyro cart
+    /// RKTG  Jetpack 2      homebrew                       NOT a gyro cart
+    /// ```
+    ///
+    /// So the genuine gyro carts are RZW-something, and the false positives have
+    /// one shared cause worth knowing: `RARE` is Rare's own name used as a
+    /// placeholder game code in their unfinished builds, and it begins with R by
+    /// coincidence. Any Rare prototype will look like a gyro cart here.
+    ///
+    /// The owner ran a 2005 Diddy Kong Pilot prototype and confirmed the
+    /// helicopter is on the D-pad with no motion control at all. It is not an
+    /// unfinished gyro game, it was never a gyro cart.
+    ///
+    /// NARROWING THIS IS NOT WORTH IT, and one plausible guard was measured and
+    /// rejected rather than assumed: the maker code at 0xB0 does NOT discriminate,
+    /// because it reads '01' for all nine of the above, false positives included.
+    /// Rare's prototypes carry Nintendo's maker code and even the homebrew sets
+    /// it. The alternative is a title list, which is the exact thing this check
+    /// exists to avoid and which goes stale on the first new dump.
+    ///
+    /// The cost of a false positive is bounded and was verified: these three are
+    /// byte-identical before and after gyro changes because they never touch the
+    /// GPIO. On the Android side it costs one sensor listener for a ROM that will
+    /// not read it. It would stop being harmless if a user-visible motion prompt
+    /// were ever gated on this byte, because then a false positive becomes a lie
+    /// on screen rather than a little battery.
     pub fn detect(rom: &[u8]) -> Self {
         match rom.get(0xAC) {
             Some(b'R') => CartSensor::Gyro,
@@ -137,6 +172,12 @@ const GYRO_SPAN: i32 = 0x700;
 /// mgba#3511 is itself a DIFFERENT bug that happens to share the symptom;
 /// endrift traced it to libogc on Wii. It is cited for the hardware behaviour it
 /// records, not as a diagnosis of this one.
+///
+/// THE LIMIT OF THE EVIDENCE, worth stating because it is thinner than it looks:
+/// only WarioWare Twisted and its Japanese release use this sensor, and they are
+/// one engine. Diddy Kong Pilot carries an R game code but is not a gyro cart at
+/// all, see [`CartSensor::detect`], so the second-engine confirmation this sign
+/// deserves does not exist in the corpus. It rests on one game plus mGBA.
 ///
 /// The bridge deliberately publishes unrotated device axes and leaves cartridge
 /// coordinate conversion to the core, so the negation belongs HERE and not in
