@@ -160,10 +160,12 @@ const GYRO_SIGN: f32 = -1.0;
 /// 238 seconds of the owner actually playing Twisted on an S25 Ultra, 11,324
 /// samples over 119 windows:
 ///
-///     median window peak |z|   1.20 rad/s
-///     p90 window peak |z|      5.34
-///     session max |z|          9.52
-///     samples past this clamp  41 of 11,324, 0.36%, in 8 of 119 windows
+/// ```text
+/// median window peak |z|   1.20 rad/s
+/// p90 window peak |z|      5.34
+/// session max |z|          9.52
+/// samples past this clamp  41 of 11,324, 0.36%, in 8 of 119 windows
+/// ```
 ///
 /// So ordinary play sits well inside the range and the ADC is not going unused.
 /// The tail does clip: his hardest flick was 39% past full scale, and because
