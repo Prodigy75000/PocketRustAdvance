@@ -146,18 +146,35 @@ impl Sensors {
 
     // --- Host input ----------------------------------------------------------
 
-    /// Rotation rate about Z, as the front-end reports it (rad/s). The divisor
-    /// sets how hard the player has to twist for full deflection and is a feel
-    /// choice rather than a measurement.
+    /// Rotation rate about Z.
+    ///
+    /// Units here are NOT confirmed the way the accelerometer's are. There is
+    /// no working gyro feed anywhere in the fleet yet to measure against, so
+    /// rad/s is the libretro convention and an assumption. Given the
+    /// accelerometer turned out to be g rather than the m/s^2 that seemed
+    /// obvious, this wants checking against a real feed before it is trusted;
+    /// the divisor is the knob and it is a feel choice either way.
     pub fn set_gyroscope(&mut self, _x: f32, _y: f32, z: f32) {
         self.in_gyro_z = (z / 8.0).clamp(-1.0, 1.0);
     }
 
-    /// Accelerometer in m/s^2, as Android reports it, so one gravity is ~9.81.
-    /// Dividing by that maps "tipped fully onto one edge" to full scale.
+    /// Accelerometer as specific force in **g**, which is the unit the
+    /// front-end reports and not m/s^2.
+    ///
+    /// This started out dividing by 9.81, on the assumption that the value
+    /// arrived in m/s^2 the way Android's own SensorEvent does. It does not:
+    /// PocketRust's `gb-libretro/src/sensor.rs` states the contract outright,
+    /// "the frontend reports specific force in g", and its liveness threshold
+    /// is a figure measured on a real tablet in those units (0.00293 g of
+    /// jitter at rest). That core's tilt is known to work on device, so it is
+    /// the authority here. Dividing again would have scaled every tilt down by
+    /// about ten and read as "the sensor does nothing".
+    ///
+    /// One g is a device resting fully on that edge, which is the most tilt a
+    /// player can express, so g maps straight onto full scale.
     pub fn set_accelerometer(&mut self, x: f32, y: f32, _z: f32) {
-        self.in_accel_x = (x / 9.81).clamp(-1.0, 1.0);
-        self.in_accel_y = (y / 9.81).clamp(-1.0, 1.0);
+        self.in_accel_x = x.clamp(-1.0, 1.0);
+        self.in_accel_y = y.clamp(-1.0, 1.0);
     }
 
     fn sample_gyro(&self) -> u16 {
@@ -424,7 +441,10 @@ mod tests {
     #[test]
     fn tilt_samples_on_the_handshake_and_reports_ready() {
         let mut s = Sensors::new(&rom_with_code(b"KYGE"));
-        s.set_accelerometer(9.81, -9.81, 0.0);
+        // One g, i.e. resting fully on that edge. NOT 9.81: the front-end
+        // reports specific force in g, so passing m/s^2 here would clamp and
+        // hide a ten-fold scaling error rather than catch it.
+        s.set_accelerometer(1.0, -1.0, 0.0);
 
         // Sampling is started by the documented pair of writes.
         assert!(s.tilt_write(0x0E00_8000, 0x55));
