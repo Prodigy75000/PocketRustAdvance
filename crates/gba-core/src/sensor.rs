@@ -58,6 +58,38 @@ const TILT_CENTER_Y: i32 = 0x3A0;
 const TILT_SPAN_X: i32 = 0xE3;
 const TILT_SPAN_Y: i32 = 0xDD;
 
+/// Which way round the tilt cart sees each axis. X positive, Y NEGATIVE, and
+/// both measured on device rather than reasoned out.
+///
+/// These are per-axis and not one handedness flip, because the two axes were
+/// established by different evidence and one of them was wrong for a month
+/// without anything noticing.
+///
+/// X is positive and verified. The owner checked Yoshi Topsy-Turvy's side tilt
+/// in portrait against footage of the real game: correct, including the detail
+/// that Yoshi leans OPPOSITE to the tilt, which is the game keeping him upright
+/// with respect to real gravity rather than a sign error.
+///
+/// Y is negative, and this is the 2026-09-30 fix. Koro Koro Puzzle is the FIRST
+/// game in the corpus that asks for vertical tilt at all: Yoshi's gameplay is
+/// side tilt and Twisted is single-axis gyro by construction, so this axis had
+/// never been under test on any title. The owner's report, with the game's own
+/// kataMuki prompt showing a downward arrow on screen: "I have to tilt my GBA
+/// forward but what works for me is the opposite."
+///
+/// Tilting the phone's top edge away from you reduces Android's accelerometer Y
+/// (upright reads +1g on Y, flat reads 0), so forward tilt has to move this ADC
+/// UP, which is what the negation does.
+///
+/// This also reconciles mGBA, which had looked like it disagreed with us on X.
+/// Its cart/gpio.c computes `0x3A0 - (x >> 22)` while its libretro port feeds
+/// `ACCELEROMETER_X * 3e8` and `ACCELEROMETER_Y * -3e8`, so net of both steps it
+/// does NOT negate X and DOES negate Y. Relative to raw Android device axes that
+/// is exactly this pair. The earlier discrepancy was our reading of only half of
+/// its pipeline, not a real disagreement.
+const TILT_SIGN_X: f32 = 1.0;
+const TILT_SIGN_Y: f32 = -1.0;
+
 // Gyro centre and half-span, matched to mGBA.
 //
 // GBATEK gives the gyro's wiring and its bitstream but no resting value and no
@@ -388,8 +420,10 @@ impl Sensors {
                 // latched here so the pair a game reads always comes from one
                 // instant, and the status bit reads Busy until the second write
                 // completes the handshake.
-                self.tilt_x = clamp12(TILT_CENTER_X + (self.in_accel_x * TILT_SPAN_X as f32) as i32);
-                self.tilt_y = clamp12(TILT_CENTER_Y + (self.in_accel_y * TILT_SPAN_Y as f32) as i32);
+                self.tilt_x =
+                    clamp12(TILT_CENTER_X + (TILT_SIGN_X * self.in_accel_x * TILT_SPAN_X as f32) as i32);
+                self.tilt_y =
+                    clamp12(TILT_CENTER_Y + (TILT_SIGN_Y * self.in_accel_y * TILT_SPAN_Y as f32) as i32);
                 self.tilt_ready = false;
                 self.conversions += 1;
                 true
@@ -547,6 +581,16 @@ mod tests {
         assert_eq!(plain.gpio_read(0xC4), None);
     }
 
+    /// Read the latched 12-bit pair the way a game does, low byte then the
+    /// four high bits.
+    fn read_axes(s: &Sensors) -> (u16, u16) {
+        let x = s.tilt_read(0x0E00_8200).unwrap() as u16
+            | ((s.tilt_read(0x0E00_8300).unwrap() as u16 & 0x0F) << 8);
+        let y = s.tilt_read(0x0E00_8400).unwrap() as u16
+            | ((s.tilt_read(0x0E00_8500).unwrap() as u16 & 0x0F) << 8);
+        (x, y)
+    }
+
     #[test]
     fn tilt_samples_on_the_handshake_and_reports_ready() {
         let mut s = Sensors::new(&rom_with_code(b"KYGE"));
@@ -562,16 +606,30 @@ mod tests {
         assert!(s.tilt_write(0x0E00_8100, 0xAA));
         assert_eq!(s.tilt_read(0x0E00_8300).unwrap() & 0x80, 0x80, "ready bit");
 
-        let x = s.tilt_read(0x0E00_8200).unwrap() as u16
-            | ((s.tilt_read(0x0E00_8300).unwrap() as u16 & 0x0F) << 8);
-        let y = s.tilt_read(0x0E00_8400).unwrap() as u16
-            | ((s.tilt_read(0x0E00_8500).unwrap() as u16 & 0x0F) << 8);
-        assert!(x > TILT_CENTER_X as u16, "tilted one way reads above centre");
-        assert!(y < TILT_CENTER_Y as u16, "tilted the other reads below centre");
-        // GBATEK's ranges are the bound worth holding: outside them the cart
-        // would be producing values a real one never does.
-        assert!((0x2AF..=0x477).contains(&x), "X outside the documented range");
-        assert!((0x2C3..=0x480).contains(&y), "Y outside the documented range");
+        let (x, y) = read_axes(&s);
+
+        // Absolute numbers, and GBATEK's rather than ours. The previous version
+        // of these two asserts was written as "above TILT_CENTER_X" and "below
+        // TILT_CENTER_Y", which moves with the constants it is checking and,
+        // worse, encoded the Y direction that turned out to be inverted. It
+        // would have passed under either sign.
+        //
+        // DIRECTIONS COME FROM THE DEVICE, see TILT_SIGN_X and TILT_SIGN_Y.
+        // +1g on X reads high; -1g on Y must ALSO read high, because tilting
+        // the phone forward reduces Android's Y and has to move this ADC up.
+        assert_eq!(x, 0x475, "+1g on X reads high, just under GBATEK 0x477 ceiling");
+        assert_eq!(y, 0x47D, "-1g on Y must read ABOVE centre, not below it");
+
+        // The other corner, which lands exactly on GBATEK's documented floors:
+        // "X ranged between 0x2AF to 0x477" and "Y ranged between 0x2C3 to
+        // 0x480". Full scale is supposed to reach the extremes a real cart
+        // produces and go no further.
+        s.set_accelerometer(-1.0, 1.0, 0.0);
+        assert!(s.tilt_write(0x0E00_8000, 0x55));
+        assert!(s.tilt_write(0x0E00_8100, 0xAA));
+        let (x2, y2) = read_axes(&s);
+        assert_eq!(x2, 0x2AF, "-1g on X lands on GBATEK's documented X floor");
+        assert_eq!(y2, 0x2C3, "+1g on Y lands on GBATEK's documented Y floor");
 
         // A cart without the sensor must not answer in the SRAM window, which
         // is where its save memory lives.
