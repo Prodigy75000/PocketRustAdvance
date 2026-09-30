@@ -49,6 +49,15 @@ pub struct Gba {
     pub irqs_taken: u64,
     /// Diagnostics: CPU instructions executed since boot.
     pub steps: u64,
+    /// Diagnostics: how many of `steps` were executed inside the 16 KB BIOS.
+    ///
+    /// A cartridge that crashes and restarts through the BIOS looks perfectly
+    /// healthy to any colour-based liveness check, because the boot animation
+    /// draws and animates: Maniac Racers Advance sits on the Normmatt logo
+    /// forever and scores 16 distinct colours, the same as a game resting on a
+    /// dark title screen. This says WHO is executing, which a colour count
+    /// cannot. A healthy cartridge enters the BIOS only for SWIs.
+    pub bios_steps: u64,
     /// Diagnostics: cycles the CPU spent halted, i.e. the game had finished its
     /// work for that stretch and was waiting for an interrupt.
     ///
@@ -123,6 +132,7 @@ impl Gba {
             bus,
             irqs_taken: 0,
             steps: 0,
+            bios_steps: 0,
             halt_cycles: 0,
             render_enabled: true,
             audio_clock: 0,
@@ -243,6 +253,14 @@ impl Gba {
                     if self.bus.watch_addr != 0 {
                         let back = if self.cpu.thumb() { 4 } else { 8 };
                         self.bus.cur_pc = self.cpu.r[15].wrapping_sub(back);
+                    }
+                    // One compare on the hot path, with the pipeline offset folded
+                    // into the bound: R15 runs 8 bytes (ARM) or 4 (Thumb) ahead of
+                    // the instruction being executed, so R15 < 0x4008 is exactly
+                    // "executing inside the BIOS" for ARM and over-counts Thumb by
+                    // at most the four bytes either side of the BIOS ceiling.
+                    if self.cpu.r[15] < 0x4008 {
+                        self.bios_steps += 1;
                     }
                     self.cpu.step(&mut self.bus);
                     self.steps += 1;
@@ -464,6 +482,50 @@ mod tests {
         assert!(
             gba.cpu.r[15] < 0x0800_0000,
             "N/0 must not be intercepted: hardware hangs here, so we must too"
+        );
+    }
+
+    /// `bios_steps` must count BIOS instructions and ONLY BIOS instructions.
+    ///
+    /// This is the signal that tells a crashed cartridge apart from a working
+    /// one, and a colour count cannot: Maniac Racers Advance sits on the
+    /// Normmatt boot logo forever and scores the same 16 distinct colours as a
+    /// game on a dark title screen. Both halves are asserted separately, so a
+    /// bound that is too wide (counting cartridge code) or an increment that
+    /// never fires both fail.
+    #[test]
+    fn bios_steps_counts_the_bios_and_nothing_else() {
+        // A stand-in BIOS: an endless loop parked at the SWI vector, so a
+        // cartridge that calls a SWI never comes back and every instruction
+        // after that one is BIOS.
+        let mut bios = vec![0u8; 0x4000];
+        bios[8..12].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes()); // 0x08: b .
+
+        // Cartridge A never leaves its own code: `b .` at the entry point.
+        let mut rom = vec![0u8; 0x2000];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        let mut a = Gba::new(rom, bios.clone());
+        a.run_frame();
+        assert!(a.steps > 1000, "the cartridge should have run, got {}", a.steps);
+        assert_eq!(
+            a.bios_steps, 0,
+            "a cartridge that never calls a SWI must not count as BIOS"
+        );
+
+        // Cartridge B vectors into the BIOS on its first instruction and stays.
+        let mut rom = vec![0u8; 0x2000];
+        rom[0..4].copy_from_slice(&0xEF00_0000u32.to_le_bytes()); // swi #0
+        let mut b = Gba::new(rom, bios);
+        b.run_frame();
+        assert!(
+            b.bios_steps > 1000,
+            "a cartridge stuck in the BIOS must count as BIOS, got {} of {}",
+            b.bios_steps,
+            b.steps
+        );
+        assert!(
+            b.bios_steps < b.steps,
+            "the cartridge ran its own SWI first, so not every step is BIOS"
         );
     }
 }

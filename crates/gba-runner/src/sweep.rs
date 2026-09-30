@@ -48,7 +48,7 @@ fn distinct(fb: &[u16]) -> usize {
 /// steps, non-zero audio samples). Panics propagate to the caller's catch.
 /// With `bios` empty this is HLE direct-boot (the shipping config); pass a real
 /// 16 KB BIOS (via GBA_BIOS) to measure how many failures are BIOS-dependent.
-fn run_one(rom: Vec<u8>, bios: &[u8], frames: u32) -> (usize, u32, u64, usize, u64) {
+fn run_one(rom: Vec<u8>, bios: &[u8], frames: u32) -> (usize, u32, u64, usize, u64, u64) {
     let mut gba = Gba::new(rom, bios.to_vec());
     let (mut best, mut best_frame) = (0usize, 0u32);
     // `late` = peak distinct colours over the final ~30 frames. Unlike the
@@ -57,6 +57,7 @@ fn run_one(rom: Vec<u8>, bios: &[u8], frames: u32) -> (usize, u32, u64, usize, u
     // actually drawing when we stop, not just that something flashed at boot.
     let late_from = frames.saturating_sub(30);
     let mut late = 0usize;
+    let (mut late_steps, mut late_bios) = (0u64, 0u64);
     for f in 0..frames {
         let p = f % 24 < 4; // pulse A+Start to advance logos / title / dialogue
         gba.set_button(Button::A, p);
@@ -69,6 +70,13 @@ fn run_one(rom: Vec<u8>, bios: &[u8], frames: u32) -> (usize, u32, u64, usize, u
         if f >= late_from && d > late {
             late = d;
         }
+        if f == late_from {
+            // Snapshot, so the BIOS share below covers only the closing frames.
+            // Over the whole run it is useless: Mario Kart reads 19% purely from
+            // boot-time BIOS decompression and a crashed cart reads 52%.
+            late_steps = gba.steps;
+            late_bios = gba.bios_steps;
+        }
         let _ = gba.take_audio();
     }
     // Percent of the run the CPU spent halted, which is the headroom the game
@@ -77,7 +85,14 @@ fn run_one(rom: Vec<u8>, bios: &[u8], frames: u32) -> (usize, u32, u64, usize, u
         * gba_core::ppu::CYCLES_PER_LINE as u64
         * gba_core::TOTAL_LINES as u64;
     let idle = if total > 0 { gba.halt_cycles * 100 / total } else { 0 };
-    (best, best_frame, gba.steps, late, idle)
+    // Share of the CLOSING frames spent executing BIOS code. Near 0 for a
+    // healthy cart; ~100 for one that crashed back into the boot animation,
+    // which no colour count can tell apart from a game on a dark screen: the
+    // Normmatt logo animates and scores 16 distinct colours. A run that never
+    // executed in the window reads 100, because nothing is the same as parked.
+    let (ds, db) = (gba.steps - late_steps, gba.bios_steps - late_bios);
+    let in_bios = if ds > 0 { db * 100 / ds } else { 100 };
+    (best, best_frame, gba.steps, late, idle, in_bios)
 }
 
 fn main() {
@@ -154,16 +169,17 @@ fn main() {
                     break;
                 }
                 let path = &todo[i];
-                // Columns: path, status, peak_distinct, best_frame, steps, late_distinct, idle%
+                // Columns: path, status, peak_distinct, best_frame, steps,
+                // late_distinct, idle%, bios%
                 let line = match std::fs::read(path) {
-                    Err(e) => format!("{}\tREADERR\t0\t0\t0\t0\t{}\n", path.display(), e),
+                    Err(e) => format!("{}\tREADERR\t0\t0\t0\t0\t{}\t0\n", path.display(), e),
                     Ok(rom) => match panic::catch_unwind(AssertUnwindSafe(|| run_one(rom, &bios, frames))) {
-                        Ok((d, bf, steps, late, idle)) => {
-                            format!("{}\tOK\t{}\t{}\t{}\t{}\t{}\n", path.display(), d, bf, steps, late, idle)
+                        Ok((d, bf, steps, late, idle, in_bios)) => {
+                            format!("{}\tOK\t{}\t{}\t{}\t{}\t{}\t{}\n", path.display(), d, bf, steps, late, idle, in_bios)
                         }
                         Err(_) => {
                             let msg = LAST_PANIC.with(|p| p.borrow().clone());
-                            format!("{}\tPANIC\t0\t0\t0\t0\t{}\n", path.display(), msg)
+                            format!("{}\tPANIC\t0\t0\t0\t0\t{}\t0\n", path.display(), msg)
                         }
                     },
                 };

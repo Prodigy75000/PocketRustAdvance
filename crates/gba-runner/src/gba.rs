@@ -430,6 +430,10 @@ fn main() {
     let mut prev_sound = (0u8, 0u16, 0u16, 0u16);
     let (mut lp, mut lu, mut lr) = (0u64, 0u64, 0u64);
     let mut lirq = 0u64;
+    // Snapshot at the start of the closing 30 frames, so the BIOS share below
+    // reports who is executing NOW rather than averaging in boot-time SWIs.
+    let late_from = frames.saturating_sub(30);
+    let (mut late_steps, mut late_bios) = (0u64, 0u64);
     for f in 0..frames {
         if autoinput {
             let p = f % 24 < 4; // pulse A + Start to advance title and dialogue
@@ -460,6 +464,10 @@ fn main() {
                     }
                 }
             }
+        }
+        if f == late_from {
+            late_steps = gba.steps;
+            late_bios = gba.bios_steps;
         }
         let fb = gba.run_frame().to_vec();
         if irqlog {
@@ -731,6 +739,13 @@ fn main() {
         }
     }
     println!("steps={}  (~{} instr/frame)", gba.steps, gba.steps / frames.max(1) as u64);
+    // Who is executing over the closing frames: a cart that crashed back into
+    // the BIOS boot animation still draws a colourful, animated screen, so the
+    // colour count above says nothing about it. Near 0% is healthy (SWIs only);
+    // near 100% is the boot logo.
+    let (ds, db) = (gba.steps - late_steps, gba.bios_steps - late_bios);
+    println!("  in BIOS: {}% of the last {} frames ({} of {} steps)",
+        if ds > 0 { db * 100 / ds } else { 100 }, frames - late_from, db, ds);
     if gba.bus.watch_addr != 0 {
         println!("  watch {:08X}: {} writes", gba.bus.watch_addr, gba.bus.watch_hits.len());
         for (pc, addr, val) in gba.bus.watch_hits.iter().take(24) {
