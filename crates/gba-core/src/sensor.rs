@@ -68,6 +68,27 @@ const TILT_SPAN_Y: i32 = 0xDD;
 const GYRO_CENTER: i32 = 0x6C0;
 const GYRO_SPAN: i32 = 0x500;
 
+/// Which way round the cartridge sees a rotation.
+///
+/// Untested, and named rather than folded into the maths so that fixing it is
+/// one character. The input contract is settled: TH-Android's cartridge bridge
+/// publishes Android TYPE_GYROSCOPE unrotated and unconverted, which Android
+/// documents as rad/s about the device axes under the right-hand rule. What is
+/// NOT settled is whether the cartridge's idea of positive matches the phone's,
+/// because nothing has compared them against the game yet.
+///
+/// The bridge deliberately publishes unrotated device axes and leaves cartridge
+/// coordinate conversion to the core, so if WarioWare Twisted turns out
+/// mirrored, the negation belongs HERE and not in the bridge.
+const GYRO_SIGN: f32 = 1.0;
+
+/// Rotation rate, in rad/s, that deflects the sensor fully.
+///
+/// A feel choice rather than a measurement: about 460 degrees per second, so a
+/// brisk wrist twist reaches the end of the range without a slow turn feeling
+/// dead. Lower it if Twisted feels sluggish, raise it if it feels twitchy.
+const GYRO_RATE_FULL_SCALE: f32 = 8.0;
+
 fn clamp12(v: i32) -> u16 {
     v.clamp(0, 0x0FFF) as u16
 }
@@ -146,16 +167,18 @@ impl Sensors {
 
     // --- Host input ----------------------------------------------------------
 
-    /// Rotation rate about Z.
+    /// Rotation rate about Z, in rad/s.
     ///
-    /// Units here are NOT confirmed the way the accelerometer's are. There is
-    /// no working gyro feed anywhere in the fleet yet to measure against, so
-    /// rad/s is the libretro convention and an assumption. Given the
-    /// accelerometer turned out to be g rather than the m/s^2 that seemed
-    /// obvious, this wants checking against a real feed before it is trusted;
-    /// the divisor is the knob and it is a feel choice either way.
+    /// The UNIT is now settled: TH-Android's cartridge bridge publishes Android
+    /// TYPE_GYROSCOPE through with no conversion and no axis remap, and Android
+    /// documents that as rad/s about the device axes. So this matches its
+    /// source, unlike the accelerometer, which turned out to be g and not the
+    /// m/s^2 that looked obvious.
+    ///
+    /// Two things remain unmeasured and both are single constants:
+    /// [`GYRO_RATE_FULL_SCALE`], which is a feel choice, and [`GYRO_SIGN`].
     pub fn set_gyroscope(&mut self, _x: f32, _y: f32, z: f32) {
-        self.in_gyro_z = (z / 8.0).clamp(-1.0, 1.0);
+        self.in_gyro_z = (GYRO_SIGN * z / GYRO_RATE_FULL_SCALE).clamp(-1.0, 1.0);
     }
 
     /// Accelerometer as specific force in **g**, which is the unit the
