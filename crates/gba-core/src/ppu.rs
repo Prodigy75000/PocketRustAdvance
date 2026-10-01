@@ -398,7 +398,30 @@ impl Ppu {
         // second of banded noise where the screen should be black, caught by
         // the owner on device and absent on gpSP. Reported 2026-10-01.
         if dispcnt & 0x0400 == 0 {
-            self.framebuffer[line * SCREEN_W..(line + 1) * SCREEN_W].fill(backdrop);
+            // Nothing left but the backdrop, and the backdrop is a colour-effect
+            // target like any other layer (BLDCNT bit 5). Filling it raw was
+            // wrong: Hello Kitty Collection fades this very transition to black
+            // with a brightness decrease on the backdrop, so skipping the effect
+            // held a flat green screen for 53 frames where hardware and mGBA go
+            // black almost at once. Measured BLDCNT=00FF, BLDY ramping to 0F.
+            //
+            // Alpha is not reachable here: it needs a second target underneath,
+            // and there is nothing under the backdrop. The window colour-effect
+            // gate is not applied either, which would matter only for a window
+            // enabled in a bitmap mode with BG2 switched off.
+            let bldcnt = self.regs[0x50 / 2];
+            let fx = if self.no_blend { 0 } else { (bldcnt >> 6) & 3 };
+            let evy = (self.regs[0x54 / 2] & 0x1F).min(16);
+            let px = if bldcnt & (1 << 5) != 0 {
+                match fx {
+                    2 => brighten(backdrop, evy),
+                    3 => darken(backdrop, evy),
+                    _ => backdrop,
+                }
+            } else {
+                backdrop
+            };
+            self.framebuffer[line * SCREEN_W..(line + 1) * SCREEN_W].fill(px);
             return;
         }
         let frame = if dispcnt & 0x10 != 0 { 0xA000 } else { 0 };
@@ -1101,6 +1124,30 @@ mod tests {
             0x001F,
             "BG2 disabled: the backdrop, not whatever VRAM happens to hold"
         );
+        // A blanked bitmap mode still obeys the colour effects, because the
+        // backdrop is BLDCNT target bit 5. Hello Kitty Collection fades this exact
+        // transition to black with a brightness decrease; without this the screen
+        // sat flat green for 53 frames.
+        {
+            let mut p = Ppu::new();
+            put16(&mut p.palram, 0, 0x001F); // backdrop = full red
+            p.write_reg16(0x00, 0x0003); // mode 3, BG2 OFF
+            p.write_reg16(0x50, 0x00FF); // every layer a 1st target, mode 3 = darken
+            p.write_reg16(0x54, 16); // EVY at maximum
+            p.render_line(0);
+            assert_eq!(
+                p.framebuffer[0], 0,
+                "a full brightness-decrease on the backdrop must reach black"
+            );
+            // With the backdrop NOT named as a target the effect must not apply.
+            p.write_reg16(0x50, 0x00DF); // clear bit 5, keep darken
+            p.render_line(0);
+            assert_eq!(
+                p.framebuffer[0], 0x001F,
+                "the effect only applies to layers BLDCNT names"
+            );
+        }
+
         // Mode 4 and mode 5 are the same background behind a different format.
         assert_eq!(
             scene(0x0004),
