@@ -666,7 +666,13 @@ fn main() {
             use gba_core::save::SaveKind;
             let sv = &gba.bus.save;
             let nonzero = sv.data.iter().filter(|&&b| b != 0).count();
-            println!("  SAVE: kind={:?} size={} nonzero={nonzero}  data[0..16]={:02X?}",
+            // Bytes still reading FF are ERASED, never written by the game.
+            // RetroAchievements reads this buffer as the GBA save region, and a
+            // "collect them all" condition tested against an all-ones bitmask
+            // unlocks the moment it is evaluated. A save that is still mostly
+            // erased long after boot is therefore worth seeing.
+            let erased = sv.data.iter().filter(|&&b| b == 0xFF).count();
+            println!("  SAVE: kind={:?} size={} nonzero={nonzero} erased(FF)={erased}  data[0..16]={:02X?}",
                 sv.kind, sv.data.len(), &sv.data[..sv.data.len().min(16)]);
         }
         // Palette dump (to spot a washed/faded/duplicated palette).
