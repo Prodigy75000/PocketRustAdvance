@@ -80,6 +80,10 @@ struct Compositor {
     snd_col: [u16; SCREEN_W],
     snd_id: [u8; SCREEN_W],
     snd_key: [u16; SCREEN_W],
+    /// Whether the winning pixel came from a semi-transparent sprite (OBJ mode
+    /// 1). Such a sprite is the alpha-blend 1st target regardless of BLDCNT, so
+    /// this has to be carried per pixel rather than read off a register.
+    top_semi: [bool; SCREEN_W],
     /// Track the second layer only when a colour effect needs it (blending on).
     track_second: bool,
     /// Per-pixel window mask: bits 0-4 enable BG0-3/OBJ, bit 5 the colour effect.
@@ -97,6 +101,7 @@ impl Compositor {
             snd_col: [backdrop; SCREEN_W],
             snd_id: [5; SCREEN_W],
             snd_key: [bd_key; SCREEN_W],
+            top_semi: [false; SCREEN_W],
             track_second,
             win_mask: [0x3F; SCREEN_W],
         }
@@ -114,7 +119,7 @@ impl Compositor {
     }
 
     #[inline]
-    fn place(&mut self, x: usize, col: u16, id: u8, priority: u8, rank: u8) {
+    fn place(&mut self, x: usize, col: u16, id: u8, priority: u8, rank: u8, semi: bool) {
         // A layer disabled by the window here contributes nothing.
         if self.win_mask[x] & (1 << id) == 0 {
             return;
@@ -129,6 +134,7 @@ impl Compositor {
             self.top_col[x] = col;
             self.top_id[x] = id;
             self.top_key[x] = key;
+            self.top_semi[x] = semi;
         } else if self.track_second && key < self.snd_key[x] {
             self.snd_col[x] = col;
             self.snd_id[x] = id;
@@ -427,7 +433,10 @@ impl Ppu {
     fn render_tiled(&mut self, line: usize, mode: u16, dispcnt: u16) {
         let bldcnt = self.regs[0x50 / 2];
         let blend_mode = if self.no_blend { 0 } else { (bldcnt >> 6) & 3 };
-        let mut comp = Compositor::new(self.backdrop(), blend_mode != 0);
+        // A semi-transparent sprite blends whatever BLDCNT says, so the layer
+        // underneath has to be kept even when no colour effect is configured.
+        let semi_obj = !self.no_blend && dispcnt & 0x1000 != 0 && self.any_semi_obj();
+        let mut comp = Compositor::new(self.backdrop(), blend_mode != 0 || semi_obj);
 
         // Window layer/effect masking (DISPCNT bits 13/14/15 enable win0/1/obj).
         if dispcnt & 0xE000 != 0 && !self.no_window {
@@ -472,8 +481,8 @@ impl Ppu {
         }
 
         let dst = &mut self.framebuffer[line * SCREEN_W..(line + 1) * SCREEN_W];
-        if blend_mode == 0 {
-            // No colour effect: the winning layer is the output.
+        if blend_mode == 0 && !semi_obj {
+            // No colour effect and nothing forcing one: the winner is the output.
             dst.copy_from_slice(&comp.top_col);
             return;
         }
@@ -490,8 +499,16 @@ impl Ppu {
             let tc = comp.top_col[x];
             // The colour effect only runs where the window enables it (bit 5).
             let effect = comp.win_mask[x] & 0x20 != 0;
-            let first_hit = effect && first & (1 << comp.top_id[x]) != 0;
-            dst[x] = match blend_mode {
+            // GBATEK: a semi-transparent sprite is ALWAYS the 1st target and
+            // always alpha-blends, regardless of BLDCNT bit 4 and bits 6-7,
+            // provided whatever is under it is a 2nd-target layer. Super
+            // Bust-A-Move greys out the unselected menu option this way, and
+            // without it both options render at full brightness and the
+            // selection is invisible.
+            let semi = comp.top_semi[x];
+            let first_hit = effect && (semi || first & (1 << comp.top_id[x]) != 0);
+            let mode = if semi && effect { 1 } else { blend_mode };
+            dst[x] = match mode {
                 1 if first_hit && second & (1 << comp.snd_id[x]) != 0 => {
                     blend_alpha(tc, comp.snd_col[x], eva, evb)
                 }
@@ -500,6 +517,22 @@ impl Ppu {
                 _ => tc,
             };
         }
+    }
+
+    /// Is any enabled sprite in OAM semi-transparent (OBJ mode 1)?
+    ///
+    /// Checked per scanline rather than cached, because OAM is routinely
+    /// rewritten mid-frame. It is 128 halfword reads against a full compositing
+    /// pass, and it only runs at all when sprites are enabled.
+    fn any_semi_obj(&self) -> bool {
+        (0..128).any(|i| {
+            let a0 = u16::from_le_bytes([self.oam[i * 8], self.oam[i * 8 + 1]]);
+            // Skip a disabled non-affine sprite; bit 9 means double-size on affine.
+            if a0 & 0x100 == 0 && a0 & 0x200 != 0 {
+                return false;
+            }
+            (a0 >> 10) & 3 == 1
+        })
     }
 
     /// Fill `mask` with the per-pixel window layer/effect bits for this scanline.
@@ -683,7 +716,7 @@ impl Ppu {
             }
             let color =
                 u16::from_le_bytes([self.palram[pal * 2], self.palram[pal * 2 + 1]]) & 0x7FFF;
-            comp.place(x, color, bg as u8, priority, rank);
+            comp.place(x, color, bg as u8, priority, rank, false);
         }
     }
 
@@ -748,7 +781,7 @@ impl Ppu {
             };
             let color =
                 u16::from_le_bytes([self.palram[pal * 2], self.palram[pal * 2 + 1]]) & 0x7FFF;
-            comp.place(x, color, bg as u8, priority, rank);
+            comp.place(x, color, bg as u8, priority, rank, false);
         }
     }
 
@@ -778,6 +811,9 @@ impl Ppu {
             if matches!((a0 >> 10) & 3, 2 | 3) {
                 continue;
             }
+            // Mode 1 = semi-transparent: this sprite blends with whatever is
+            // under it, whatever BLDCNT says about 1st targets.
+            let semi = (a0 >> 10) & 3 == 1;
             let shape = ((a0 >> 14) & 3) as usize;
             let size = ((a1 >> 14) & 3) as usize;
             if shape == 3 {
@@ -859,7 +895,7 @@ impl Ppu {
                 let color =
                     u16::from_le_bytes([self.palram[pal * 2], self.palram[pal * 2 + 1]]) & 0x7FFF;
                 // OBJ (layer id 4) beats a BG of equal priority (rank 0).
-                comp.place(sx, color, 4, priority, 0);
+                comp.place(sx, color, 4, priority, 0, semi);
             }
         }
     }
@@ -972,6 +1008,60 @@ mod tests {
         p.write_reg16(0x00, 0x1140); // DISPCNT: mode 0, BG0 + OBJ, 1D
         p.render_line(0);
         assert_eq!(p.framebuffer[0], 0x03E0, "OBJ wins over BG at equal priority");
+    }
+
+    /// A semi-transparent sprite (OBJ mode 1) alpha-blends with the layer under
+    /// it even though BLDCNT names no 1st target and switches the colour effect
+    /// off entirely. GBATEK: such a sprite is always the 1st target and always
+    /// blends, regardless of BLDCNT bit 4 and bits 6-7.
+    ///
+    /// Super Bust-A-Move greys out the unselected option of its CONTINUE? prompt
+    /// this way. Without the override both options drew at full brightness and
+    /// there was no way to see which one was selected.
+    #[test]
+    fn semi_transparent_sprite_blends_without_bldcnt_asking() {
+        fn scene(obj_mode: u16) -> (u16, u16) {
+            let mut p = Ppu::new();
+            put16(&mut p.palram, 2, 0x001F); // BG palette[1] = red
+            put16(&mut p.palram, 0x202, 0x7C00); // OBJ palette[1] = blue
+            for i in 0..32 {
+                p.vram[i] = 0x11;
+                p.vram[0x1_0000 + i] = 0x11;
+            }
+            put16(&mut p.vram, 0x800, 0); // BG0 map (0,0) -> tile 0
+            put16(&mut p.oam, 0, obj_mode << 10); // sprite 0 at (0,0), tile 0
+            // A decoy semi-transparent sprite well off to the right, so OAM always
+            // contains one and the colour-effect pass always runs. Without it the
+            // control below passes even if every sprite is treated as
+            // semi-transparent, because the OAM scan alone would gate the pass.
+            put16(&mut p.oam, 8, 1 << 10);
+            put16(&mut p.oam, 10, 64);
+            p.write_reg16(0x08, 0x0100); // BG0CNT priority 0
+            p.write_reg16(0x00, 0x1140); // DISPCNT: mode 0, BG0 + OBJ, 1D
+            // 1st target NONE, colour effect OFF, 2nd target BG0.
+            p.write_reg16(0x50, 0x0100);
+            p.write_reg16(0x52, 0x0808); // EVA = EVB = 8, a half-and-half mix
+            p.render_line(0);
+            (p.framebuffer[0], p.framebuffer[64])
+        }
+
+        assert_eq!(
+            scene(1).0,
+            blend_alpha(0x7C00, 0x001F, 8, 8),
+            "a semi-transparent sprite must blend with the BG under it"
+        );
+        assert_eq!(
+            scene(0).0,
+            0x7C00,
+            "a NORMAL sprite must not blend: BLDCNT names no 1st target"
+        );
+        // The decoy itself must blend, which proves the pass really ran and the
+        // control above is a statement about the sprite, not about the scene.
+        assert_eq!(
+            scene(0).1,
+            blend_alpha(0x7C00, 0x001F, 8, 8),
+            "the semi-transparent decoy must blend in the very same frame"
+        );
     }
 
     #[test]
