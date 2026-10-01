@@ -686,7 +686,22 @@ fn main() {
         // Search EWRAM/IWRAM for the rug-green 0x5BF4 to find the source palette
         // buffer, and show whether it is paired there or clean (distinct).
         // GBA_DUMP=<hexaddr>: dump 64 bytes of IWRAM/EWRAM as 32-bit words.
-        if let Ok(a) = std::env::var("GBA_DUMP") {
+        // GBA_RAMDUMP=<path> writes IWRAM (32 KB) then EWRAM (256 KB) as one flat
+    // file, which is exactly the memory RetroAchievements reads: RA address 0 is
+    // IWRAM and RA 0x8000 is EWRAM, so a byte at file offset N is RA address N.
+    // Written for comparing our work RAM against another emulator byte for byte
+    // when an achievement unlocks here and nowhere else.
+    if let Ok(path) = std::env::var("GBA_RAMDUMP") {
+        let mut blob = Vec::with_capacity(gba.bus.iwram.len() + gba.bus.ewram.len());
+        blob.extend_from_slice(&gba.bus.iwram);
+        blob.extend_from_slice(&gba.bus.ewram);
+        match std::fs::write(&path, &blob) {
+            Ok(()) => println!("  wrote {} bytes of work RAM to {path}", blob.len()),
+            Err(e) => eprintln!("  could not write {path}: {e}"),
+        }
+    }
+
+    if let Ok(a) = std::env::var("GBA_DUMP") {
             let addr = u32::from_str_radix(a.trim_start_matches("0x"), 16).unwrap_or(0x0300_0000);
             let (name, mem, off) = if (0x0600_0000..0x0700_0000).contains(&addr) {
                 ("VRAM", &gba.bus.ppu.vram[..], (addr & 0x1_FFFF) as usize)
