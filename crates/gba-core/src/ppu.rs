@@ -388,6 +388,19 @@ impl Ppu {
 
     fn render_bitmap(&mut self, line: usize, mode: u16, dispcnt: u16) {
         let backdrop = self.backdrop();
+        // The bitmap IS BG2, so DISPCNT bit 10 switches it off like any other
+        // background. Drawing it regardless means that whenever a game blanks
+        // the screen by clearing the enable bit, which is the normal way to
+        // hide a transition while the next image is DMAd in, the half-written
+        // VRAM is shown as a picture instead of the backdrop.
+        //
+        // Iridion II does exactly that between intro cutscenes: a quarter of a
+        // second of banded noise where the screen should be black, caught by
+        // the owner on device and absent on gpSP. Reported 2026-10-01.
+        if dispcnt & 0x0400 == 0 {
+            self.framebuffer[line * SCREEN_W..(line + 1) * SCREEN_W].fill(backdrop);
+            return;
+        }
         let frame = if dispcnt & 0x10 != 0 { 0xA000 } else { 0 };
         // In modes 3/4/5 the bitmap is BG2, an AFFINE background: it is sampled
         // through BG2's rotation/scaling matrix (PA/PB/PC/PD) and reference point,
@@ -1061,6 +1074,43 @@ mod tests {
             scene(0).1,
             blend_alpha(0x7C00, 0x001F, 8, 8),
             "the semi-transparent decoy must blend in the very same frame"
+        );
+    }
+
+    /// In the bitmap modes the picture IS BG2, so clearing DISPCNT bit 10 must
+    /// blank it to the backdrop, exactly as it does for a tiled background.
+    ///
+    /// Games switch BG2 off to hide a transition while the next image is being
+    /// written into VRAM. Drawing it anyway shows that half-written VRAM as a
+    /// picture: Iridion II gave a quarter of a second of banded noise between
+    /// intro cutscenes, where the screen should have been black.
+    #[test]
+    fn a_disabled_bg2_blanks_the_bitmap_modes() {
+        fn scene(dispcnt: u16) -> u16 {
+            let mut p = Ppu::new();
+            put16(&mut p.palram, 0, 0x001F); // backdrop = red
+            put16(&mut p.vram, 0, 0x7C00); // the bitmap is blue at (0,0)
+            p.write_reg16(0x00, dispcnt);
+            p.render_line(0);
+            p.framebuffer[0]
+        }
+        // Mode 3 with BG2 ON draws the bitmap, and with BG2 OFF draws nothing.
+        assert_eq!(scene(0x0403), 0x7C00, "BG2 enabled: the bitmap is drawn");
+        assert_eq!(
+            scene(0x0003),
+            0x001F,
+            "BG2 disabled: the backdrop, not whatever VRAM happens to hold"
+        );
+        // Mode 4 and mode 5 are the same background behind a different format.
+        assert_eq!(
+            scene(0x0004),
+            0x001F,
+            "mode 4 obeys the enable bit too"
+        );
+        assert_eq!(
+            scene(0x0005),
+            0x001F,
+            "mode 5 obeys the enable bit too"
         );
     }
 
