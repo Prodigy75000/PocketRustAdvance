@@ -437,6 +437,36 @@ impl Ppu {
         // Bitmap dimensions: modes 3/4 are full-screen, mode 5 is 160x128.
         let (bw, bh) = if mode == 5 { (160i32, 128i32) } else { (SCREEN_W as i32, SCREEN_H as i32) };
 
+        // The bitmap is BG2 and the area outside it is the backdrop, so both are
+        // colour-effect targets (BLDCNT bits 2 and 5) exactly as in the tiled
+        // modes. Drawing them raw meant a game fading the screen out kept showing
+        // the picture at full brightness.
+        //
+        // Iridion II fades its intro to black with BLDY at the maximum of 16 while
+        // mode 4 is still displaying a buffer it is in the middle of rewriting.
+        // Hardware shows black; we showed the half-written buffer, which is the
+        // garbage the owner reported on 2026-10-01 and photographed.
+        //
+        // Only brighten and darken are modelled. Alpha needs a second target
+        // underneath and these modes composite one layer, and sprites are not
+        // drawn in the bitmap modes at all yet, which is a separate gap.
+        let bldcnt = self.regs[0x50 / 2];
+        let fx = if self.no_blend { 0 } else { (bldcnt >> 6) & 3 };
+        let evy = (self.regs[0x54 / 2] & 0x1F).min(16);
+        let effect = |c: u16, is_target: bool| -> u16 {
+            if !is_target {
+                return c;
+            }
+            match fx {
+                2 => brighten(c, evy),
+                3 => darken(c, evy),
+                _ => c,
+            }
+        };
+        let bg2_target = bldcnt & (1 << 2) != 0;
+        let bd_target = bldcnt & (1 << 5) != 0;
+        let backdrop_px = effect(backdrop, bd_target);
+
         let row = &mut self.framebuffer[line * SCREEN_W..(line + 1) * SCREEN_W];
         for px in row.iter_mut() {
             let tx = cx >> 8;
@@ -444,11 +474,11 @@ impl Ppu {
             cx = cx.wrapping_add(pa);
             cy = cy.wrapping_add(pc);
             if tx < 0 || ty < 0 || tx >= bw || ty >= bh {
-                *px = backdrop; // outside the bitmap: backdrop (no wrap in bitmap modes)
+                *px = backdrop_px; // outside the bitmap (these modes do not wrap)
                 continue;
             }
             let (tx, ty) = (tx as usize, ty as usize);
-            *px = match mode {
+            let col = match mode {
                 4 => {
                     let idx = self.vram[frame + ty * bw as usize + tx] as usize;
                     u16::from_le_bytes([self.palram[idx * 2], self.palram[idx * 2 + 1]]) & 0x7FFF
@@ -460,6 +490,7 @@ impl Ppu {
                     u16::from_le_bytes([self.vram[o], self.vram[o + 1]]) & 0x7FFF
                 }
             };
+            *px = effect(col, bg2_target);
         }
     }
 
@@ -1098,6 +1129,43 @@ mod tests {
             blend_alpha(0x7C00, 0x001F, 8, 8),
             "the semi-transparent decoy must blend in the very same frame"
         );
+    }
+
+    /// A bitmap mode obeys the colour effects on the picture itself, not just on
+    /// the backdrop behind it.
+    ///
+    /// Iridion II fades its intro to black with BLDY at the maximum while mode 4
+    /// still displays a buffer it is rewriting. Without the effect the half-written
+    /// buffer is shown at full brightness, which is the garbage the owner
+    /// photographed; with it the screen is black, as hardware and gpSP both show.
+    #[test]
+    fn a_bitmap_mode_fades_with_bldy() {
+        fn scene(bldcnt: u16, evy: u16) -> u16 {
+            let mut p = Ppu::new();
+            put16(&mut p.palram, 0, 0x7FFF); // backdrop = white
+            put16(&mut p.vram, 0, 0x7FFF); // the bitmap is white at (0,0)
+            p.write_reg16(0x00, 0x0403); // mode 3, BG2 ON
+            p.write_reg16(0x50, bldcnt);
+            p.write_reg16(0x54, evy);
+            p.render_line(0);
+            p.framebuffer[0]
+        }
+        // Darken, BG2 named as a 1st target, EVY at maximum: the picture goes black.
+        assert_eq!(
+            scene(0x00FF, 16),
+            0,
+            "a full brightness decrease must black out the bitmap itself"
+        );
+        // Half strength lands halfway rather than anywhere.
+        assert_eq!(scene(0x00FF, 8), darken(0x7FFF, 8));
+        // BG2 not named: BLDCNT bit 2 clear, so the picture is untouched.
+        assert_eq!(
+            scene(0x00FB, 16),
+            0x7FFF,
+            "the effect must only reach layers BLDCNT names"
+        );
+        // Brighten is the other direction and must also reach the bitmap.
+        assert_eq!(scene(0x00BF, 16), 0x7FFF);
     }
 
     /// In the bitmap modes the picture IS BG2, so clearing DISPCNT bit 10 must
