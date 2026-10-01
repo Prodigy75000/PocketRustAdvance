@@ -131,6 +131,22 @@ Where there is evidence rather than assertion:
 - The RetroAchievements memory map is more complete here: rcheevos registers all
   three GBA regions from our descriptors, and logs "Could not map region starting
   at $048000" for gpSP, which publishes only two. Double-edged, see below.
+- **gpSP is ahead on menu transitions, reported 2026-10-01 and OPEN.** Iridion II
+  shows single frames of garbage during its intro transitions here and none on
+  gpSP: a noise frame after the language is chosen, then an over-saturated frame,
+  then another noise frame on the next button press. Not yet reproduced headless.
+  Every frame rendered from the owner's own save states around those moments is
+  clean, scanned one frame at a time, so whatever it is does not reproduce from
+  the core alone driven by a scripted button press.
+
+  One structural difference is worth knowing while this is open: `retro_run`
+  copies the frame into a single buffer and hands the host a pointer to it, then
+  overwrites that same buffer on the next call. There is no double buffer. The
+  host registers its callbacks on the main thread and runs frames on a dedicated
+  emulation thread, so a frame consumed asynchronously would tear, and a tear
+  between two very different transition frames looks like noise. Unproven, and
+  the discriminating question is whether the garbage appears at normal speed or
+  only under fast-forward.
 
 ## Risks a swap would carry
 
