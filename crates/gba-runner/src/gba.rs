@@ -470,6 +470,22 @@ fn main() {
             late_bios = gba.bios_steps;
         }
         let fb = gba.run_frame().to_vec();
+        // GBA_FRAMELOG: one line per frame with a distinct-colour count and a
+        // horizontal-edge count, so a whole run can be SCANNED for a single bad
+        // frame rather than sampled. A frame of garbage spikes both at once;
+        // ordinary detailed artwork spikes edges alone. Written while chasing a
+        // one-frame corruption in Iridion II that sampling every third frame
+        // would have walked straight past.
+        if std::env::var_os("GBA_FRAMELOG").is_some() {
+            let mut edges = 0usize;
+            for y in 0..SCREEN_H {
+                for x in 1..SCREEN_W {
+                    if fb[y * SCREEN_W + x] != fb[y * SCREEN_W + x - 1] { edges += 1; }
+                }
+            }
+            let mut v: Vec<u16> = fb.clone(); v.sort_unstable(); v.dedup();
+            println!("FRAMELOG {} {} {}", f, v.len(), edges);
+        }
         if irqlog {
             let d = &gba.bus.dbg_irq_src;
             println!(

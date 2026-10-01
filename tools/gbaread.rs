@@ -61,6 +61,7 @@ extern "C" fn env_cb(cmd: c_uint, data: *mut c_void) -> bool {
 static FRAME_W: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static FRAME_H: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static mut FRAME_RGB: Vec<u8> = Vec::new();
+static VRFRAME: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 extern "C" fn vr_cb(d: *const c_void, w: c_uint, h: c_uint, pitch: usize) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -93,6 +94,26 @@ extern "C" fn vr_cb(d: *const c_void, w: c_uint, h: c_uint, pitch: usize) {
                     rgb.push((b << 3) | (b >> 2));
                 }
             }
+        }
+        // --vrlog: one line per delivered frame with a colour count and a
+        // horizontal-edge count. A frame of garbage spikes BOTH at once, which
+        // ordinary artwork does not, so a whole run can be scanned for a single
+        // bad frame instead of sampled.
+        if std::env::args().any(|a| a == "--vrlog") {
+            let (mut edges, mut cols) = (0usize, std::collections::HashSet::new());
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let i = (y * w as usize + x) * 3;
+                    let px = (rgb[i], rgb[i + 1], rgb[i + 2]);
+                    cols.insert(px);
+                    if x > 0 {
+                        let j = i - 3;
+                        if px != (rgb[j], rgb[j + 1], rgb[j + 2]) { edges += 1; }
+                    }
+                }
+            }
+            let n = VRFRAME.fetch_add(1, Relaxed);
+            println!("VRLOG {} {} {}", n, cols.len(), edges);
         }
         FRAME_W.store(w as usize, Relaxed);
         FRAME_H.store(h as usize, Relaxed);
