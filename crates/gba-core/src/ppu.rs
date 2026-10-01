@@ -386,112 +386,67 @@ impl Ppu {
         }
     }
 
+    /// Bitmap modes 3-5. The picture is BG2 sampled through BG2's affine matrix,
+    /// so it composites with sprites, windows and the colour effects exactly as a
+    /// tiled background does, and goes through the same path to prove it.
+    ///
+    /// It used to write pixels straight into the framebuffer, which cost two bugs
+    /// the owner found on hardware within an hour of each other: Iridion II showed
+    /// a buffer it was mid-rewrite because BLDY never reached it, and Spider-Man 2
+    /// lost every line of dialogue because 128 active sprites were never drawn.
     fn render_bitmap(&mut self, line: usize, mode: u16, dispcnt: u16) {
-        let backdrop = self.backdrop();
-        // The bitmap IS BG2, so DISPCNT bit 10 switches it off like any other
-        // background. Drawing it regardless means that whenever a game blanks
-        // the screen by clearing the enable bit, which is the normal way to
-        // hide a transition while the next image is DMAd in, the half-written
-        // VRAM is shown as a picture instead of the backdrop.
-        //
-        // Iridion II does exactly that between intro cutscenes: a quarter of a
-        // second of banded noise where the screen should be black, caught by
-        // the owner on device and absent on gpSP. Reported 2026-10-01.
-        if dispcnt & 0x0400 == 0 {
-            // Nothing left but the backdrop, and the backdrop is a colour-effect
-            // target like any other layer (BLDCNT bit 5). Filling it raw was
-            // wrong: Hello Kitty Collection fades this very transition to black
-            // with a brightness decrease on the backdrop, so skipping the effect
-            // held a flat green screen for 53 frames where hardware and mGBA go
-            // black almost at once. Measured BLDCNT=00FF, BLDY ramping to 0F.
-            //
-            // Alpha is not reachable here: it needs a second target underneath,
-            // and there is nothing under the backdrop. The window colour-effect
-            // gate is not applied either, which would matter only for a window
-            // enabled in a bitmap mode with BG2 switched off.
-            let bldcnt = self.regs[0x50 / 2];
-            let fx = if self.no_blend { 0 } else { (bldcnt >> 6) & 3 };
-            let evy = (self.regs[0x54 / 2] & 0x1F).min(16);
-            let px = if bldcnt & (1 << 5) != 0 {
-                match fx {
-                    2 => brighten(backdrop, evy),
-                    3 => darken(backdrop, evy),
-                    _ => backdrop,
-                }
-            } else {
-                backdrop
-            };
-            self.framebuffer[line * SCREEN_W..(line + 1) * SCREEN_W].fill(px);
-            return;
-        }
-        let frame = if dispcnt & 0x10 != 0 { 0xA000 } else { 0 };
-        // In modes 3/4/5 the bitmap is BG2, an AFFINE background: it is sampled
-        // through BG2's rotation/scaling matrix (PA/PB/PC/PD) and reference point,
-        // not blitted 1:1. Games commonly magnify a smaller video frame 2x (PA=PD=
-        // 0x080) to fill the screen; blitting 1:1 showed it at 1/4 size in the
-        // corner (DBZ Legacy of Goku's intro cinematic). bg_ref[0] holds BG2's
-        // per-scanline reference (reloaded at line 0, advanced by PB/PD each line).
-        let pa = self.regs[BG2_PA] as i16 as i32; // dx per screen pixel
-        let pc = self.regs[BG2_PA + 2] as i16 as i32; // dy per screen pixel
-        let (mut cx, mut cy) = (self.bg_ref[0][0], self.bg_ref[0][1]);
-        // Bitmap dimensions: modes 3/4 are full-screen, mode 5 is 160x128.
-        let (bw, bh) = if mode == 5 { (160i32, 128i32) } else { (SCREEN_W as i32, SCREEN_H as i32) };
-
-        // The bitmap is BG2 and the area outside it is the backdrop, so both are
-        // colour-effect targets (BLDCNT bits 2 and 5) exactly as in the tiled
-        // modes. Drawing them raw meant a game fading the screen out kept showing
-        // the picture at full brightness.
-        //
-        // Iridion II fades its intro to black with BLDY at the maximum of 16 while
-        // mode 4 is still displaying a buffer it is in the middle of rewriting.
-        // Hardware shows black; we showed the half-written buffer, which is the
-        // garbage the owner reported on 2026-10-01 and photographed.
-        //
-        // Only brighten and darken are modelled. Alpha needs a second target
-        // underneath and these modes composite one layer, and sprites are not
-        // drawn in the bitmap modes at all yet, which is a separate gap.
         let bldcnt = self.regs[0x50 / 2];
-        let fx = if self.no_blend { 0 } else { (bldcnt >> 6) & 3 };
-        let evy = (self.regs[0x54 / 2] & 0x1F).min(16);
-        let effect = |c: u16, is_target: bool| -> u16 {
-            if !is_target {
-                return c;
-            }
-            match fx {
-                2 => brighten(c, evy),
-                3 => darken(c, evy),
-                _ => c,
-            }
-        };
-        let bg2_target = bldcnt & (1 << 2) != 0;
-        let bd_target = bldcnt & (1 << 5) != 0;
-        let backdrop_px = effect(backdrop, bd_target);
-
-        let row = &mut self.framebuffer[line * SCREEN_W..(line + 1) * SCREEN_W];
-        for px in row.iter_mut() {
-            let tx = cx >> 8;
-            let ty = cy >> 8;
-            cx = cx.wrapping_add(pa);
-            cy = cy.wrapping_add(pc);
-            if tx < 0 || ty < 0 || tx >= bw || ty >= bh {
-                *px = backdrop_px; // outside the bitmap (these modes do not wrap)
-                continue;
-            }
-            let (tx, ty) = (tx as usize, ty as usize);
-            let col = match mode {
-                4 => {
-                    let idx = self.vram[frame + ty * bw as usize + tx] as usize;
-                    u16::from_le_bytes([self.palram[idx * 2], self.palram[idx * 2 + 1]]) & 0x7FFF
-                }
-                _ => {
-                    // Modes 3 and 5 are direct RGB555 (mode 3 always frame 0).
-                    let base = if mode == 3 { 0 } else { frame };
-                    let o = base + (ty * bw as usize + tx) * 2;
-                    u16::from_le_bytes([self.vram[o], self.vram[o + 1]]) & 0x7FFF
-                }
-            };
-            *px = effect(col, bg2_target);
+        let blend_mode = if self.no_blend { 0 } else { (bldcnt >> 6) & 3 };
+        let semi_obj = !self.no_blend && dispcnt & 0x1000 != 0 && self.any_semi_obj();
+        let mut comp = Compositor::new(self.backdrop(), blend_mode != 0 || semi_obj);
+        if dispcnt & 0xE000 != 0 && !self.no_window {
+            self.build_window_mask(line, dispcnt, &mut comp.win_mask);
         }
+
+        // The bitmap is BG2, so DISPCNT bit 10 switches it off and BG2CNT gives it
+        // a priority against the sprites.
+        if dispcnt & 0x0400 != 0 {
+            let frame = if dispcnt & 0x10 != 0 { 0xA000 } else { 0 };
+            let priority = (self.regs[0x0C / 2] & 3) as u8;
+            let pa = self.regs[BG2_PA] as i16 as i32;
+            let pc = self.regs[BG2_PA + 2] as i16 as i32;
+            let (mut cx, mut cy) = (self.bg_ref[0][0], self.bg_ref[0][1]);
+            // Modes 3 and 4 are full screen; mode 5 is a 160x128 picture.
+            let (bw, bh) = if mode == 5 {
+                (160i32, 128i32)
+            } else {
+                (SCREEN_W as i32, SCREEN_H as i32)
+            };
+            for x in 0..SCREEN_W {
+                let (tx, ty) = (cx >> 8, cy >> 8);
+                cx = cx.wrapping_add(pa);
+                cy = cy.wrapping_add(pc);
+                // No wrapping in the bitmap modes: outside is simply not drawn.
+                if tx < 0 || ty < 0 || tx >= bw || ty >= bh {
+                    continue;
+                }
+                let (tx, ty) = (tx as usize, ty as usize);
+                let col = match mode {
+                    4 => {
+                        let idx = self.vram[frame + ty * bw as usize + tx] as usize;
+                        u16::from_le_bytes([self.palram[idx * 2], self.palram[idx * 2 + 1]])
+                            & 0x7FFF
+                    }
+                    _ => {
+                        // Modes 3 and 5 are direct colour; mode 3 is always frame 0.
+                        let base = if mode == 3 { 0 } else { frame };
+                        let o = base + (ty * bw as usize + tx) * 2;
+                        u16::from_le_bytes([self.vram[o], self.vram[o + 1]]) & 0x7FFF
+                    }
+                };
+                comp.place(x, col, 2, priority, 1, false);
+            }
+        }
+
+        if dispcnt & 0x1000 != 0 {
+            self.sprite_line(line, dispcnt, &mut comp);
+        }
+        self.resolve_line(line, &comp, blend_mode, semi_obj);
     }
 
     /// Tile modes 0-2: composite the enabled backgrounds and sprites by
@@ -547,6 +502,22 @@ impl Ppu {
             self.sprite_line(line, dispcnt, &mut comp);
         }
 
+        self.resolve_line(line, &comp, blend_mode, semi_obj);
+    }
+
+    /// Resolve the composited scanline into the framebuffer, applying BLDCNT.
+    ///
+    /// Shared by the tiled and the bitmap renderers, because the colour effects
+    /// are not a property of the mode: a bitmap is BG2 and obeys them exactly as
+    /// a tiled background does.
+    fn resolve_line(
+        &mut self,
+        line: usize,
+        comp: &Compositor,
+        blend_mode: u16,
+        semi_obj: bool,
+    ) {
+        let bldcnt = self.regs[0x50 / 2];
         let dst = &mut self.framebuffer[line * SCREEN_W..(line + 1) * SCREEN_W];
         if blend_mode == 0 && !semi_obj {
             // No colour effect and nothing forcing one: the winner is the output.
@@ -1129,6 +1100,37 @@ mod tests {
             blend_alpha(0x7C00, 0x001F, 8, 8),
             "the semi-transparent decoy must blend in the very same frame"
         );
+    }
+
+    /// Sprites are drawn in the bitmap modes. They were not drawn at all until
+    /// 2026-10-02, which cost Spider-Man 2 every line of dialogue and Harry Potter
+    /// Quidditch World Cup its entire language menu: both run in mode 3 with OBJ
+    /// enabled and OAM full, and both looked like empty boxes.
+    #[test]
+    fn sprites_are_drawn_over_a_bitmap() {
+        let mut p = Ppu::new();
+        put16(&mut p.palram, 0, 0x7C00); // backdrop = blue
+        put16(&mut p.vram, 0, 0x001F); // the mode 3 picture is red at (0,0)
+        put16(&mut p.vram, 16, 0x001F); // and red again at (8,0), clear of the sprite
+        put16(&mut p.palram, 0x202, 0x03E0); // OBJ palette[1] = green
+        for i in 0..32 {
+            p.vram[0x1_0000 + i] = 0x11; // OBJ tile 0, every texel index 1
+        }
+        // Sprite 0 sits at (0,0); all attribute words zero is an 8x8 at the origin.
+        p.write_reg16(0x00, 0x1443); // mode 3, BG2 on, OBJ on, 1D mapping
+        p.render_line(0);
+        assert_eq!(
+            p.framebuffer[0], 0x03E0,
+            "the sprite must win over the bitmap underneath it"
+        );
+        assert_eq!(
+            p.framebuffer[8], 0x001F,
+            "and the bitmap, not the backdrop, shows where no sprite covers it"
+        );
+        // With OBJ switched off the bitmap is uncovered again.
+        p.write_reg16(0x00, 0x0443);
+        p.render_line(0);
+        assert_eq!(p.framebuffer[0], 0x001F, "DISPCNT bit 12 still gates sprites");
     }
 
     /// A bitmap mode obeys the colour effects on the picture itself, not just on

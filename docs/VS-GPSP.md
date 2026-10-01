@@ -132,24 +132,27 @@ Where there is evidence rather than assertion:
 - The RetroAchievements memory map is more complete here: rcheevos registers all
   three GBA regions from our descriptors, and logs "Could not map region starting
   at $048000" for gpSP, which publishes only two. Double-edged, see below.
-- **The bitmap modes ignored the BG2 enable bit, fixed 2026-10-01 (159d834).**
-  A game that cleared the bit to hide a transition got its half-written VRAM
-  drawn as a picture instead of the backdrop. The fix is hardware-correct and
-  the corpus moves no title into or out of failure.
+- **The bitmap modes did not composite at all. Fixed over 2026-10-01/02.** They
+  wrote pixels straight into the framebuffer, so they ignored the BG2 enable bit,
+  the colour effects and sprites entirely. Three bugs the owner found on hardware
+  in one evening, all the same root cause:
 
-  **It did NOT fix the bug it was written for, and my first account of it was
-  wrong.** Iridion II is unchanged on device: same garbage frames, same place.
-  Prehistorik Man and Virtual Kasparov were never bugs at all, the owner checked
-  and gpSP shows the same transition artefacts, so they are the games own
-  behaviour; the garbage I found in them headlessly came from the sweep auto-input
-  driving them somewhere a player never goes. Only Hello Kitty Collection changed,
-  from garbage to a flat green screen, which is what DISPCNT and the backdrop
-  palette actually say should be there.
+  - Iridion II drew a buffer it was mid-rewrite because BLDY never reached the
+    picture. The game fades to black with BLDY at 16 and we showed it at full
+    brightness. **gpSP was correct, this core was not.**
+  - Hello Kitty Collection held a flat green backdrop for 53 frames because the
+    fade never reached the backdrop either. mGBA shows the same green and covers
+    it immediately, which is what pinned it down.
+  - Spider-Man 2 lost every line of dialogue and Harry Potter Quidditch World Cup
+    its entire language menu and splash animation, because sprites were never
+    drawn in these modes. Both run mode 3 with OAM full.
 
-  **Iridion II remains an OPEN loss to gpSP.** Still not reproduced headless.
+  The bitmap path now builds the same compositor the tiled modes use, so the
+  picture is BG2 with a priority, sprites and windows and blending all apply, and
+  the two renderers share one resolve step. Corpus unchanged at 30 flagged.
 
-- Hello Kitty Collection Miracle Fashion Maker does not run on gpSP at all, so
-  it belongs in the win column above as well.
+- Ghost Rider and Kao the Kangaroo show garbage in the same transitions on gpSP
+  and are clean here, so this class of bug runs in both directions.
 
 ## Risks a swap would carry
 
