@@ -58,4 +58,21 @@ pub trait Bus {
     /// HLE BIOS halt hook: the Halt / IntrWait SWIs park the CPU until an IRQ.
     /// Default no-op so the TomHarte harness bus need not model it.
     fn set_halted(&mut self, _halted: bool) {}
+
+    /// The CPU is about to fetch an instruction from `addr`. The GBA bus uses
+    /// it to decide whether the BIOS region reads back its contents, which it
+    /// does only for code executing inside the BIOS, and to remember the last
+    /// opcode the BIOS fetched.
+    ///
+    /// Called from BOTH fetch paths, and both are needed. The refill covers
+    /// exception entry, which vectors into the BIOS before any step runs, so
+    /// without it the IRQ and SWI vectors would read back as protected and
+    /// nothing would dispatch. The per-instruction prefetch is what makes the
+    /// remembered opcode the one actually fetched last, which is the value
+    /// hardware hands back and the value mGBA keeps (`biosPrefetch`, snapshot
+    /// from `prefetch[1]`). Tracking only the branch targets costs three games
+    /// their late frames; tracking every fetch costs about 2% of throughput.
+    ///
+    /// Default no-op so the TomHarte harness bus need not model it.
+    fn set_fetch_pc(&mut self, _addr: u32) {}
 }

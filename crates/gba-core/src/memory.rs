@@ -12,6 +12,21 @@ use crate::save::Save;
 
 pub struct GbaBus {
     pub bios: Box<[u8]>,   // 16 KB
+    /// Whether the CPU is currently fetching instructions from inside the BIOS.
+    /// The BIOS region is readable ONLY to code executing in it; see
+    /// `set_fetch_pc`, which maintains this from the fetch address so that
+    /// exception entry is covered by the same rule.
+    exec_in_bios: bool,
+    /// The last opcode word the BIOS fetched. A read of region 0 from outside
+    /// the BIOS returns THIS rather than the BIOS contents. The initial value
+    /// is the one GBATEK documents as left over after the boot sequence, which
+    /// is what a direct-booted (HLE) game sees, since its BIOS never runs.
+    ///
+    /// Deliberately NOT in the save state, because the serialize format is a
+    /// binding cross-core contract and this costs nothing to rebuild: the next
+    /// instruction fetch restores `exec_in_bios`, and the next BIOS entry (one
+    /// V-blank away at worst) restores the word.
+    bios_prefetch: u32,
     pub ewram: Box<[u8]>,  // 256 KB
     pub iwram: Box<[u8]>,  // 32 KB
     pub rom: Box<[u8]>,    // up to 32 MB
@@ -231,6 +246,8 @@ impl GbaBus {
         GbaBus {
             sensors,
             bios: b.into_boxed_slice(),
+            exec_in_bios: false,
+            bios_prefetch: 0xE129_F000,
             ewram: vec![0; 256 * 1024].into_boxed_slice(),
             iwram: vec![0; 32 * 1024].into_boxed_slice(),
             rom: rom.into_boxed_slice(),
@@ -673,6 +690,10 @@ impl GbaBus {
 
     fn read8_raw(&self, addr: u32) -> u8 {
         match (addr >> 24) & 0xF {
+            // Region 0 is read-protected: see `set_fetch_pc`. Outside the BIOS
+            // the byte comes from the stale prefetch word, selected by the low
+            // two address bits exactly as an open-bus read is.
+            0x0 if !self.exec_in_bios => (self.bios_prefetch >> (8 * (addr & 3))) as u8,
             0x0 => *self.bios.get((addr & 0x3FFF) as usize).unwrap_or(&0),
             0x2 => self.ewram[(addr & 0x3_FFFF) as usize],
             0x3 => self.iwram[(addr & 0x7FFF) as usize],
@@ -709,7 +730,9 @@ impl GbaBus {
     #[inline]
     fn linear_region(&self, addr: u32) -> Option<(&[u8], usize)> {
         match (addr >> 24) & 0xF {
-            0x0 => Some((&self.bios, (addr & 0x3FFF) as usize)),
+            // Only while executing inside it; otherwise the byte path below
+            // synthesises the protected value.
+            0x0 if self.exec_in_bios => Some((&self.bios, (addr & 0x3FFF) as usize)),
             0x2 => Some((&self.ewram, (addr & 0x3_FFFF) as usize)),
             0x3 => Some((&self.iwram, (addr & 0x7FFF) as usize)),
             // The GPIO port lives inside the ROM window at 0x080000C4..C9, so
@@ -1067,6 +1090,45 @@ mod tests {
 
     fn bus() -> GbaBus {
         GbaBus::new(vec![0; 0x100], Vec::new())
+    }
+
+    /// The BIOS region must read back its contents only to code executing
+    /// inside it. Everywhere else it reads the last opcode the BIOS fetched.
+    ///
+    /// Legends of Wrestling II and both European Tetris Worlds builds all boot
+    /// on this and all three died without it: each calls through a pointer that
+    /// is legitimately null at that moment and decides what to do next from a
+    /// byte it reads at a low address. With the BIOS exposed, that byte is one
+    /// of OUR BIOS image's bytes, and reading a zero there sends the game down
+    /// a path it was never meant to take.
+    #[test]
+    fn the_bios_reads_back_only_to_code_running_inside_it() {
+        // A BIOS whose first two words are recognisable and are NOT the value
+        // the protected read is supposed to return.
+        let mut img = vec![0u8; 16 * 1024];
+        img[0..4].copy_from_slice(&0x1111_1111u32.to_le_bytes());
+        img[4..8].copy_from_slice(&0x2222_2222u32.to_le_bytes());
+        let mut b = GbaBus::new(vec![0; 0x100], img);
+
+        // Boot leaves the CPU fetching from the cartridge.
+        b.set_fetch_pc(0x0800_0000);
+        assert_eq!(
+            b.read32(0, Access::NonSeq),
+            0xE129_F000,
+            "from outside, region 0 must return the stale prefetch word"
+        );
+        assert_eq!(b.read8(1, Access::NonSeq), 0xF0, "byte reads select from that word");
+        assert_eq!(b.read16(2, Access::NonSeq), 0xE129, "and so do halfword reads");
+
+        // Executing inside the BIOS, it reads normally, and the prefetch
+        // follows the fetch address.
+        b.set_fetch_pc(4);
+        assert_eq!(b.read32(0, Access::NonSeq), 0x1111_1111, "from inside, real contents");
+        assert_eq!(b.bios_prefetch, 0x2222_2222, "the prefetch tracks the fetch address");
+
+        // Leaving again re-protects it, now with the value the BIOS left behind.
+        b.set_fetch_pc(0x0300_0000);
+        assert_eq!(b.read32(0, Access::NonSeq), 0x2222_2222);
     }
 
     /// Build a 16 KB image carrying only the six words the r12 repair targets.
@@ -1451,5 +1513,22 @@ impl Bus for GbaBus {
     }
     fn set_halted(&mut self, halted: bool) {
         self.halted = halted;
+    }
+    /// BIOS read protection. Region 0 reads back its contents only to code
+    /// executing inside it; from anywhere else the hardware returns the last
+    /// opcode the BIOS fetched, which is what `bios_prefetch` holds.
+    ///
+    /// Legends of Wrestling II is the reason this exists. It calls through a
+    /// null object pointer: `ldr r1,[0x03000004]` yields 0, and the game then
+    /// reads the byte at 0xC3 to decide whether to make an indirect call. With
+    /// the BIOS readable that byte is 0, the one-shot test passes, and the call
+    /// goes through the null pointer to the word at address 0, which is the
+    /// BIOS reset branch. The PC runs away into unmapped space inside the first
+    /// frame and never comes back.
+    fn set_fetch_pc(&mut self, addr: u32) {
+        self.exec_in_bios = addr < 0x4000;
+        if self.exec_in_bios {
+            self.bios_prefetch = self.read32_raw(addr & !3);
+        }
     }
 }

@@ -316,6 +316,9 @@ impl Arm7tdmi {
         // reads of R15 still see the pipeline-ahead value. On a branch this
         // prefetch is the in-flight fetch that completes before the flush.
         let fetch_addr = self.r[15];
+        // Where instructions are coming from, which decides whether the BIOS
+        // region is readable and what a protected read of it returns.
+        bus.set_fetch_pc(fetch_addr);
         let (fetched, width) = if thumb {
             (bus.read16(fetch_addr, Access::Seq) as u32, 2)
         } else {
@@ -381,6 +384,10 @@ impl Arm7tdmi {
     /// is `target + step`, not `(target & align) + step`.
     fn refill<B: Bus>(&mut self, bus: &mut B) {
         let target = self.r[15];
+        // Same hook as the prefetch in `step`, and it has to be here too:
+        // exception entry refills straight into the BIOS vectors without ever
+        // running a step, so this is what makes those vectors readable.
+        bus.set_fetch_pc(target);
         if self.thumb() {
             let aligned = target & !1;
             self.pipeline[0] = bus.read16(aligned, Access::NonSeq) as u32;
