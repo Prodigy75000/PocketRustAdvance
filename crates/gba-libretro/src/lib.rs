@@ -484,30 +484,37 @@ fn publish_memory_map(s: &mut State) {
         },
     ];
 
-    // Cartridge save RAM is DELIBERATELY NOT PUBLISHED, even though it is real,
-    // memory mapped at 0x0E000000, and rcheevos asks for it (RA 0x048000).
+    // Only SRAM and Flash live at 0x0E000000. EEPROM is not memory mapped at
+    // all, it is clocked in a bit at a time through region 0xD, so publishing
+    // it at the SRAM address would hand the achievement runtime bytes that are
+    // real but mean something else.
     //
-    // Publishing it false-unlocks achievements on a save that has never been
-    // written. A fresh cart reads 0xFF everywhere, which is what hardware does
-    // and what mGBA does, and a "collect them all" condition tested against an
-    // all-ones bitmask is satisfied the instant it is evaluated. Measured on
-    // device 2026-10-01: Advance Wars 2 awarded "Shiny Design Room" 110 ms after
-    // load, repeatedly, on a save that was still 97.6% erased.
-    //
-    // gpSP publishes IWRAM and EWRAM only, so rcheevos logs "Could not map
-    // region starting at $048000" and fills it with zeros, and the condition
-    // stays false. Six gpSP launches in a row did not award it; one launch of
-    // this core did. Withholding the descriptor is therefore not a regression
-    // against the core Trophy Hub actually ships: those achievements are
-    // already unobtainable there.
-    //
-    // The runtime cannot save us here. rcheevos evaluates from the first frame
-    // and has no load-time guard, so the only protection is a set that tests a
-    // TRANSITION rather than a resting value, and this set does not.
-    //
-    // This does NOT stop saves persisting: retro_get_memory_data still answers
-    // RETRO_MEMORY_SAVE_RAM, which is what the front-end writes to disk. The
-    // only thing withheld is RetroAchievements' read access.
+    // This descriptor was removed on 2026-10-01 and put straight back. The
+    // theory was that an unwritten save reads 0xFF and false-unlocks a "collect
+    // them all" achievement, which Advance Wars 2 was doing within 110 ms of
+    // load. The owner falsified it on hardware: mGBA publishes this same region
+    // and fills fresh flash with 0xFF exactly as we do, and does NOT unlock it.
+    // Withholding the descriptor here did not stop the unlock either, which
+    // proves the condition reads WORK RAM. RetroAchievements documents this
+    // region for the GBA, so sets are entitled to read it and hiding it would
+    // only break the honest ones silently.
+    if matches!(
+        gba.bus.save.kind,
+        SaveKind::Sram | SaveKind::Flash64 | SaveKind::Flash128
+    ) && !gba.bus.save.data.is_empty()
+    {
+        descs.push(retro_memory_descriptor {
+            flags: RETRO_MEMDESC_SAVE_RAM,
+            ptr: gba.bus.save.data.as_mut_ptr() as *mut c_void,
+            offset: 0,
+            start: 0x0E00_0000,
+            select: 0,
+            disconnect: 0,
+            len: gba.bus.save.data.len(),
+            addrspace: c"SRAM".as_ptr(),
+        });
+    }
+
     let map = retro_memory_map {
         descriptors: descs.as_ptr(),
         num_descriptors: descs.len() as c_uint,
@@ -806,21 +813,16 @@ mod tests {
 
         assert_eq!(iwram_len, 32 * 1024, "IWRAM is 32 KB");
         assert_eq!(ewram_len, 256 * 1024, "EWRAM is 256 KB");
-        // rcheevos asks for save RAM at RA 0x048000 and must get NOTHING, so it
-        // logs "Could not map region" and fills the region with zeros, exactly as
-        // it does for gpSP. That is the whole fix for the Advance Wars 2 false
-        // unlock, and it is the assertion most likely to be undone by someone
-        // "completing" the map later.
-        assert!(
-            rcheevos_resolve(&descs, 0x0E00_0000).is_none(),
-            "save RAM must be invisible to the achievement runtime"
-        );
+        let (_, sram_len, sram) = find("SRAM", 0x0E00_0000);
+        assert!(sram_len >= 64 * 1024, "rcheevos reads 64 KB of save RAM");
 
         for (label, real, want_ptr, want_off) in [
             ("IWRAM base", 0x0300_0000usize, iwram, 0usize),
             ("IWRAM last", 0x0300_7FFF, iwram, 0x7FFF),
             ("EWRAM base", 0x0200_0000, ewram, 0),
             ("EWRAM last", 0x0203_FFFF, ewram, 0x3_FFFF),
+            ("SRAM base", 0x0E00_0000, sram, 0),
+            ("SRAM last", 0x0E00_FFFF, sram, 0xFFFF),
 
         ] {
             let got = rcheevos_resolve(&descs, real)
@@ -879,14 +881,11 @@ mod tests {
         assert_eq!(iwram.0, RETRO_MEMDESC_SYSTEM_RAM);
         assert_eq!(ewram.0, RETRO_MEMDESC_SYSTEM_RAM);
 
-        // Save RAM is withheld ON PURPOSE, from an SRAM cart as much as a flash
-        // one. An unwritten save reads 0xFF and false-unlocks "collect them all"
-        // achievements; see publish_memory_map.
-        assert!(
-            sram.iter().all(|d| d.1 != 0x0E00_0000),
-            "save RAM must not be published to the achievement runtime"
-        );
-        // ... but the front-end must still be able to persist it to disk.
+        // A cart with SRAM is memory mapped at 0x0E000000 and RetroAchievements
+        // documents it as a GBA region, so it is published.
+        let save = sram.iter().find(|d| d.1 == 0x0E00_0000).expect("SRAM descriptor");
+        assert_eq!(save.0, RETRO_MEMDESC_SAVE_RAM);
+        // And the front-end must be able to persist it to disk.
         assert!(
             retro_get_memory_size(RETRO_MEMORY_SAVE_RAM) > 0,
             "withholding the descriptor must not stop saves being written"
