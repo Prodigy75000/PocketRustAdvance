@@ -39,6 +39,7 @@ Every verdict below is the owner on hardware, not the sweep.
 | Elevator Action Old and New (Japan) | black screen |
 | Harobots Robo Hero Battling (Japan) | white screen |
 | everGirl (USA) | black screen in gameplay with audio screeching |
+| Hello Kitty Collection - Miracle Fashion Maker (Japan) | does not run |
 
 everGirl is a qualified win: it reaches gameplay here with a sprite flicker on
 the protagonist, so it is better rather than correct.
@@ -60,7 +61,7 @@ collection), Mortal Kombat Deadly Alliance and Tournament Edition (both stick on
 the Midway logo), the first title in 2 Game Pack Hot Wheels, Legends of Wrestling
 II. Madden NFL 06 runs on both and has the same obscured in-game menu on both.
 
-**Net: six titles gained, five lost.** That is close to a wash and is not on its
+**Net: seven titles gained, five lost.** That is close to a wash and is not on its
 own a reason to switch.
 
 ## Features
@@ -131,14 +132,24 @@ Where there is evidence rather than assertion:
 - The RetroAchievements memory map is more complete here: rcheevos registers all
   three GBA regions from our descriptors, and logs "Could not map region starting
   at $048000" for gpSP, which publishes only two. Double-edged, see below.
-- **Menu transition garbage, reported and FIXED on 2026-10-01 (159d834).** The
-  bitmap modes ignored the BG2 enable bit, so a game that cleared it to hide a
-  transition got its half-written VRAM drawn as a picture instead of a blank
-  screen. gpSP was correct here and this core was not. Found from the owner's
-  screen recording rather than from the corpus: 795 frames decoded and scanned
-  for local pixel noise isolated one burst of 17 frames with black either side.
-  Confirmed on device afterwards in Iridion II, Prehistorik Man, Virtual
-  Kasparov and Hello Kitty Collection, all in menu transitions.
+- **The bitmap modes ignored the BG2 enable bit, fixed 2026-10-01 (159d834).**
+  A game that cleared the bit to hide a transition got its half-written VRAM
+  drawn as a picture instead of the backdrop. The fix is hardware-correct and
+  the corpus moves no title into or out of failure.
+
+  **It did NOT fix the bug it was written for, and my first account of it was
+  wrong.** Iridion II is unchanged on device: same garbage frames, same place.
+  Prehistorik Man and Virtual Kasparov were never bugs at all, the owner checked
+  and gpSP shows the same transition artefacts, so they are the games own
+  behaviour; the garbage I found in them headlessly came from the sweep auto-input
+  driving them somewhere a player never goes. Only Hello Kitty Collection changed,
+  from garbage to a flat green screen, which is what DISPCNT and the backdrop
+  palette actually say should be there.
+
+  **Iridion II remains an OPEN loss to gpSP.** Still not reproduced headless.
+
+- Hello Kitty Collection Miracle Fashion Maker does not run on gpSP at all, so
+  it belongs in the win column above as well.
 
 ## Risks a swap would carry
 
