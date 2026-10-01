@@ -152,7 +152,7 @@ impl Waits {
     }
 }
 
-/// Six words of the bundled open BIOS, and what they become.
+/// Eight words of the bundled open BIOS, and what they become.
 ///
 /// Normmatt's IntrWait keeps the I/O base in r2 and parks 0x208 in r12. Real
 /// hardware's BIOS keeps the base in r12, and so does mGBA's hand-written HLE
@@ -162,6 +162,11 @@ impl Waits {
 /// in it the store lands on 0x200 instead, which is BIOS ROM and read-only, so
 /// the flag never appears and IntrWait never returns. The cartridge spins in the
 /// BIOS forever while its handler keeps running and looking perfectly healthy.
+///
+/// The second, same shape one level down: the loop keeps the flag POINTER in r4,
+/// and the BIOS interrupt prologue saves only {r0-r3, r12, lr}, so a game handler
+/// that clobbers r4 leaves IntrWait reading a ROM address forever. Harobots does
+/// exactly that.
 ///
 /// The repair swaps which register holds which constant. r2 and r12 trade places
 /// in the halt loop, and the three stores that index off them swap operands to
@@ -183,6 +188,15 @@ const OPEN_BIOS_R12: &[(usize, u32, u32)] = &[
     (0x4A0, 0xE182_70BC, 0xE18C_70B2), // strh r7, [r2, r12]     -> strh r7, [r12, r2]
     (0x4BC, 0xE182_60BC, 0xE18C_60B2), // strh r6, [r2, r12]     -> strh r6, [r12, r2]
     (0x4CC, 0xE182_60BC, 0xE18C_60B2), // strh r6, [r2, r12]     -> strh r6, [r12, r2]
+    // And the flag pointer itself, for the same reason one level down. The BIOS
+    // interrupt prologue saves {r0-r3, r12, lr} and NOTHING else, so a game's
+    // handler is free to clobber r4. Normmatt's halt loop keeps the check-flag
+    // pointer in r4 across the halt, so one such handler leaves it reading some
+    // address in ROM forever. Harobots does exactly that: measured mid-hang, r4
+    // held 0x08003205 where the loop needed 0x03FFFFFF. Re-based on r12, which
+    // survives, and which is 8 above the flag word anyway.
+    (0x4A4, 0xE154_30B7, 0xE15C_30B8), // ldrh r3, [r4, #-7]     -> ldrh r3, [r12, #-8]
+    (0x4B8, 0xE144_30B7, 0xE14C_30B8), // strh r3, [r4, #-7]     -> strh r3, [r12, #-8]
 ];
 
 /// Apply [`OPEN_BIOS_R12`], but only to a BIOS image that is byte-for-byte the
