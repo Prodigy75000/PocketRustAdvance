@@ -11,9 +11,12 @@ would cost, with the losses first-class. Where a number is unmeasured it says so
 
 A swap today would gain motion-control support, which gpSP does not have at all,
 and six titles gpSP cannot boot. It would cost real-time clock support, rumble,
-five titles gpSP runs, and roughly a factor of four in CPU speed. The clock is
-the serious one: it is the only item on the list that silently degrades games
-that otherwise look fine.
+and five titles gpSP runs. The clock is the serious one: it is the only item on
+the list that silently degrades games that otherwise look fine.
+
+Speed is NOT on that list. An earlier draft of this page called it a risk and the
+owner corrected it: both cores sit at the app's 600 fps fast-forward cap on his
+device, so the four-times gap measured below never reaches a user.
 
 ## Compatibility
 
@@ -99,15 +102,20 @@ enabled in all three:
   gpSP         341 ms    88x realtime     4.0x faster than us
 ```
 
-**Treat that as a lower bound on the gap, not an upper one.** This core is a
-plain interpreter. gpSP is built around a dynamic recompiler whose reason for
-existing is ARM handhelds, and a Windows x86 build is the configuration where it
-is least ahead. On the hardware that matters the margin is likely wider.
+**That ratio does not reach the user, and an earlier draft of this page was wrong
+to call it a risk.** The owner's measurement on device: both cores run at 600 fps
+in fast-forward on a Galaxy S25 Ultra, which is the app's cap. Both are pinned to
+the ceiling, so the four-times difference is invisible from inside the product.
 
-What is known on device: both cores hold 60 fps on the owner's Galaxy S25 Ultra.
-**Low-end performance is entirely unmeasured**, and it is the gap in this
-document I would close first. The Galaxy Tab A9+ already attached to the bench is
-the obvious instrument.
+At 1x there is no plausible Android device that struggles with a GBA, so normal
+play is not a differentiator for either core. The only place the gap could ever
+surface is the fast-forward ceiling on much weaker hardware, where gpSP would
+still hit the cap and this core might fall short of it. That is a ceiling on a
+convenience feature, not a playability problem, and nobody has reported it.
+
+Worth knowing rather than worth fixing. This core is a plain interpreter and
+gpSP is a dynamic recompiler built for ARM handhelds, so the headroom gap is
+real and structural; it simply sits above the range anyone can perceive.
 
 ## Accuracy
 
@@ -127,15 +135,13 @@ Where there is evidence rather than assertion:
 ## Risks a swap would carry
 
 1. **No real-time clock.** Silent degradation in heavily played titles.
-2. **Speed.** Four times slower than gpSP on the one platform measured, and the
-   platform that matters is the one not measured.
-3. **A more complete memory map exposes racy achievement sets.** Advance Wars 2
+2. **A more complete memory map exposes racy achievement sets.** Advance Wars 2
    awards "Shiny Design Room" seconds after boot here. That one is a flaw in RA
    set 1768, reproduced by the owner on Linkboy and ticketed, and it is not caused
    by anything this core gets wrong. But gpSP's narrower map hides a class of set
    bug that this core will surface, and false unlocks reach a player's account and
    cannot be taken back.
-4. **Five titles regress.**
+3. **Five titles regress.**
 
 ## What replacing gpSP actually needs
 
@@ -144,15 +150,16 @@ In the order I would do it:
 1. **Real-time clock.** The only item that makes a popular game quietly worse.
    Shares the GPIO port already built for the gyro, so the hardware plumbing
    exists; this is the S3511 protocol on top of it.
-2. **Low-end device performance measurement.** Cheap, and it either removes risk 2
-   from this page or reframes the whole project.
-3. **The five regressions**, three of which are one engine (Frogger) and one of
+2. **The five regressions**, three of which are one engine (Frogger) and one of
    which is already narrowed to a specific BIOS interaction (Hagane).
-4. **Rumble.** Small, and it is the other half of the Twisted cartridge already
+3. **Rumble.** Small, and it is the other half of the Twisted cartridge already
    emulated here.
-5. Solar, for Boktai. Neither core has it, so it is a shared gap and not part of
+4. Solar, for Boktai. Neither core has it, so it is a shared gap and not part of
    the promotion case.
 
-Items 1 and 4 are both cartridge hardware on a port this core already models. The
+Performance work is deliberately absent. The margin is structural but sits above
+the range anyone can perceive, so chasing it would buy nothing a player notices.
+
+Items 1 and 3 are both cartridge hardware on a port this core already models. The
 honest estimate is that the feature gap is smaller than the compatibility gap
-looks, and that the unmeasured risk is performance.
+looks, and that the clock is most of the remaining distance.
