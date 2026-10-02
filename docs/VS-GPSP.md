@@ -1,6 +1,6 @@
 # PocketRustAdvance against gpSP
 
-Last measured 2026-10-02 at `9e2a100`. gpSP is the GBA core Trophy Hub ships
+Last measured 2026-10-02 at `4c159ad`. gpSP is the GBA core Trophy Hub ships
 today; this core is reachable only behind a debug preference that defaults off.
 
 This is the head-to-head the owner asked for when this work started: not an
@@ -61,7 +61,7 @@ nothing here comes from the automated cut.
 | title | here |
 |---|---|
 | Hikaru no Go 2 (Japan) | white screen, dead in all three BIOS modes. A loop in IWRAM at `0x03000B0C` pinned from frame 10 to 1800, interrupts never enabled. Hikaru no Go 1 is fine. |
-| Grand Theft Auto Advance (USA, Europe) | black screen on confirming a save name, on the first EEPROM write |
+| Grand Theft Auto Advance (USA, Europe) | black screen on confirming a save name. NOT the save: there are zero EEPROM transactions. It writes garbage into the I/O registers (0xEFEF and friends into DISPCNT, DISPSTAT and IE), which clears its own V-blank IRQ enable, and then waits in VBlankIntrWait for the interrupt it just disabled. |
 
 **Broken here, not known to work anywhere (1 title)**
 
@@ -77,10 +77,16 @@ nothing here comes from the automated cut.
 
 **Broken on both cores, so not a swap risk**
 
-Crash and Spyro Superpack (white screen after picking a game from the
-collection), Mortal Kombat Deadly Alliance and Tournament Edition (both stick on
-the Midway logo), the first title in 2 Game Pack Hot Wheels. Madden NFL 06 runs
-on both with the same obscured in-game menu.
+One dump of Crash and Spyro (Season of Ice plus Huge Adventure, USA; the other
+four Crash and Spyro dumps are healthy) and the first title in 2 Game Pack Hot
+Wheels. Madden NFL 06 runs on both with the same obscured in-game menu.
+
+Mortal Kombat Deadly Alliance and Tournament Edition used to be in this
+paragraph. **All three ROMs now boot** (`4c159ad`): the open BIOS's
+`RLUnCompWram` never word-aligned its header read, so a misaligned source got an
+ARM7-rotated size and a 2048-byte block decompressed as 6,579,200, filling EWRAM
+forever. gpSP still fails them; mGBA runs them, which is why they were worth
+chasing.
 
 **Never smoked, flagged by the BIOS-crash signal, about 13 ROMs**
 
