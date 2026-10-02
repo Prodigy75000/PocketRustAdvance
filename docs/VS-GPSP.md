@@ -1,6 +1,6 @@
 # PocketRustAdvance against gpSP
 
-Last measured 2026-10-02 at `57f4d9c`. gpSP is the GBA core Trophy Hub ships
+Last measured 2026-10-02 at `a90c078`. gpSP is the GBA core Trophy Hub ships
 today; this core is reachable only behind a debug preference that defaults off.
 
 This is the head-to-head the owner asked for when this work started: not an
@@ -10,9 +10,9 @@ would cost, with the losses first-class. Where a number is unmeasured it says so
 ## The short version
 
 A swap today would gain motion-control support, which gpSP does not have at all,
-and seven titles gpSP cannot boot. It would cost rumble, and the link cable,
-which is the real one. The real-time clock was the serious item on this list
-until 2026-10-02 and is now implemented.
+and seven titles gpSP cannot boot. What it would still cost is the **link
+cable**, and that is now the only thing on the list. The real-time clock and
+rumble were both on it this morning and both went in on 2026-10-02.
 
 **No title that gpSP boots is dead here, and the compatibility list is closed.**
 Both of the two that were went on 2026-10-02: Hikaru no Go 2 boots and plays
@@ -155,7 +155,7 @@ Verified by reading both cores, not by running them.
 |---|---|---|
 | Tilt sensor (Yoshi Topsy-Turvy, Koro Koro Puzzle) | yes, verified on device | **no** |
 | Gyro sensor (WarioWare Twisted, Mawaru) | yes, verified on device | **no** |
-| Rumble (Drill Dozer, Twisted) | **no** | yes, with a core option |
+| Rumble (Drill Dozer, Twisted) | yes, as of `a90c078` | yes, with a core option |
 | Real-time clock (Pokemon berries and tides, Boktai) | yes, as of `a50f8a5` | yes |
 | Solar sensor (Boktai) | no | no |
 
@@ -309,19 +309,23 @@ Where there is evidence rather than assertion:
 
 In the order I would do it:
 
-1. **Rumble.** Small, and it is the other half of the Twisted cartridge already
-   emulated here.
-2. **Link cable and RFU.** Not a defect, but it is the actual reason gpSP is the
+1. **Link cable and RFU.** Not a defect, but it is the actual reason gpSP is the
    incumbent: it was chosen for multiplayer, not for compatibility. Until this
    core serves that, a swap trades a working feature for everything else on this
    page. The serial registers are modelled with no cable attached (`1a58d70`),
    which is the floor to build on, not the feature.
-3. Solar, for Boktai. Neither core has it, so it is a shared gap and not part of
+2. Solar, for Boktai. Neither core has it, so it is a shared gap and not part of
    the promotion case.
 
-~~GTA Advance's second fault~~ and ~~the real-time clock~~ were both on this
-list until 2026-10-02. Compatibility is no longer on it at all, and the clock is
-done pending a hardware check.
+~~GTA Advance's second fault~~, ~~the real-time clock~~ and ~~rumble~~ were all
+on this list on the morning of 2026-10-02. Compatibility is no longer on it at
+all. The clock is confirmed ticking on device in both Ruby and Sapphire, with a
+berry the one check still outstanding. Rumble is measured working offline
+(Screw Breaker drives the motor on 18 of 1800 frames from a cold boot) and wants
+a device smoke, since only hardware can say whether the phone actually buzzes.
+
+**The link cable is what is left**, and it is worth being plain that it is the
+largest item of the four, not the smallest.
 
 Performance work is deliberately absent. The margin is structural but sits above
 the range anyone can perceive, so chasing it would buy nothing a player notices.
