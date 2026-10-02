@@ -258,8 +258,13 @@ fn main() {
             p.read_reg16(0x30), p.read_reg16(0x36), p.read_reg16(0x3A), p.read_reg16(0x38), p.read_reg16(0x3E), p.read_reg16(0x3C),
         );
     }
+    // GBA_WATCHW=<hex addr>[:<hex len>] - log every write landing in the block.
+    // The length matters: a 32-bit store to 0x04000000 also writes DISPSTAT, so a
+    // 4-byte watch on 0x04000004 misses it entirely.
     if let Ok(a) = std::env::var("GBA_WATCHW") {
-        gba.bus.watch_addr = u32::from_str_radix(a.trim_start_matches("0x"), 16).unwrap_or(0);
+        let (addr, len) = a.split_once(':').unwrap_or((a.as_str(), "4"));
+        gba.bus.watch_addr = u32::from_str_radix(addr.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+        gba.bus.watch_len = u32::from_str_radix(len.trim().trim_start_matches("0x"), 16).unwrap_or(4);
     }
     if std::env::var_os("GBA_NORENDER").is_some() {
         gba.render_enabled = false;
@@ -826,8 +831,11 @@ fn main() {
     println!("  in BIOS: {}% of the last {} frames ({} of {} steps)",
         if ds > 0 { db * 100 / ds } else { 100 }, frames - late_from, db, ds);
     if gba.bus.watch_addr != 0 {
-        println!("  watch {:08X}: {} writes", gba.bus.watch_addr, gba.bus.watch_hits.len());
-        for (pc, addr, val) in gba.bus.watch_hits.iter().take(24) {
+        println!("  watch {:08X}+{:X}: {} writes (showing the last {})",
+            gba.bus.watch_addr, gba.bus.watch_len.max(4),
+            gba.bus.watch_total, gba.bus.watch_hits.len().min(32));
+        let hits = &gba.bus.watch_hits;
+        for (pc, addr, val) in hits.iter().skip(hits.len().saturating_sub(32)) {
             println!("    PC={pc:08X} w{} [{:07X}] = {val:08X}", addr >> 28, addr & 0x0FFF_FFFF);
         }
     }

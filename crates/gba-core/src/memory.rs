@@ -81,7 +81,16 @@ pub struct GbaBus {
     /// capped log of (pc, value, width) writes that hit it.
     pub cur_pc: u32,
     pub watch_addr: u32,
+    /// Bytes covered by the watchpoint, starting at `watch_addr`. Defaults to 4.
+    /// This is NOT cosmetic: a 4-byte window on 0x04000004 reports zero writes
+    /// while DISPSTAT is visibly clobbered, because the stores are 32-bit and
+    /// start at 0x04000000. Watch a block, then read the addresses back.
+    pub watch_len: u32,
     pub watch_hits: Vec<(u32, u32, u32)>,
+    /// Every write that hit the watch block, counted even after `watch_hits` has
+    /// rolled. `watch_hits` keeps the MOST RECENT writes, because the interesting
+    /// one is nearly always the last: an init sequence floods the first hundred.
+    pub watch_total: u64,
     /// Debug counter: sound-FIFO DMA refills (4-word transfers) since boot.
     pub dbg_fifo_refills: u64,
     /// Debug counter: times the PPU raised the V-blank IRQ request (IF bit 0).
@@ -344,7 +353,9 @@ impl GbaBus {
             halted: false,
             cur_pc: 0,
             watch_addr: 0,
+            watch_len: 4,
             watch_hits: Vec::new(),
+            watch_total: 0,
             dbg_fifo_refills: 0,
             dbg_vbl_raised: 0,
             dbg_irq_src: [0; 16],
@@ -950,11 +961,16 @@ impl GbaBus {
             2 => addr & !1,
             _ => addr,
         };
-        if self.watch_addr != 0 && addr >= self.watch_addr && addr < self.watch_addr + 0x4
-            && self.watch_hits.len() < 200
+        if self.watch_addr != 0
+            && addr >= self.watch_addr
+            && addr < self.watch_addr + self.watch_len.max(4)
         {
+            self.watch_total += 1;
             // Stash width in the top nibble (palette values are 16-bit, so free).
             self.watch_hits.push((self.cur_pc, (width << 28) | addr, val));
+            if self.watch_hits.len() > 512 {
+                self.watch_hits.drain(..256);
+            }
         }
         match (addr >> 24) & 0xF {
             0x2 => write_le(&mut self.ewram, (addr & 0x3_FFFF) as usize, val, width),
@@ -1042,12 +1058,19 @@ impl GbaBus {
                     self.io[o as usize] = byte;
                     self.halted = true;
                 }
-                _ => {
+                // A DMA control high byte carries the enable bit, and hardware
+                // starts a transfer on its 0 -> 1 EDGE only. Storing a 1 over a 1
+                // does nothing at all, so the previous state has to be read
+                // before the byte lands.
+                0xBB | 0xC7 | 0xD3 | 0xDF => {
+                    let was_enabled = self.io[o as usize] & 0x80 != 0;
                     self.io[o as usize] = byte;
-                    // A DMA control high byte (enable bit) may start a channel.
-                    if matches!(o, 0xBB | 0xC7 | 0xD3 | 0xDF) {
+                    if !was_enabled {
                         self.start_dma(((o - 0xBB) / 12) as usize);
                     }
+                }
+                _ => {
+                    self.io[o as usize] = byte;
                 }
             }
         }
@@ -1559,14 +1582,61 @@ mod tests {
     }
 
     #[test]
+    fn rewriting_a_running_dma_control_does_not_restart_it() {
+        // Hardware starts a DMA on the 0 -> 1 EDGE of the enable bit. Storing a 1
+        // over a 1 does nothing at all.
+        //
+        // Grand Theft Auto Advance tears its sound DMA down in two steps at
+        // 0x08033418: first DMA1CNT_H &= 0xC5FF, which clears the repeat and
+        // start-timing bits but deliberately LEAVES enable set, then
+        // DMA1CNT_H &= 0x7FFF to drop enable. Restarting on any write with enable
+        // set made step one latch the channel's stale registers with its timing
+        // now reading as "immediate", and run a 0x4000-word transfer whose
+        // destination walked up from the sound FIFO through the entire I/O block.
+        // That cleared DISPCNT and DISPSTAT's V-blank IRQ enable, after which the
+        // game waited forever in VBlankIntrWait for an interrupt it could no
+        // longer receive. Confirming a save name was a permanent black screen.
+        let mut b = bus();
+        b.write32(0x0300_0000, 0xCAFE_F00D, Access::NonSeq); // the source word
+
+        b.write32(0x0400_00BC, 0x0300_0000, Access::NonSeq); // DMA1SAD
+        b.write32(0x0400_00C0, 0x0300_1000, Access::NonSeq); // DMA1DAD
+        b.write16(0x0400_00C4, 1, Access::NonSeq); // DMA1CNT_L = 1 word
+        // enable | IRQ | 32-bit | repeat | timing = V-blank. V-blank timing means
+        // it does NOT fire on the store, and repeat means enable stays set.
+        b.write16(0x0400_00C6, 0x8000 | 0x4000 | 0x400 | 0x200 | (1 << 12), Access::NonSeq);
+        assert_eq!(
+            b.read32(0x0300_1000, Access::NonSeq),
+            0,
+            "a V-blank-timed channel must not transfer when it is armed"
+        );
+
+        // Step one of the teardown, exactly as the game writes it.
+        let control = b.io_u16(0xC6);
+        assert_eq!(control & 0x8000, 0x8000, "a repeating channel keeps enable set");
+        b.write16(0x0400_00C6, control & 0xC5FF, Access::NonSeq);
+
+        assert_eq!(
+            b.read32(0x0300_1000, Access::NonSeq),
+            0,
+            "rewriting the control register of an already-enabled channel must not              start a transfer; only a 0 -> 1 edge on the enable bit does"
+        );
+    }
+
+    #[test]
     fn self_rearming_dma_terminates() {
         // The pathological shape: a channel whose destination IS its own control
-        // register, with a source word that sets the enable bit again. Every
-        // transfer re-arms the channel. Unguarded this recursed once per word and
-        // overflowed the stack, aborting the process outright (uncatchable by
-        // catch_unwind, which is how it silently truncated a 6118-ROM sweep). The
-        // guard queues instead of nesting, and the drain is capped so the re-arm
-        // cannot spin forever either. Reaching the assertions at all is the point.
+        // register, with a source word that sets the enable bit again. Unguarded
+        // this recursed once per transferred word and overflowed the stack, which
+        // aborts the process outright (uncatchable by catch_unwind, and how it
+        // silently truncated a 6118-ROM sweep). Kaisertal (Europe) (Demo) does it.
+        //
+        // Since DMA became edge-triggered the store cannot re-arm the channel at
+        // all, because its enable bit is already set while the transfer runs, so
+        // the shape is now closed twice over. That is what the source assertion
+        // below pins: one transfer, so the source advanced by exactly one word.
+        // The cross-channel arming that the guard still protects is covered by
+        // `dma_writing_dma_registers_queues_instead_of_recursing`.
         let mut b = bus();
         b.write32(0x0300_0300, 0x8400_0001, Access::NonSeq); // count 1, enable+32bit+immediate
         b.write32(0x0400_00B0, 0x0300_0300, Access::NonSeq); // DMA0SAD
@@ -1574,6 +1644,10 @@ mod tests {
         b.write32(0x0400_00B8, 0x8400_0001, Access::NonSeq); // count + enable, fires now
         assert!(!b.dma_active, "the guard must be released");
         assert_eq!(b.dma_pending, 0, "the drain must leave nothing queued");
+        assert_eq!(
+            b.dma_src[0], 0x0300_0304,
+            "the channel must have run exactly once: a store of 1 over an enable              bit that is already 1 is not an edge and starts nothing"
+        );
     }
 
     #[test]

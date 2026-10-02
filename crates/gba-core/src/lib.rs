@@ -86,6 +86,11 @@ pub struct Gba {
     trap_prev: u32,
     trap_from: u32,
     trapped: bool,
+    /// The last 64 taken branches before the trap fired, oldest first. A runaway
+    /// PC is never interesting at the point it lands: the question is always what
+    /// called what to get there, and the single "prev branch from" address above
+    /// answers it only when the jump is one hop deep. GTA Advance took four.
+    pub trap_ring: Vec<(u32, u32)>,
 }
 
 impl Gba {
@@ -140,6 +145,7 @@ impl Gba {
             trap_prev: 0,
             trap_from: 0,
             trapped: false,
+            trap_ring: Vec::new(),
         }
     }
 
@@ -225,10 +231,27 @@ impl Gba {
                                 "TRAP: PC jumped into unused space: {:08X} -> {exec:08X} (prev branch from {:08X}, irqs={})",
                                 self.trap_prev, self.trap_from, self.irqs_taken
                             );
+                            let r = &self.cpu.r;
+                            eprintln!(
+                                "TRAP: r0-r7  {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]
+                            );
+                            eprintln!(
+                                "TRAP: r8-r15 {:08X} {:08X} {:08X} {:08X} {:08X} sp={:08X} lr={:08X} pc={:08X}",
+                                r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]
+                            );
+                            eprintln!("TRAP: the {} branches that led there:", self.trap_ring.len());
+                            for (from, to) in self.trap_ring.iter() {
+                                eprintln!("TRAP:   {from:08X} -> {to:08X}");
+                            }
                             self.trapped = true;
                         } else {
                             if self.trap_prev != 0 && exec != self.trap_prev.wrapping_add(width) {
                                 self.trap_from = self.trap_prev; // last in-range branch source
+                                self.trap_ring.push((self.trap_prev, exec));
+                                if self.trap_ring.len() > 64 {
+                                    self.trap_ring.remove(0);
+                                }
                             }
                             self.trap_prev = exec;
                         }
