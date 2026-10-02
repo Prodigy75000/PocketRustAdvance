@@ -879,6 +879,9 @@ fn main() {
     if gba.cart_has_rumble() {
         println!("  RUMBLE: present, motor driven on {rumble_frames} of {frames} frames");
     }
+    if let Some((cmds, resets, state)) = gba.rfu_stats() {
+        println!("  RFU: present, {cmds} commands, {resets} resets, state={state}");
+    }
     let counter = u32::from_le_bytes(gba.bus.iwram[0..4].try_into().unwrap());
     println!("IWRAM counter @0x03000000 = {counter}  (IRQs taken)");
     // Prefer the best (most colourful) frame for the PNG; fall back to the final.

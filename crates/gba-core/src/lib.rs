@@ -13,6 +13,7 @@ pub mod bus;
 pub mod cpu;
 pub mod memory;
 pub mod ppu;
+pub mod rfu;
 pub mod rtc;
 pub mod save;
 pub mod sensor;
@@ -205,6 +206,7 @@ impl Gba {
             }
             self.bus.raise_ppu_irqs(line as u16);
             self.bus.step_timers();
+            self.bus.step_serial();
             if line == 160 {
                 self.bus.trigger_dma(1); // V-blank DMA
             }
@@ -373,6 +375,23 @@ impl Gba {
     /// look the same from outside.
     pub fn rtc_latches(&self) -> u64 {
         self.bus.sensors.rtc.latches
+    }
+
+    /// Is a wireless adapter attached to this cartridge?
+    pub fn cart_has_rfu(&self) -> bool {
+        self.bus.rfu.is_some()
+    }
+
+    /// Commands the game has sent the adapter, times it has power-cycled it,
+    /// and where the adapter currently is. Same purpose as `rtc_latches`:
+    /// zero commands separates "the adapter is wrong" from "the game never
+    /// asked", and resets climbing while commands stay put is specifically a
+    /// handshake that never completes.
+    pub fn rfu_stats(&self) -> Option<(u64, u64, &'static str)> {
+        self.bus
+            .rfu
+            .as_ref()
+            .map(|r| (r.commands, r.resets, r.state_name()))
     }
 
     /// Feed the gyroscope, in rad/s. Used by WarioWare Twisted, which senses

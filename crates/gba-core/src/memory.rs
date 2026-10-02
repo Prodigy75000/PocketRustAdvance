@@ -10,6 +10,12 @@ use crate::bus::{Access, Bus};
 use crate::ppu::Ppu;
 use crate::save::Save;
 
+/// Serial transfer durations, in system cycles, for eight bits at each of the
+/// two Normal-mode shift rates: 16777216 / 256000 * 8 and 16777216 / 2000000
+/// * 8. A 32-bit transfer costs four of them.
+const CYC_256KHZ_8BIT: u32 = 524;
+const CYC_2MHZ_8BIT: u32 = 67;
+
 pub struct GbaBus {
     pub bios: Box<[u8]>,   // 16 KB
     /// Whether the CPU is currently fetching instructions from inside the BIOS.
@@ -47,6 +53,18 @@ pub struct GbaBus {
     /// Cartridge motion sensors, when the cartridge has any. Detected from the
     /// game code, so an ordinary cart never sees any of this.
     pub sensors: crate::sensor::Sensors,
+    /// The wireless adapter, when the cartridge is one of the 43 titles that
+    /// expect one. `None` leaves every serial path exactly as it was, which is
+    /// what keeps the no-cable behaviour byte-identical for every other game.
+    pub rfu: Option<crate::rfu::Rfu>,
+    /// `cycles` as of the last `step_serial`, so serial timing is a delta the
+    /// same way the timers are.
+    serial_cycles: u64,
+    /// Cycles left before the in-flight serial transfer completes. Unlike the
+    /// no-cable path, an adapter transfer is paced: the game polls the start
+    /// bit and does an SO/SI handshake in between, so completing instantly
+    /// collapses a sequence the game is relying on.
+    serial_pending: u32,
     /// Decoded WAITCNT, kept in step with `io[0x204]` by `write`.
     waits: Waits,
     /// Cycles the Game Pak prefetch unit has been free to run ahead since the
@@ -344,8 +362,22 @@ impl GbaBus {
         align_the_rl_header_read(&mut b);
         let save = Save::detect(&rom);
         let sensors = crate::sensor::Sensors::new(&rom);
+        // GBA_RFU=0 detaches the adapter from a cart that has one, and
+        // GBA_RFU=1 attaches one to a cart that does not. Both directions are
+        // needed to tell "the game behaves differently with an adapter" from
+        // "the game behaves the same either way", which is the only way to
+        // know detection actually worked.
+        let attached = match std::env::var("GBA_RFU").as_deref() {
+            Ok("0") => false,
+            Ok(_) => true,
+            Err(_) => crate::rfu::detect(&rom),
+        };
+        let rfu = attached.then(crate::rfu::Rfu::new);
         GbaBus {
             sensors,
+            rfu,
+            serial_cycles: 0,
+            serial_pending: 0,
             bios: b.into_boxed_slice(),
             exec_in_bios: false,
             last_fetch: 0,
@@ -1156,6 +1188,13 @@ impl GbaBus {
 
     fn io_write(&mut self, addr: u32, val: u32, width: u32) {
         let off = addr & 0x3FF;
+        // A game power-cycles an attached wireless adapter through RCNT, and
+        // that is an edge against the PREVIOUS value, so sample it before the
+        // store lands. Cheap enough to do unconditionally rather than branch.
+        let touches_rcnt = off < 0x136 && off + width > 0x134;
+        let prev_rcnt = if touches_rcnt { self.io_u16(0x134) } else { 0 };
+        let touches_siocnt = off < 0x12A && off + width > 0x128;
+        let prev_siocnt = if touches_siocnt { self.io_u16(0x128) } else { 0 };
         for i in 0..width {
             let o = off + i;
             let byte = (val >> (i * 8)) as u8;
@@ -1236,8 +1275,50 @@ impl GbaBus {
         // SIOCNT's start bit is in the LOW byte but the mode select is in the
         // HIGH byte, so this has to run after the whole store has landed rather
         // than per byte the way the DMA enable does.
-        if off < 0x12A && off + width > 0x128 {
+        // An attached adapter drives SIOCNT bit 2 (SI) as a ready/busy
+        // handshake against bit 3 (SO), and bit 2 is a status bit the game
+        // cannot write at all. We used to store whatever the game wrote
+        // verbatim, so the game never saw the adapter acknowledge anything and
+        // gave up: Emerald got through the handshake, issued one command, then
+        // power-cycled the adapter and started over, forever. Masking is
+        // deliberately scoped to carts that have an adapter rather than
+        // applied to every game, to keep the blast radius at 43 ROMs.
+        if touches_siocnt && self.rfu.is_some() {
+            let written = self.io_u16(0x128);
+            let mut cnt = (written & 0x7F8B) | (prev_siocnt & 0x0004);
+            let so_rose = cnt & 0x0008 != 0 && prev_siocnt & 0x0008 == 0;
+            let so_fell = cnt & 0x0008 == 0 && prev_siocnt & 0x0008 != 0;
+            if cnt & 0x0001 != 0 {
+                // The game drives the clock. SO going high says the game is
+                // busy, and the adapter answers by dropping SI to ready.
+                if so_rose {
+                    cnt &= !0x0004;
+                }
+            } else {
+                // The adapter drives the clock, and SI just follows SO.
+                if so_rose {
+                    cnt |= 0x0004;
+                } else if so_fell {
+                    cnt &= !0x0004;
+                }
+            }
+            self.set_io16(0x128, cnt);
+        }
+        if touches_siocnt {
             self.sio_transfer();
+        }
+        // Driving SD high while it is an output resets the wireless adapter.
+        // The test is gpSP's: SD is an output in the new value and was low in
+        // the old one, which in practice is SD's rising edge. Emerald walks
+        // RCNT 8000 -> 80A0 -> 80A2 at boot and this is the 80A2 step.
+        if touches_rcnt && self.rfu.is_some() {
+            let rcnt = self.io_u16(0x134);
+            if rcnt & 0x20 != 0 && prev_rcnt & 0x02 == 0 {
+                if std::env::var_os("GBA_RFULOG").is_some() {
+                    eprintln!("  RFU reset  RCNT {prev_rcnt:04X} -> {rcnt:04X}");
+                }
+                self.rfu.as_mut().unwrap().reset();
+            }
         }
         // GBA_SIOLOG: every store that lands on the serial block, with the mode
         // decoded. A game hung waiting on a serial IRQ looks exactly like one
@@ -1263,6 +1344,56 @@ impl GbaBus {
                 self.io_u16(0x12A),
                 self.io_u16(0x120), self.io_u16(0x122), self.io_u16(0x124), self.io_u16(0x126),
             );
+        }
+    }
+
+    /// Advance the serial port by the cycles since the last call.
+    ///
+    /// Two jobs. It completes a paced transfer, clearing the start bit and
+    /// raising the serial IRQ once the word has had time to move. And it gives
+    /// an attached adapter the chance to take the clock and push an event back
+    /// at the game, which is the one place the device, not the game, is master.
+    pub fn step_serial(&mut self) {
+        let delta = (self.cycles - self.serial_cycles) as u32;
+        self.serial_cycles = self.cycles;
+
+        if self.serial_pending > 0 {
+            if self.serial_pending > delta {
+                self.serial_pending -= delta;
+            } else {
+                self.serial_pending = 0;
+                let cnt = self.io_u16(0x128);
+                // Clear start, and set SI to mark the device busy: that is the
+                // handshake the adapter runs between words.
+                self.set_io16(0x128, (cnt & !0x0080) | 0x0004);
+                if cnt & 0x4000 != 0 {
+                    self.if_ |= 1 << 7;
+                }
+            }
+        }
+
+        if self.rfu.is_none() {
+            return;
+        }
+        let cnt = self.io_u16(0x128);
+        let game_is_slave = cnt & 0x0001 == 0;
+        let so_si_clear = cnt & 0x000C == 0;
+        let armed = cnt & 0x0080 != 0;
+        let pushed = self
+            .rfu
+            .as_mut()
+            .unwrap()
+            .step(delta, game_is_slave, so_si_clear, armed);
+        if let Some(word) = pushed {
+            if std::env::var_os("GBA_RFULOG").is_some() {
+                eprintln!("  RFU rx {word:08X}  (adapter holds the clock)");
+            }
+            self.set_io16(0x120, word as u16);
+            self.set_io16(0x122, (word >> 16) as u16);
+            self.set_io16(0x128, cnt & !0x0080);
+            if cnt & 0x4000 != 0 {
+                self.if_ |= 1 << 7;
+            }
         }
     }
 
@@ -1296,6 +1427,34 @@ impl GbaBus {
             // Clear SI (bit 2, parent), ID (4-5), error (6) and start (7);
             // set SD (bit 3), which a lone unit in Multi-Player mode does drive.
             self.set_io16(0x128, (cnt & !0x00F4) | 0x0008);
+        } else if self.rfu.is_some() && cnt & 0x0001 != 0 && self.serial_pending == 0 {
+            // Normal mode into a wireless adapter, with us driving the clock.
+            // The word goes to the device and its answer comes straight back,
+            // but completion is PACED rather than immediate: the game polls
+            // the start bit and runs an SO/SI handshake between words, and
+            // finishing inside the store collapses a sequence it depends on.
+            let sent = self.io_u32(0x120);
+            let reply = self.rfu.as_mut().unwrap().transfer(sent);
+            if std::env::var_os("GBA_RFULOG").is_some() {
+                let rfu = self.rfu.as_ref().unwrap();
+                eprintln!(
+                    "  RFU tx {sent:08X} -> {reply:08X}  state={} cmds={}",
+                    rfu.state_name(),
+                    rfu.commands
+                );
+            }
+            self.set_io16(0x120, reply as u16);
+            self.set_io16(0x122, (reply >> 16) as u16);
+            // Eight bits at the selected baud, four times over for a 32-bit
+            // word. Emerald picks 256 KHz, so a word is about two scanlines.
+            let mut pending = if cnt & 0x0002 != 0 { CYC_2MHZ_8BIT } else { CYC_256KHZ_8BIT };
+            if cnt & 0x1000 != 0 {
+                pending *= 4;
+            }
+            self.serial_pending = pending;
+            // The start bit deliberately stays set; `step_serial` clears it
+            // and raises the IRQ when the transfer has had time to happen.
+            return;
         } else {
             // Normal mode. Bit 0 selects the shift clock: with an EXTERNAL clock
             // we are the slave, and with nothing plugged in there is no clock, so
