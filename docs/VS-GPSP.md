@@ -1,6 +1,6 @@
 # PocketRustAdvance against gpSP
 
-Last measured 2026-10-02 at `ebda31a`. gpSP is the GBA core Trophy Hub ships
+Last measured 2026-10-02 at `f768034`. gpSP is the GBA core Trophy Hub ships
 today; this core is reachable only behind a debug preference that defaults off.
 
 This is the head-to-head the owner asked for when this work started: not an
@@ -14,12 +14,12 @@ and seven titles gpSP cannot boot. It would cost real-time clock support and
 rumble. The clock is the serious one: it is the only item on the list that
 silently degrades games that otherwise look fine.
 
-**No title that gpSP boots is now dead here.** Both of the two that were went in
-`d98365e`: Hikaru no Go 2 boots and plays, and Grand Theft Auto Advance gets from
-a black screen at the save-name prompt through its whole intro cutscene to the
-first mission card. The stop after the mission card fell on 2026-10-02 with the
-CPU/DMA cycle-accounting fixes: GTA now reaches Portland gameplay from a cold
-boot under both the open BIOS and a real dump.
+**No title that gpSP boots is dead here, and the compatibility list is closed.**
+Both of the two that were went on 2026-10-02: Hikaru no Go 2 boots and plays
+(`d98365e`), and Grand Theft Auto Advance went in two steps, the DMA enable edge
+(`d98365e`) and then the ARM7TDMI bus cycles we were not charging (`b59bf8e`).
+GTA now reaches Portland gameplay. **The owner confirmed it on hardware and
+cross-checked the same scenes against mGBA and gpSP.**
 
 The compatibility side of this page was rewritten on 2026-10-02. Three of the
 five regressions went away in one commit (`e1af4e6`, BIOS read protection), and
@@ -32,7 +32,7 @@ device, so the four-times gap measured below never reaches a user.
 ## Compatibility
 
 2727 licensed ROMs, 1800 frames each, booting through the bundled open BIOS,
-which is the shipping configuration. **233 rows flagged by the automated cut,
+which is the shipping configuration. **244 rows flagged by the automated cut,
 of which a handful are real**; see the caveat below, which is why this section
 quotes titles rather than a percentage.
 
@@ -63,9 +63,16 @@ the protagonist, so it is better rather than correct.
 This is the whole list, and it is short. Every entry is the owner on hardware;
 nothing here comes from the automated cut.
 
-**Partially working here, works on gpSP: none.** Grand Theft Auto Advance
-headed this table until 2026-10-02. It now plays: boots, takes a save name,
-plays the intro cutscene and runs gameplay in Portland from a cold boot.
+**Broken here, works on gpSP: none.** Grand Theft Auto Advance headed this
+table until 2026-10-02. It now plays: boots, takes a save name, plays the intro
+cutscene and runs gameplay in Portland. **Owner-confirmed on hardware, with the
+same scenes cross-checked against mGBA and gpSP.** USA and Europe, under the
+bundled open BIOS and a real BIOS dump.
+
+One thing to know if a GTA save state is ever used to judge this: every state
+captured before `b59bf8e` is poisoned. The corruption happened earlier in the
+scene than the crash, so the state's own work RAM already contains the damaged
+code and it will still die on load. Judge a timing fix from a fresh run.
 
 Hikaru no Go 2 used to head this table as a white screen dead in all three BIOS
 modes. It boots to its title screen and into the kana name entry as of `d98365e`.
@@ -131,7 +138,7 @@ of which the owner has since played without trouble.
 
 ### What the automated number is worth, which is not much
 
-**The sweep flags 233 of 2727 rows and that is not a failure count.** It pulses
+**The sweep flags 244 of 2727 rows and that is not a failure count.** It pulses
 A and Start forever, which walks a game into pause menus and soft resets no
 player visits, and it scores a frame by counting colours, which calls a dark
 title screen dead. Six of the 233 are titles the owner has personally cleared.
@@ -174,10 +181,16 @@ Mario Kart Super Circuit, 1800 frames, this desktop (Ryzen 9 9950X), rendering
 enabled in all three:
 
 ```text
-  this core   1374 ms    22x realtime
-  mGBA         517 ms    58x realtime     2.7x faster than us
-  gpSP         341 ms    88x realtime     4.0x faster than us
+  this core   1660 ms    18x realtime
+  mGBA         517 ms    58x realtime     3.2x faster than us
+  gpSP         341 ms    88x realtime     4.9x faster than us
 ```
+
+Our figure was re-measured on 2026-10-02 and the previous 1374 ms was stale: the
+same binary measures 1660 ms today, and so does the commit before the cycle
+accounting changed, so this is not a regression from that work. The mGBA and gpSP
+numbers have NOT been re-measured on the current machine, so read the ratios as
+approximate.
 
 **That ratio does not reach the user, and an earlier draft of this page was wrong
 to call it a risk.** The owner's measurement on device: both cores run at 600 fps
@@ -279,12 +292,18 @@ In the order I would do it:
 1. **Real-time clock.** The only item that makes a popular game quietly worse.
    Shares the GPIO port already built for the gyro, so the hardware plumbing
    exists; this is the S3511 protocol on top of it.
-2. ~~GTA Advance's second fault~~ - fixed 2026-10-02 (CPU/DMA cycle
-   accounting; the self-patch race described above).
-3. **Rumble.** Small, and it is the other half of the Twisted cartridge already
+2. **Rumble.** Small, and it is the other half of the Twisted cartridge already
    emulated here.
+3. **Link cable and RFU.** Not a defect, but it is the actual reason gpSP is the
+   incumbent: it was chosen for multiplayer, not for compatibility. Until this
+   core serves that, a swap trades a working feature for everything else on this
+   page. The serial registers are modelled with no cable attached (`1a58d70`),
+   which is the floor to build on, not the feature.
 4. Solar, for Boktai. Neither core has it, so it is a shared gap and not part of
    the promotion case.
+
+~~GTA Advance's second fault~~ was item 2 here until 2026-10-02. Compatibility is
+no longer on this list at all.
 
 Performance work is deliberately absent. The margin is structural but sits above
 the range anyone can perceive, so chasing it would buy nothing a player notices.
