@@ -537,19 +537,25 @@ impl Ppu {
             let tc = comp.top_col[x];
             // The colour effect only runs where the window enables it (bit 5).
             let effect = comp.win_mask[x] & 0x20 != 0;
-            // GBATEK: a semi-transparent sprite is ALWAYS the 1st target and
-            // always alpha-blends, regardless of BLDCNT bit 4 and bits 6-7,
-            // provided whatever is under it is a 2nd-target layer. Super
-            // Bust-A-Move greys out the unselected menu option this way, and
-            // without it both options render at full brightness and the
-            // selection is invisible.
+            // GBATEK: a semi-transparent sprite is ALWAYS the 1st target,
+            // regardless of BLDCNT bit 4. Super Bust-A-Move greys out the
+            // unselected menu option this way, and without it both options
+            // render at full brightness and the selection is invisible.
+            //
+            // It overrides the BLDCNT mode and alpha-blends ONLY where the
+            // pixel underneath is itself a selected 2nd target. Everywhere else
+            // the normal mode still applies to it. Forcing alpha unconditionally
+            // let the sprite fall through unblended whenever there was nothing
+            // to blend with, which is how Mario vs Donkey Kong kept a lit blue
+            // box on screen through a fade to black: BLDCNT asks for brightness
+            // decrease on every layer with BLDY past the clamp, and no 2nd
+            // target at all.
             let semi = comp.top_semi[x];
             let first_hit = effect && (semi || first & (1 << comp.top_id[x]) != 0);
-            let mode = if semi && effect { 1 } else { blend_mode };
+            let over_second = second & (1 << comp.snd_id[x]) != 0;
+            let mode = if semi && effect && over_second { 1 } else { blend_mode };
             dst[x] = match mode {
-                1 if first_hit && second & (1 << comp.snd_id[x]) != 0 => {
-                    blend_alpha(tc, comp.snd_col[x], eva, evb)
-                }
+                1 if first_hit && over_second => blend_alpha(tc, comp.snd_col[x], eva, evb),
                 2 if first_hit => brighten(tc, evy),
                 3 if first_hit => darken(tc, evy),
                 _ => tc,
@@ -1100,6 +1106,53 @@ mod tests {
             blend_alpha(0x7C00, 0x001F, 8, 8),
             "the semi-transparent decoy must blend in the very same frame"
         );
+    }
+
+    /// A semi-transparent sprite overrides the BLDCNT mode ONLY where the pixel
+    /// under it is a selected 2nd target. Everywhere else the normal mode still
+    /// applies to it, because GBATEK qualifies the override: "if a
+    /// semi-transparent OBJ pixel does by itself select the 2nd target layer,
+    /// then (for that pixel only) the brightness effect will be ignored".
+    ///
+    /// Mario vs Donkey Kong is the case this was found on. Its level-start fade
+    /// asks for brightness decrease on every layer with BLDY past the clamp and
+    /// names no 2nd target at all, so the screen should go flat black. Forcing
+    /// alpha mode unconditionally meant the sprite matched no arm of the blend
+    /// and fell through undarkened, leaving a lit blue box sitting on the fade
+    /// for the whole transition.
+    #[test]
+    fn a_semi_transparent_sprite_still_darkens_with_nothing_to_blend_into() {
+        fn scene(second_target: u16) -> u16 {
+            let mut p = Ppu::new();
+            put16(&mut p.palram, 2, 0x001F); // BG palette[1] = red
+            put16(&mut p.palram, 0x202, 0x7C00); // OBJ palette[1] = blue
+            for i in 0..32 {
+                p.vram[i] = 0x11;
+                p.vram[0x1_0000 + i] = 0x11;
+            }
+            put16(&mut p.vram, 0x800, 0);
+            put16(&mut p.oam, 0, 1 << 10); // sprite 0 semi-transparent, at (0,0)
+            p.write_reg16(0x08, 0x0100); // BG0CNT priority 0
+            p.write_reg16(0x00, 0x1140); // DISPCNT: mode 0, BG0 + OBJ, 1D
+            // Brightness decrease, every layer a 1st target, BLDY at full.
+            p.write_reg16(0x50, 0x00FF | (second_target << 8));
+            p.write_reg16(0x52, 0x0808);
+            p.write_reg16(0x54, 16);
+            p.render_line(0);
+            p.framebuffer[0]
+        }
+
+        assert_eq!(
+            scene(0),
+            darken(0x7C00, 16),
+            "with no 2nd target under it, the sprite takes the brightness effect"
+        );
+        assert_eq!(
+            scene(0x01),
+            blend_alpha(0x7C00, 0x001F, 8, 8),
+            "with BG0 named as 2nd target, alpha wins and brightness is ignored"
+        );
+        assert_ne!(scene(0), 0x7C00, "it must not escape the fade entirely");
     }
 
     /// Sprites are drawn in the bitmap modes. They were not drawn at all until

@@ -29,10 +29,11 @@ pub struct GbaBus {
     /// BIOS returns THIS rather than the BIOS contents. Starts at the value
     /// GBATEK documents as left over after the boot sequence.
     ///
-    /// Deliberately NOT in the save state, because the serialize format is a
-    /// binding cross-core contract and this costs nothing to rebuild: the next
-    /// instruction fetch restores `exec_in_bios`, and the next BIOS entry (one
-    /// V-blank away at worst) restores the word.
+    /// In the save state, appended at the end so older blobs still load. The
+    /// first cut left it out on the theory that the next BIOS entry would
+    /// rebuild it within a frame. That is wrong for exactly the games this
+    /// protection matters to: they read region 0 before the next entry and get
+    /// the boot-time value, so the state does not resume where it was saved.
     bios_prefetch: u32,
     pub ewram: Box<[u8]>,  // 256 KB
     pub iwram: Box<[u8]>,  // 32 KB
@@ -315,6 +316,16 @@ impl GbaBus {
         self.ppu.serialize(w);
         self.apu.serialize(w);
         self.sensors.serialize(w);
+        // The bus state behind the BIOS read protection. Small, but a state
+        // that omits it does not resume faithfully: a game that reads region 0
+        // before the next BIOS entry sees the boot-time value instead of the
+        // one it actually had. Babar to the Rescue is the measured case, and it
+        // restarted into the BIOS boot animation on load.
+        w.u32(self.bios_prefetch);
+        w.u32(self.last_fetch);
+        w.bool(self.last_fetch_thumb);
+        w.bool(self.exec_in_bios);
+        w.bool(self.bios_entry_irq);
     }
 
     pub fn deserialize(&mut self, r: &mut crate::state::Reader) {
@@ -352,6 +363,15 @@ impl GbaBus {
         // from their reset values, which is one frame of staleness at worst.
         if r.remaining() >= 17 {
             self.sensors.deserialize(r);
+        }
+        // Appended after the sensors, same rule: a state from a build without
+        // it still loads, and the bus simply starts from its reset values.
+        if r.remaining() >= 11 {
+            self.bios_prefetch = r.u32();
+            self.last_fetch = r.u32();
+            self.last_fetch_thumb = r.bool();
+            self.exec_in_bios = r.bool();
+            self.bios_entry_irq = r.bool();
         }
     }
 
