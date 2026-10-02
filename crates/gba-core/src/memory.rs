@@ -222,6 +222,66 @@ const OPEN_BIOS_R12: &[(usize, u32, u32)] = &[
     (0x4B8, 0xE144_30B7, 0xE14C_30B8), // strh r3, [r4, #-7]     -> strh r3, [r12, #-8]
 ];
 
+/// Where the RL-decompression repair lands. The bundled open BIOS stops using
+/// its image at 0x243C and the remaining 7 KB is zero, so there is room to put
+/// four instructions somewhere the original never executes.
+const RL_STUB: usize = 0x2440;
+
+/// `RLUnCompWram` (SWI 0x14) reads its header with `ldr r2, [r0], #4` and does
+/// not word-align `r0` first. On an ARM7 a misaligned LDR ROTATES the word it
+/// loaded, so a source that is not a multiple of four yields a header with the
+/// right type nibble and a garbage size.
+///
+/// Mortal Kombat Deadly Alliance passes `src % 4 == 2` on every one of its
+/// twenty calls, every time with a perfectly good header sitting at that byte
+/// offset. Measured on the Europe build: the block is 2048 bytes, and the
+/// rotation turns that into 6,579,200. The decompressor then writes until it
+/// has filled EWRAM several times over and never returns, which is the Midway
+/// logo hanging forever at a 99% BIOS share.
+///
+/// The fix is one instruction's worth of behaviour, and the image itself says
+/// so: `RLUnCompVram` next door at 0x0FBC does `bic r0, r0, #3` before the very
+/// same load, and only the Wram entry is missing it. mGBA agrees and is the
+/// reference here, since it runs these games and we did not:
+///
+/// ```text
+/// remaining = (load32(source & 0xFFFFFFFC) & 0xFFFFFF00) >> 8;   // masked
+/// source += 4;                                                   // NOT masked
+/// ```
+///
+/// Note which pointer gets masked. The header is read from the aligned address,
+/// but the source advances from the ORIGINAL, so the compressed stream still
+/// starts at `src + 4`. Masking r0 outright shifts the whole stream two bytes
+/// and corrupts everything it decodes. The stub keeps them separate, and for an
+/// already-aligned source it is behaviour-identical to the instruction it
+/// replaces.
+///
+/// `(offset, expected, replacement)`.
+#[rustfmt::skip]
+const OPEN_BIOS_RL: &[(usize, u32, u32)] = &[
+    // ldr r2, [r0], #4  ->  b RL_STUB
+    (0x0F18, 0xE490_2004, 0xEA00_0548),
+    // The stub, into guaranteed-zero space.
+    (RL_STUB,        0, 0xE3C0_2003), // bic r2, r0, #3     (aligned copy for the header)
+    (RL_STUB + 0x4,  0, 0xE592_2000), // ldr r2, [r2]       (unrotated, so the size is real)
+    (RL_STUB + 0x8,  0, 0xE280_0004), // add r0, r0, #4     (advance from the ORIGINAL src)
+    (RL_STUB + 0xC,  0, 0xEAFF_FAB2), // b 0x0F1C           (back into the routine)
+];
+
+/// Apply [`OPEN_BIOS_RL`], under the same all-or-nothing rule as the r12
+/// repair: a real BIOS dump, a different build of the open BIOS or the HLE stub
+/// is left untouched, and the four stub words must be zero before anything is
+/// written over them.
+fn align_the_rl_header_read(bios: &mut [u8]) {
+    let word = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    if !OPEN_BIOS_RL.iter().all(|&(o, want, _)| o + 4 <= bios.len() && word(bios, o) == want) {
+        return;
+    }
+    for &(o, _, patched) in OPEN_BIOS_RL {
+        bios[o..o + 4].copy_from_slice(&patched.to_le_bytes());
+    }
+}
+
 /// Apply [`OPEN_BIOS_R12`], but only to a BIOS image that is byte-for-byte the
 /// one it was measured against.
 ///
@@ -249,6 +309,7 @@ impl GbaBus {
             }
         }
         hold_io_base_in_r12(&mut b);
+        align_the_rl_header_read(&mut b);
         let save = Save::detect(&rom);
         let sensors = crate::sensor::Sensors::new(&rom);
         GbaBus {
@@ -1230,6 +1291,74 @@ mod tests {
             b[o..o + 4].copy_from_slice(&original.to_le_bytes());
         }
         b
+    }
+
+    /// The two branches in the RL repair must land exactly where they are meant
+    /// to, decoded the way the CPU decodes them.
+    ///
+    /// This exists because the first cut of the table had the branch back
+    /// hand-computed as `0xEAFFFEB2` when it should have been `0xEAFFFAB2`, a
+    /// slip of one hex digit that sent it to 0x1F1C instead of 0x0F1C. It still
+    /// stopped Mortal Kombat hanging, so every behavioural check I had said
+    /// PASS, and it was only caught by diffing the patched image against a
+    /// known-good one. Encoded branch offsets need decoding, not eyeballing.
+    #[test]
+    fn the_rl_repair_branches_land_where_they_are_aimed() {
+        // ARM B: offset is a signed 24-bit word count, relative to PC + 8.
+        let target = |at: usize, word: u32| -> usize {
+            assert_eq!(word >> 24, 0xEA, "expected an unconditional B at {at:#X}");
+            let off = ((word & 0x00FF_FFFF) << 8) as i32 >> 8; // sign-extend 24 -> 32
+            (at as i64 + 8 + (off as i64) * 4) as usize
+        };
+        let word_at = |o: usize| OPEN_BIOS_RL.iter().find(|&&(x, _, _)| x == o).unwrap().2;
+
+        assert_eq!(
+            target(0x0F18, word_at(0x0F18)),
+            RL_STUB,
+            "the call site must branch into the stub"
+        );
+        assert_eq!(
+            target(RL_STUB + 0xC, word_at(RL_STUB + 0xC)),
+            0x0F1C,
+            "the stub must branch back to the instruction after the one it replaced"
+        );
+
+        // The stub must sit in space the original image never uses, and the
+        // table must say so, or the all-or-nothing guard is meaningless.
+        for &(o, want, _) in OPEN_BIOS_RL.iter().filter(|&&(o, _, _)| o >= RL_STUB) {
+            assert_eq!(want, 0, "stub word at {o:#X} must be expected-zero");
+        }
+    }
+
+    /// The RL repair, like the r12 one, only touches the image it was measured
+    /// against, and it must leave the four stub words alone unless they really
+    /// are zero.
+    #[test]
+    fn the_rl_repair_only_touches_the_bios_it_was_measured_against() {
+        let word = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+
+        let mut good = vec![0u8; 16 * 1024];
+        for &(o, original, _) in OPEN_BIOS_RL {
+            good[o..o + 4].copy_from_slice(&original.to_le_bytes());
+        }
+        align_the_rl_header_read(&mut good);
+        for &(o, _, patched) in OPEN_BIOS_RL {
+            assert_eq!(word(&good, o), patched, "word at {o:#X} should have been rewritten");
+        }
+
+        // Somebody else's BIOS, or a build whose stub space is already in use.
+        let mut occupied = vec![0u8; 16 * 1024];
+        for &(o, original, _) in OPEN_BIOS_RL {
+            occupied[o..o + 4].copy_from_slice(&original.to_le_bytes());
+        }
+        occupied[RL_STUB + 4..RL_STUB + 8].copy_from_slice(&0xE1A0_0000u32.to_le_bytes());
+        let before = occupied.clone();
+        align_the_rl_header_read(&mut occupied);
+        assert_eq!(occupied, before, "an image whose stub space is in use must be untouched");
+
+        let mut zeros = vec![0u8; 16 * 1024];
+        align_the_rl_header_read(&mut zeros);
+        assert!(zeros.iter().all(|&x| x == 0), "an unrecognised BIOS must be untouched");
     }
 
     /// The r12 repair must rewrite an image it recognises and refuse every other
