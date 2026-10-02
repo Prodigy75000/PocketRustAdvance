@@ -1,6 +1,6 @@
 # PocketRustAdvance against gpSP
 
-Last measured 2026-10-02 at `a50f8a5`. gpSP is the GBA core Trophy Hub ships
+Last measured 2026-10-02 at `57f4d9c`. gpSP is the GBA core Trophy Hub ships
 today; this core is reachable only behind a debug preference that defaults off.
 
 This is the head-to-head the owner asked for when this work started: not an
@@ -179,9 +179,17 @@ the most played titles there are.
 The chip is a Seiko S-3511A on the same GPIO port as the gyro, found by the
 Nintendo RTC library's version string in the ROM, which hits exactly 30 of the
 2727 licensed ROMs and no false positives. All seven clock carts checked latch
-the clock while booting. **Not yet confirmed on hardware**: the test that counts
-is a Pokemon save left overnight with a berry planted, which is the owner's to
-run.
+the clock while booting.
+
+**Owner-confirmed on device**: Sapphire's wall clock was set at 9:02 and read
+9:05 three real minutes later, advancing on its own with no input. Still
+outstanding is a berry, which is the only test of elapsed time surviving a save
+and reload.
+
+The clock follows the **host wall clock**, pushed every frame, not emulated time.
+So it neither pauses while the app is suspended nor runs fast in fast-forward: it
+reads real time whenever a frame happens to run, which is how a cartridge whose
+crystal keeps going with the console switched off behaves.
 
 The one piece still missing for these cartridges is the **solar sensor**, which
 neither core has. It is why both Boktai rows sit flagged in the sweep.
@@ -285,8 +293,8 @@ Where there is evidence rather than assertion:
 
 ## Risks a swap would carry
 
-1. ~~No real-time clock~~ - implemented 2026-10-02 (`a50f8a5`), pending a
-   hardware confirmation that a berry actually grows.
+1. ~~No real-time clock~~ - implemented 2026-10-02 (`a50f8a5`) and confirmed
+   ticking on device; a berry is the one check still outstanding.
 2. **A more complete memory map exposes racy achievement sets.** Advance Wars 2
    awards "Shiny Design Room" seconds after boot here. That one is a flaw in RA
    set 1768, reproduced by the owner on Linkboy and ticketed, and it is not caused
