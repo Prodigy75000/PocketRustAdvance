@@ -59,8 +59,8 @@ pub(crate) fn swilog(num: u8, caller: u32, r: &[u32; 16]) {
     let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n < limit {
         eprintln!(
-            "  SWI {num:02X} from {caller:08X} r0={:08X} r1={:08X} r2={:08X} r3={:08X}",
-            r[0], r[1], r[2], r[3]
+            "  SWI {num:02X} from {caller:08X} r0={:08X} r1={:08X} r2={:08X} r3={:08X} lr={:08X}",
+            r[0], r[1], r[2], r[3], r[14]
         );
     }
 }

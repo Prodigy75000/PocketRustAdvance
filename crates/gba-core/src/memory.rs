@@ -86,6 +86,9 @@ pub struct GbaBus {
     /// while DISPSTAT is visibly clobbered, because the stores are 32-bit and
     /// start at 0x04000000. Watch a block, then read the addresses back.
     pub watch_len: u32,
+    /// When non-zero, only record watch hits made by this PC. A buffer that is
+    /// written by several unrelated routines drowns the one you care about.
+    pub watch_pc: u32,
     pub watch_hits: Vec<(u32, u32, u32)>,
     /// Every write that hit the watch block, counted even after `watch_hits` has
     /// rolled. `watch_hits` keeps the MOST RECENT writes, because the interesting
@@ -354,6 +357,7 @@ impl GbaBus {
             cur_pc: 0,
             watch_addr: 0,
             watch_len: 4,
+            watch_pc: 0,
             watch_hits: Vec::new(),
             watch_total: 0,
             dbg_fifo_refills: 0,
@@ -964,6 +968,7 @@ impl GbaBus {
         if self.watch_addr != 0
             && addr >= self.watch_addr
             && addr < self.watch_addr + self.watch_len.max(4)
+            && (self.watch_pc == 0 || self.watch_pc == self.cur_pc)
         {
             self.watch_total += 1;
             // Stash width in the top nibble (palette values are 16-bit, so free).

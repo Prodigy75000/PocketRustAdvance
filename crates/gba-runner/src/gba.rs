@@ -266,6 +266,10 @@ fn main() {
         gba.bus.watch_addr = u32::from_str_radix(addr.trim().trim_start_matches("0x"), 16).unwrap_or(0);
         gba.bus.watch_len = u32::from_str_radix(len.trim().trim_start_matches("0x"), 16).unwrap_or(4);
     }
+    // GBA_WATCHPC=<hex pc>: only log watch hits from this instruction.
+    if let Ok(a) = std::env::var("GBA_WATCHPC") {
+        gba.bus.watch_pc = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+    }
     if std::env::var_os("GBA_NORENDER").is_some() {
         gba.render_enabled = false;
     }
