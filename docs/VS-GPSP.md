@@ -1,6 +1,6 @@
 # PocketRustAdvance against gpSP
 
-Last measured 2026-10-02 at `4c159ad`. gpSP is the GBA core Trophy Hub ships
+Last measured 2026-10-02 at `d98365e`. gpSP is the GBA core Trophy Hub ships
 today; this core is reachable only behind a debug preference that defaults off.
 
 This is the head-to-head the owner asked for when this work started: not an
@@ -10,9 +10,15 @@ would cost, with the losses first-class. Where a number is unmeasured it says so
 ## The short version
 
 A swap today would gain motion-control support, which gpSP does not have at all,
-and seven titles gpSP cannot boot. It would cost real-time clock support,
-rumble, and two titles gpSP runs. The clock is the serious one: it is the only
-item on the list that silently degrades games that otherwise look fine.
+and seven titles gpSP cannot boot. It would cost real-time clock support and
+rumble. The clock is the serious one: it is the only item on the list that
+silently degrades games that otherwise look fine.
+
+**No title that gpSP boots is now dead here.** Both of the two that were went in
+`d98365e`: Hikaru no Go 2 boots and plays, and Grand Theft Auto Advance gets from
+a black screen at the save-name prompt through its whole intro cutscene to the
+first mission card. GTA still stops after that, so it is listed below as
+partially working rather than as a win.
 
 The compatibility side of this page was rewritten on 2026-10-02. Three of the
 five regressions went away in one commit (`e1af4e6`, BIOS read protection), and
@@ -25,7 +31,7 @@ device, so the four-times gap measured below never reaches a user.
 ## Compatibility
 
 2727 licensed ROMs, 1800 frames each, booting through the bundled open BIOS,
-which is the shipping configuration. **225 rows flagged by the automated cut,
+which is the shipping configuration. **233 rows flagged by the automated cut,
 of which a handful are real**; see the caveat below, which is why this section
 quotes titles rather than a percentage.
 
@@ -56,12 +62,30 @@ the protagonist, so it is better rather than correct.
 This is the whole list, and it is short. Every entry is the owner on hardware;
 nothing here comes from the automated cut.
 
-**Broken here, works on gpSP (2 titles, 3 ROMs)**
+**Partially working here, works on gpSP (1 title, 2 ROMs)**
 
 | title | here |
 |---|---|
-| Hikaru no Go 2 (Japan) | white screen, dead in all three BIOS modes. A loop in IWRAM at `0x03000B0C` pinned from frame 10 to 1800, interrupts never enabled. Hikaru no Go 1 is fine. |
-| Grand Theft Auto Advance (USA, Europe) | black screen on confirming a save name. NOT the save: there are zero EEPROM transactions. It writes garbage into the I/O registers (0xEFEF and friends into DISPCNT, DISPSTAT and IE), which clears its own V-blank IRQ enable, and then waits in VBlankIntrWait for the interrupt it just disabled. |
+| Grand Theft Auto Advance (USA, Europe) | boots, takes a save name, plays the whole intro cutscene and reaches the first mission card, then stops. Was a black screen the moment you confirmed a save name until `d98365e`; that part was never a save bug and there are still zero EEPROM transactions anywhere in the run. What remains is a second, unrelated fault in the game's runtime code generator, described below. |
+
+Hikaru no Go 2 used to head this table as a white screen dead in all three BIOS
+modes. It boots to its title screen and into the kana name entry as of `d98365e`.
+
+**What is left in GTA Advance.** The game generates ARM code into IWRAM and then
+self-patches 64-byte windows of it. The generated routine at `0x03000100` is
+emitted complete, prologue included, and a later patch copies the block at
+`+0xA0` over its first 64 bytes, which takes the prologue with it. Its epilogue
+still pops fourteen registers that were never pushed, so it returns into the
+stack, executes a byte there as a SWI with a number no BIOS defines, and the
+BIOS's unbounded SWI table branches into unmapped space. The runaway is a
+consequence, not the fault.
+
+It is NOT the bundled BIOS: from a cold boot the open BIOS and a real BIOS dump
+run off the same bogus SWI within two interrupts of each other. The divergence
+is upstream of the generator, in whatever our core tells the game that makes it
+emit that fragment list. Repro with no save state needed:
+
+    GBA_BIOS=<bios> GBA_AUTOINPUT=1 GBA_TRAP=1 ./gba.exe "Grand Theft Auto Advance (USA).gba" 900
 
 **Broken here, not known to work anywhere (1 title)**
 
@@ -100,10 +124,10 @@ of which the owner has since played without trouble.
 
 ### What the automated number is worth, which is not much
 
-**The sweep flags 223 of 2727 rows and that is not a failure count.** It pulses
+**The sweep flags 233 of 2727 rows and that is not a failure count.** It pulses
 A and Start forever, which walks a game into pause menus and soft resets no
 player visits, and it scores a frame by counting colours, which calls a dark
-title screen dead. Six of the 223 are titles the owner has personally cleared.
+title screen dead. Six of the 233 are titles the owner has personally cleared.
 Over 2026-10-01 and 02 it pointed at healthy games three separate times and
 missed three real regressions that only owner device reports caught.
 
@@ -196,6 +220,16 @@ Where there is evidence rather than assertion:
   picture is BG2 with a priority, sprites and windows and blending all apply, and
   the two renderers share one resolve step. Corpus unchanged at 30 flagged.
 
+- **DMA started on any write that left the enable bit set, not on its rising
+  edge. Fixed 2026-10-02 in `d98365e`.** Hardware starts a transfer when enable
+  goes 0 to 1; storing a 1 over a 1 does nothing. A game that read-modify-writes
+  a running channel therefore re-ran the whole transfer with whatever its
+  registers happened to hold. GTA Advance does exactly that while tearing down
+  its sound DMA, and the phantom transfer sprayed 0x4000 words up through the
+  whole I/O block from the sound FIFO, clearing DISPCNT and DISPSTAT's V-blank
+  IRQ enable. mGBA tests the same edge in `GBADMAWriteCNT_HI`. Four other titles
+  improved with it, and the corpus showed no regression.
+
 - Ghost Rider and Kao the Kangaroo show garbage in the same transitions on gpSP
   and are clean here, so this class of bug runs in both directions.
 - **The BIOS region was readable from anywhere. Fixed 2026-10-02 in `e1af4e6`.**
@@ -216,7 +250,8 @@ Where there is evidence rather than assertion:
    by anything this core gets wrong. But gpSP's narrower map hides a class of set
    bug that this core will surface, and false unlocks reach a player's account and
    cannot be taken back.
-3. **Two titles regress**, down from five.
+3. **One title falls short of gameplay** where gpSP reaches it, down from five
+   titles that regressed outright.
 
 ## What replacing gpSP actually needs
 
@@ -225,9 +260,9 @@ In the order I would do it:
 1. **Real-time clock.** The only item that makes a popular game quietly worse.
    Shares the GPIO port already built for the gyro, so the hardware plumbing
    exists; this is the S3511 protocol on top of it.
-2. **The two regressions**, down from five. Hikaru no Go 2 is pinned to a
-   single loop address and GTA Advance to a single EEPROM write, so both are
-   narrow rather than open-ended.
+2. **GTA Advance's second fault.** No longer a regression against gpSP in the
+   boot sense, but it still stops short of gameplay. Narrowed to one generated
+   routine losing its prologue to the game's own self-patch.
 3. **Rumble.** Small, and it is the other half of the Twisted cartridge already
    emulated here.
 4. Solar, for Boktai. Neither core has it, so it is a shared gap and not part of
