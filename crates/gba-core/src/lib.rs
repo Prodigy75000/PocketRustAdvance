@@ -352,8 +352,8 @@ impl Gba {
     /// Is the cartridge driving its motor right now? Read once per frame and
     /// hand to the host; the game toggles it far faster than a phone's motor
     /// can follow, so this is a level, not an event.
-    pub fn rumble_on(&self) -> bool {
-        self.bus.sensors.rumble_on()
+    pub fn rumble_on(&mut self) -> bool {
+        self.bus.sensors.take_rumble()
     }
 
     /// Push the wall clock, in seconds since the Unix epoch, **already shifted

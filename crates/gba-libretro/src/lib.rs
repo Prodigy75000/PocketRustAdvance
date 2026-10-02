@@ -630,7 +630,7 @@ pub extern "C" fn retro_run() {
         // follow, so this is a level rather than an event, and it is only sent
         // when it changes: a front-end that queues every call would otherwise
         // get 60 a second.
-        if let (Some(gba), Some(iface)) = (&s.gba, s.rumble) {
+        if let (Some(gba), Some(iface)) = (&mut s.gba, s.rumble) {
             let on = gba.rumble_on();
             if on != s.rumble_last {
                 s.rumble_last = on;

@@ -273,6 +273,11 @@ pub struct Sensors {
     pub rtc: crate::rtc::Rtc,
     /// True when the cartridge has a rumble motor, driven off GPIO bit 3.
     pub has_rumble: bool,
+    /// Sticky: the motor was driven at ANY point since the front-end last
+    /// asked. Sampling the pin once a frame instead aliases badly, because a
+    /// game pulses it far faster than 60 Hz and a pulse that starts and ends
+    /// between two samples vanishes.
+    rumble_seen: bool,
 
     /// Combined state of the four GPIO lines for the clock path. The gyro path
     /// keeps its own `data`/`dir` bookkeeping and is left alone.
@@ -319,6 +324,7 @@ impl Sensors {
             kind: CartSensor::detect(rom),
             rtc: crate::rtc::Rtc::new(rom),
             has_rumble: detect_rumble(rom),
+            rumble_seen: false,
             rtc_pins: 0,
             rtc_latch: 0,
             data: 0,
@@ -349,6 +355,15 @@ impl Sensors {
     /// when it is not.
     pub fn rumble_on(&self) -> bool {
         self.has_rumble && self.data & self.dir & 0b1000 != 0
+    }
+
+    /// Was the motor driven at any point since this was last called? Clears on
+    /// read, so the caller gets one answer per frame and nothing is lost
+    /// between frames.
+    pub fn take_rumble(&mut self) -> bool {
+        let seen = self.rumble_seen || self.rumble_on();
+        self.rumble_seen = false;
+        seen
     }
 
     /// True when the top of the SRAM window is the tilt ADC rather than save
@@ -469,6 +484,9 @@ impl Sensors {
             0xC4 => {
                 let prev = self.data;
                 self.data = val & 0xF;
+                if self.rumble_on() {
+                    self.rumble_seen = true;
+                }
                 // Only lines configured as outputs can drive the sensor.
                 let driven = self.data & self.dir;
                 let was = prev & self.dir;
@@ -493,6 +511,9 @@ impl Sensors {
             }
             0xC6 => {
                 self.dir = val & 0xF;
+                if self.rumble_on() {
+                    self.rumble_seen = true;
+                }
                 true
             }
             0xC8 => {
@@ -676,6 +697,30 @@ mod tests {
         s.gpio_write(0xC6, 0b0011);
         s.gpio_write(0xC4, 0b1000);
         assert!(!s.rumble_on(), "an input line cannot be driving the motor");
+    }
+
+    /// A pulse that begins and ends between two polls must still be felt.
+    /// Sampling the pin once a frame loses it, and that is not theoretical:
+    /// Screw Breaker reports 18 rumbling frames of 1800 when sampled and 35
+    /// when latched, so a sampled reading missed half the rumble in the one
+    /// game that rumbles from a cold boot.
+    #[test]
+    fn a_pulse_between_two_polls_is_not_lost() {
+        let mut s = Sensors::new(&rom_with_code(b"V49E"));
+        s.gpio_write(0xC6, 0b1011);
+
+        // Motor on and off again, all within one frame.
+        s.gpio_write(0xC4, 0b1000);
+        s.gpio_write(0xC4, 0b0011);
+        assert!(!s.rumble_on(), "the pin is low by the time the frame ends");
+        assert!(s.take_rumble(), "but the pulse still happened and must be felt");
+
+        // And it clears, so one pulse is not reported forever.
+        assert!(!s.take_rumble(), "nothing has happened since");
+
+        // A pin still high at poll time counts too.
+        s.gpio_write(0xC4, 0b1000);
+        assert!(s.take_rumble());
     }
 
     /// A cartridge with no motor must never report one, whatever it writes to
