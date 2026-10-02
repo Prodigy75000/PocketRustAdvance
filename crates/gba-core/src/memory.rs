@@ -80,6 +80,12 @@ pub struct GbaBus {
     /// Debug write-watchpoint: current CPU PC, watched address (0 = off), and a
     /// capped log of (pc, value, width) writes that hit it.
     pub cur_pc: u32,
+    /// Bus cycle, and matching audio-clock position, at the start of the current
+    /// scanline. The APU runs on its own exact clock that the frame loop only
+    /// advances once per line, so without these a mid-line event is attributed to
+    /// a line boundary and lands up to 1232 cycles away from where it really is.
+    pub line_cycle_base: u64,
+    pub audio_line_base: u64,
     pub watch_addr: u32,
     /// Bytes covered by the watchpoint, starting at `watch_addr`. Defaults to 4.
     /// This is NOT cosmetic: a 4-byte window on 0x04000004 reports zero writes
@@ -355,6 +361,8 @@ impl GbaBus {
             cycles: 0,
             halted: false,
             cur_pc: 0,
+            line_cycle_base: 0,
+            audio_line_base: 0,
             watch_addr: 0,
             watch_len: 4,
             watch_pc: 0,
@@ -633,6 +641,12 @@ impl GbaBus {
         if control & 0x8000 == 0 {
             return;
         }
+        // A sound-FIFO channel's re-arm moves the read pointer back to the start
+        // of the game's PCM buffer, so the APU has to be caught up to this exact
+        // cycle first or refills land on the wrong side of the boundary.
+        if (ch == 1 || ch == 2) && (control >> 12) & 3 == 3 {
+            self.catch_up_audio(ch);
+        }
         self.dma_src[ch] = self.io_u32(base) & 0x0FFF_FFFF;
         self.dma_dst[ch] = self.io_u32(base + 4) & 0x0FFF_FFFF;
         let cl = self.io_u16(base + 8) as u32;
@@ -643,25 +657,56 @@ impl GbaBus {
         }
     }
 
+    /// Advance the APU to the exact cycle the CPU has reached inside this
+    /// scanline, and service any FIFO that has drained by then.
+    ///
+    /// The frame loop normally advances the audio clock once per line, after the
+    /// line's CPU work, so every mid-line event is attributed to the line
+    /// boundary. For a sound-FIFO DMA re-arm that is not good enough: the re-arm
+    /// resets the source pointer, so the question of which FIFO refills fall
+    /// before it and which after decides where in the game's PCM buffer the next
+    /// read lands. A whole line is 1.3 Direct Sound samples, so rounding the
+    /// re-arm to a line boundary moves the read by one refill, which is 16 bytes
+    /// past the end of a buffer with no slack. See
+    /// `the_sound_fifo_is_serviced_at_the_cycle_the_dma_is_rearmed`.
+    ///
+    /// Only `ch` is serviced, never the other sound channel. Soccer Kid re-arms
+    /// both of them back to back, and topping up the second one here would read
+    /// through the stale source pointer it is about to replace.
+    fn catch_up_audio(&mut self, ch: usize) {
+        let within = (self.cycles.saturating_sub(self.line_cycle_base))
+            .min(crate::ppu::CYCLES_PER_LINE as u64);
+        let target = self.audio_line_base + within;
+        let periods = [self.ds_timer_period(0), self.ds_timer_period(1)];
+        self.apu.generate(periods, target);
+        self.refill_fifo(ch);
+    }
+
     /// Top up the Direct Sound FIFOs from their sound DMA channels. Hardware
     /// requests a refill when a FIFO drops to <= 4 words (16 bytes); DMA1/DMA2 in
     /// "special" timing service FIFO_A/FIFO_B respectively, always 4 words wide.
     pub fn refill_fifos(&mut self) {
         for ch in [1usize, 2] {
-            let base = 0xB0 + ch as u32 * 12;
-            let control = self.io_u16(base + 10);
-            if control & 0x8000 == 0 || (control >> 12) & 3 != 3 {
-                continue; // channel off, or not sound-FIFO timing
-            }
-            let dst = self.io_u32(base + 4) & 0x07FF_FFFF;
-            let level = match dst {
-                0x0400_00A0 => self.apu.fifo_a_len(),
-                0x0400_00A4 => self.apu.fifo_b_len(),
-                _ => continue,
-            };
-            if level <= 16 {
-                self.run_sound_dma(ch, dst);
-            }
+            self.refill_fifo(ch);
+        }
+    }
+
+    /// Top up one Direct Sound FIFO if its channel is streaming and it has
+    /// drained to the half-empty mark hardware requests a transfer at.
+    fn refill_fifo(&mut self, ch: usize) {
+        let base = 0xB0 + ch as u32 * 12;
+        let control = self.io_u16(base + 10);
+        if control & 0x8000 == 0 || (control >> 12) & 3 != 3 {
+            return; // channel off, or not sound-FIFO timing
+        }
+        let dst = self.io_u32(base + 4) & 0x07FF_FFFF;
+        let level = match dst {
+            0x0400_00A0 => self.apu.fifo_a_len(),
+            0x0400_00A4 => self.apu.fifo_b_len(),
+            _ => return,
+        };
+        if level <= 16 {
+            self.run_sound_dma(ch, dst);
         }
     }
 
@@ -1584,6 +1629,46 @@ mod tests {
         );
         assert!(!b.dma_active, "the guard must be released once the drain ends");
         assert_eq!(b.dma_pending, 0, "nothing may be left queued");
+    }
+
+    #[test]
+    fn the_sound_fifo_is_serviced_at_the_cycle_the_dma_is_rearmed() {
+        // The frame loop advances the APU's clock once per scanline, after the
+        // line's CPU work, so by default every mid-line event is attributed to a
+        // line boundary. Re-arming a Direct Sound FIFO channel cannot tolerate
+        // that: the re-arm moves the read pointer back to the start of the game's
+        // PCM buffer, so which FIFO refills happen before it and which after
+        // decides where the next read lands. A scanline is 1232 cycles, about 1.3
+        // Direct Sound samples, so rounding the re-arm to a line boundary moves
+        // the read by a whole 16-byte refill.
+        //
+        // Golden Nugget Casino and Caesars Palace Advance mix exactly 608 bytes
+        // of PCM per two frames into a buffer with no slack, and ARM code sits
+        // immediately after it. Reading 16 bytes past the end plays that code as
+        // 8-bit samples: a loud tick several times a second, which is what the
+        // owner heard on hardware.
+        let mut b = bus();
+        b.write32(0x0400_00BC, 0x0300_0000, Access::NonSeq); // DMA1SAD
+        b.write32(0x0400_00C0, 0x0400_00A0, Access::NonSeq); // DMA1DAD = FIFO_A
+        b.write16(0x0400_00C4, 0, Access::NonSeq); // DMA1CNT_L
+
+        // The CPU is partway through a scanline when the re-arm store executes.
+        b.line_cycle_base = b.cycles;
+        b.audio_line_base = b.apu.cycle();
+        b.cycles += 1024;
+
+        // enable | 32-bit | repeat | timing = special (sound FIFO)
+        b.write16(0x0400_00C6, 0x8000 | 0x400 | 0x200 | (3 << 12), Access::NonSeq);
+
+        let advanced = b.apu.cycle() - b.audio_line_base;
+        assert!(
+            advanced >= 512,
+            "the APU must be caught up to the re-arm's own cycle, not left at the              start of the line; it advanced {advanced} cycles of the 1024 the CPU had run"
+        );
+        assert!(
+            advanced <= crate::ppu::CYCLES_PER_LINE as u64,
+            "and it must not run past the line it is inside ({advanced} cycles)"
+        );
     }
 
     #[test]

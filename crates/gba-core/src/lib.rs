@@ -188,6 +188,8 @@ impl Gba {
     /// Run one full frame (228 scanlines) and return the RGB555 framebuffer.
     pub fn run_frame(&mut self) -> &[u16] {
         for line in 0..TOTAL_LINES {
+            self.bus.line_cycle_base = self.bus.cycles;
+            self.bus.audio_line_base = self.audio_clock;
             self.bus.ppu.begin_line(line);
             self.bus.raise_ppu_irqs(line as u16);
             self.bus.step_timers();
@@ -296,7 +298,7 @@ impl Gba {
             // the APU state as it stands after the line's CPU work, then let the
             // sound DMA top up any Direct Sound FIFO that has drained. Paced off
             // the fixed audio clock, not bus.cycles, so DMA can't inflate the rate.
-            self.audio_clock += ppu::CYCLES_PER_LINE as u64;
+            self.audio_clock = self.bus.audio_line_base + ppu::CYCLES_PER_LINE as u64;
             let periods = [self.bus.ds_timer_period(0), self.bus.ds_timer_period(1)];
             self.bus.apu.generate(periods, self.audio_clock);
             self.bus.refill_fifos();
