@@ -853,11 +853,16 @@ impl GbaBus {
     ///
     /// This used to be a flat 5 cycles for every 16-bit ROM access and 8 for
     /// every 32-bit one, with the `Access` the CPU already passes thrown away.
-    /// That charges a sequential opcode fetch the price of a random one, and it
-    /// is the reason the emulated CPU got through far less work per frame than
-    /// real hardware: measured on Mario Kart Super Circuit, 85379 instructions
-    /// per frame against the ~152000 the game expects, which is the half speed
-    /// it shows in gameplay.
+    /// That charges a sequential opcode fetch the price of a random one, which
+    /// is wrong in itself whatever it nets out to.
+    ///
+    /// Do NOT read it as a throughput win. Measured on Mario Kart Super Circuit
+    /// over 1800 frames, instructions per frame are 41866 before and 41755
+    /// after under the open BIOS, and 40350 against 40284 on a direct boot: the
+    /// cheaper sequential fetches and the newly charged load/store N and I
+    /// cycles very nearly cancel. Host wall-clock is unchanged too, 1662 ms
+    /// against 1658 ms. What changes is the SHAPE of the timing, which is what
+    /// GTA Advance's teardown race turns on, not the total.
     ///
     /// ROM is one 16-bit bus, so a 32-bit access is two of them: the first pays
     /// N or S depending on how we arrived, the second is always sequential.
