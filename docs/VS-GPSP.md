@@ -1,6 +1,6 @@
 # PocketRustAdvance against gpSP
 
-Last measured 2026-10-02 at `a90c078`. gpSP is the GBA core Trophy Hub ships
+Last measured 2026-10-02 at `7c5ac16`. gpSP is the GBA core Trophy Hub ships
 today; this core is reachable only behind a debug preference that defaults off.
 
 This is the head-to-head the owner asked for when this work started: not an
@@ -155,7 +155,7 @@ Verified by reading both cores, not by running them.
 |---|---|---|
 | Tilt sensor (Yoshi Topsy-Turvy, Koro Koro Puzzle) | yes, verified on device | **no** |
 | Gyro sensor (WarioWare Twisted, Mawaru) | yes, verified on device | **no** |
-| Rumble (Drill Dozer, Twisted) | yes, as of `a90c078` | yes, with a core option |
+| Rumble (Drill Dozer, Twisted) | yes, as of `a90c078`, confirmed on device | yes, with a core option |
 | Real-time clock (Pokemon berries and tides, Boktai) | yes, as of `a50f8a5` | yes |
 | Solar sensor (Boktai) | no | no |
 
@@ -320,9 +320,13 @@ In the order I would do it:
 ~~GTA Advance's second fault~~, ~~the real-time clock~~ and ~~rumble~~ were all
 on this list on the morning of 2026-10-02. Compatibility is no longer on it at
 all. The clock is confirmed ticking on device in both Ruby and Sapphire, with a
-berry the one check still outstanding. Rumble is measured working offline
-(Screw Breaker drives the motor on 18 of 1800 frames from a cold boot) and wants
-a device smoke, since only hardware can say whether the phone actually buzzes.
+berry the one check still outstanding. Rumble is confirmed on device: Drill Dozer (USA)
+buzzes while drilling.
+
+Both are **parity items, not advantages**. gpSP has a clock and rumble too, and
+cartridge rumble is two titles in the whole GBA library. They were worth doing
+because each was a thing a swap would have given up, not because either is a
+reason to choose this core.
 
 **The link cable is what is left**, and it is worth being plain that it is the
 largest item of the four, not the smallest.
