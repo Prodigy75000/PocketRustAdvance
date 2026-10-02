@@ -78,6 +78,33 @@ impl CartSensor {
     }
 }
 
+/// Does this cartridge have a rumble motor?
+///
+/// Rumble is a separate axis from the motion sensors, because WarioWare Twisted
+/// has both: a gyro on GPIO bits 0 to 2 and the motor on bit 3. Drill Dozer has
+/// the motor and nothing else, so it needs the GPIO port opened for rumble
+/// alone.
+///
+/// Three characters, not one, and the extra two were measured rather than
+/// assumed. Across the whole 6124-ROM dump tree every game code beginning with
+/// V is one of the three Drill Dozer regions **except** "Game Hunter (V3)
+/// (Unl)", an unlicensed cart. Matching `V49` keeps all three regions, so a new
+/// region dump still works, and drops the collision for free. The gyro's
+/// one-character rule is left alone deliberately: narrowing it was considered
+/// and rejected there on the grounds that its false positives are harmless, and
+/// re-opening that is not this change's business.
+///
+/// ```text
+/// V49E  DRILL DOZER   Drill Dozer (USA)
+/// V49J  SCREWBREAKER  Screw Breaker (Japan)
+/// V49P  DRILLDOZER P  Drill Dozer (Europe)
+/// RZWE  WARIOTWISTED  WarioWare Twisted (USA)      also a gyro
+/// RZWJ  MAWARUWARIO   Mawaru Made in Wario (Japan) also a gyro
+/// ```
+pub fn detect_rumble(rom: &[u8]) -> bool {
+    matches!(rom.get(0xAC..0xAF), Some(b"V49") | Some(b"RZW"))
+}
+
 // --- Calibration -------------------------------------------------------------
 
 // Tilt centres and span, from GBATEK's measurements of a real cart: "X ranged
@@ -244,6 +271,9 @@ pub struct Sensors {
     /// the gyro and no cartridge carries both, so the port routes to whichever
     /// is present.
     pub rtc: crate::rtc::Rtc,
+    /// True when the cartridge has a rumble motor, driven off GPIO bit 3.
+    pub has_rumble: bool,
+
     /// Combined state of the four GPIO lines for the clock path. The gyro path
     /// keeps its own `data`/`dir` bookkeeping and is left alone.
     rtc_pins: u16,
@@ -288,6 +318,7 @@ impl Sensors {
         Sensors {
             kind: CartSensor::detect(rom),
             rtc: crate::rtc::Rtc::new(rom),
+            has_rumble: detect_rumble(rom),
             rtc_pins: 0,
             rtc_latch: 0,
             data: 0,
@@ -309,7 +340,15 @@ impl Sensors {
 
     /// True when this cartridge has GPIO hardware worth decoding at 0x080000C4.
     pub fn has_gpio(&self) -> bool {
-        self.kind == CartSensor::Gyro || self.rtc.present
+        self.kind == CartSensor::Gyro || self.rtc.present || self.has_rumble
+    }
+
+    /// Is the motor currently being driven? GPIO bit 3, and only while the game
+    /// has that line configured as an output: a line it is reading cannot be
+    /// driving the motor, and Drill Dozer leaves a stale 1 in the data register
+    /// when it is not.
+    pub fn rumble_on(&self) -> bool {
+        self.has_rumble && self.data & self.dir & 0b1000 != 0
     }
 
     /// True when the top of the SRAM window is the tilt ADC rather than save
@@ -382,7 +421,7 @@ impl Sensors {
                 // configured as an input. Output lines read back what was
                 // written to them.
                 let mut v = self.data & self.dir & 0xF;
-                if self.dir & 0b100 == 0 {
+                if self.dir & 0b100 == 0 && self.kind == CartSensor::Gyro {
                     self.reads.set(self.reads.get() + 1);
                     let bit = if self.gyro_bit < 16 {
                         (self.gyro_shifter >> (15 - self.gyro_bit)) & 1
@@ -437,7 +476,7 @@ impl Sensors {
                 // Bit 0 rising: start a conversion. The sample is latched here
                 // so a value arriving from the front-end mid-stream cannot tear
                 // the 12 bits the game is part-way through clocking out.
-                if driven & 1 != 0 && was & 1 == 0 {
+                if driven & 1 != 0 && was & 1 == 0 && self.kind == CartSensor::Gyro {
                     self.conversions += 1;
                     self.gyro_sample = self.sample_gyro();
                     // 4 dummy zero bits then 12 data bits, MSB first. The
@@ -447,7 +486,7 @@ impl Sensors {
                     self.gyro_bit = 0;
                 }
                 // Bit 1 rising: clock the next bit out.
-                if driven & 0b10 != 0 && was & 0b10 == 0 {
+                if driven & 0b10 != 0 && was & 0b10 == 0 && self.kind == CartSensor::Gyro {
                     self.gyro_bit = self.gyro_bit.saturating_add(1);
                 }
                 true
@@ -592,6 +631,62 @@ mod tests {
         let mut rom = vec![0u8; 0x1000];
         rom[0xAC..0xB0].copy_from_slice(code);
         rom
+    }
+
+    /// Rumble detection is three characters rather than one, and the two extra
+    /// were earned: across the whole 6124-ROM dump tree the only game code
+    /// beginning with V that is NOT Drill Dozer is an unlicensed cart called
+    /// Game Hunter. Keeping the region letter free means a new region dump
+    /// still works.
+    #[test]
+    fn rumble_is_found_by_three_characters_because_one_collides() {
+        for code in [b"V49E", b"V49J", b"V49P"] {
+            assert!(detect_rumble(&rom_with_code(code)), "Drill Dozer in every region");
+        }
+        for code in [b"RZWE", b"RZWJ"] {
+            assert!(detect_rumble(&rom_with_code(code)), "Twisted has a motor AND a gyro");
+        }
+        assert!(
+            !detect_rumble(&rom_with_code(b"V3 C")),
+            "Game Hunter (Unl) is the measured collision a one-character rule would take"
+        );
+        assert!(!detect_rumble(&rom_with_code(b"AXVE")), "Pokemon Ruby has no motor");
+        assert!(!detect_rumble(&[0u8; 4]), "a stub must not look like a rumble cart");
+    }
+
+    /// The motor follows GPIO bit 3, and only while the game has that line
+    /// configured as an output. Screw Breaker sets the direction register to
+    /// 0x0B exactly once, at frame 357, which is bits 0, 1 and 3 out and bit 2
+    /// in; without the direction gate a stale data bit would buzz the phone
+    /// through a line the game is reading.
+    #[test]
+    fn the_motor_follows_gpio_bit_three_only_while_it_is_an_output() {
+        let mut s = Sensors::new(&rom_with_code(b"V49E"));
+        assert!(s.has_rumble);
+        assert!(s.has_gpio(), "a rumble-only cart still needs the port opened");
+
+        s.gpio_write(0xC6, 0b1011); // the direction Screw Breaker actually sets
+        assert!(!s.rumble_on(), "nothing driven yet");
+        s.gpio_write(0xC4, 0b1000);
+        assert!(s.rumble_on(), "bit 3 driven high");
+        s.gpio_write(0xC4, 0b0011);
+        assert!(!s.rumble_on(), "bit 3 low again");
+
+        // Same data bit, but now the game is reading that line, not driving it.
+        s.gpio_write(0xC6, 0b0011);
+        s.gpio_write(0xC4, 0b1000);
+        assert!(!s.rumble_on(), "an input line cannot be driving the motor");
+    }
+
+    /// A cartridge with no motor must never report one, whatever it writes to
+    /// a port it does not have.
+    #[test]
+    fn a_cart_without_a_motor_never_rumbles() {
+        let mut s = Sensors::new(&rom_with_code(b"AXVE"));
+        assert!(!s.has_rumble);
+        s.gpio_write(0xC6, 0b1111);
+        s.gpio_write(0xC4, 0b1000);
+        assert!(!s.rumble_on());
     }
 
     /// The whole feature hangs off one byte, and the cost of getting it wrong

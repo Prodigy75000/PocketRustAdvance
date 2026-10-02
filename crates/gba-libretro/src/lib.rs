@@ -99,6 +99,23 @@ const RETRO_SENSOR_GYROSCOPE_X: u32 = 3;
 const RETRO_SENSOR_GYROSCOPE_Y: u32 = 4;
 const RETRO_SENSOR_GYROSCOPE_Z: u32 = 5;
 
+/// GET_RUMBLE_INTERFACE. Plain command number, no experimental bit: rumble has
+/// been in the stable libretro API for years, unlike the sensor interface above
+/// which carries 0x10000 and is easy to copy the shape of by mistake.
+const RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE: u32 = 23;
+
+const RETRO_RUMBLE_STRONG: u32 = 0;
+const RETRO_RUMBLE_WEAK: u32 = 1;
+
+type retro_set_rumble_state_t =
+    Option<unsafe extern "C" fn(port: c_uint, effect: c_uint, strength: u16) -> bool>;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct retro_rumble_interface {
+    set_rumble_state: retro_set_rumble_state_t,
+}
+
 type retro_set_sensor_state_t =
     Option<unsafe extern "C" fn(port: c_uint, action: c_uint, rate: c_uint) -> bool>;
 type retro_sensor_get_input_t = Option<unsafe extern "C" fn(port: c_uint, id: c_uint) -> f32>;
@@ -185,6 +202,10 @@ struct State {
     /// The front-end's sensor interface, present only when this cartridge has
     /// a sensor AND the front-end offered one.
     sensors: Option<retro_sensor_interface>,
+    rumble: Option<retro_rumble_interface>,
+    /// Last level handed to the host, so an unchanged level is not re-sent 60
+    /// times a second.
+    rumble_last: bool,
     /// Whether the front-end accepted the memory map. See
     /// `retro_get_memory_data`: when it did not, we must not answer SYSTEM_RAM.
     map_published: bool,
@@ -203,6 +224,8 @@ impl State {
             input_poll: None,
             input_state: None,
             sensors: None,
+            rumble: None,
+            rumble_last: false,
             map_published: false,
         }
     }
@@ -368,6 +391,7 @@ pub extern "C" fn retro_reset() {
 fn machine_rebuilt(s: &mut State) {
     publish_memory_map(s);
     enable_cart_sensors(s);
+    enable_cart_rumble(s);
 }
 
 #[no_mangle]
@@ -404,6 +428,28 @@ pub unsafe extern "C" fn retro_load_game(info: *const retro_game_info) -> bool {
 /// Universal Gravitation and Koro Koro Puzzle carry a two-axis accelerometer.
 /// Which one is decided by the game code, so an ordinary cartridge never turns
 /// a sensor on and never costs the device the power of running one.
+fn enable_cart_rumble(s: &mut State) {
+    s.rumble = None;
+    s.rumble_last = false;
+    let Some(env) = s.env else { return };
+    let Some(gba) = s.gba.as_ref() else { return };
+    if !gba.cart_has_rumble() {
+        return;
+    }
+    let mut iface = retro_rumble_interface { set_rumble_state: None };
+    let ok = unsafe {
+        env(
+            RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE,
+            &mut iface as *mut retro_rumble_interface as *mut c_void,
+        )
+    };
+    // As with the sensors, a front-end may answer true and leave the struct
+    // empty, so the pointer is what decides.
+    if ok && iface.set_rumble_state.is_some() {
+        s.rumble = Some(iface);
+    }
+}
+
 fn enable_cart_sensors(s: &mut State) {
     s.sensors = None;
     let Some(env) = s.env else { return };
@@ -580,6 +626,24 @@ pub extern "C" fn retro_run() {
             }
         }
 
+        // Rumble. The game toggles GPIO bit 3 far faster than a phone motor can
+        // follow, so this is a level rather than an event, and it is only sent
+        // when it changes: a front-end that queues every call would otherwise
+        // get 60 a second.
+        if let (Some(gba), Some(iface)) = (&s.gba, s.rumble) {
+            let on = gba.rumble_on();
+            if on != s.rumble_last {
+                s.rumble_last = on;
+                if let Some(set) = iface.set_rumble_state {
+                    let strength = if on { u16::MAX } else { 0 };
+                    unsafe {
+                        set(0, RETRO_RUMBLE_STRONG, strength);
+                        set(0, RETRO_RUMBLE_WEAK, strength);
+                    }
+                }
+            }
+        }
+
         // The cartridge clock, pushed every frame. A cartridge clock latches on
         // demand, so a stale value shows up as a game whose day never turns.
         if let Some(gba) = &mut s.gba {
@@ -746,6 +810,10 @@ mod tests {
         assert_eq!(
             RETRO_ENVIRONMENT_GET_SENSOR_INTERFACE, 0x1_0019,
             "GET_SENSOR_INTERFACE is 25 | EXPERIMENTAL"
+        );
+        assert_eq!(
+            RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, 23,
+            "GET_RUMBLE_INTERFACE is a PLAIN 23, with no EXPERIMENTAL bit;              copying the sensor interface's shape and ORing 0x10000 asks for a              different command and the front-end writes a different struct back"
         );
         if cmd == RETRO_ENVIRONMENT_SET_MEMORY_MAPS {
             let map = &*(data as *const retro_memory_map);

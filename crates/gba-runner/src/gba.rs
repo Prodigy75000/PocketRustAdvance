@@ -350,6 +350,7 @@ fn main() {
     }
     // Track the most "interesting" frame (most distinct colours) so a single PNG
     // lands on a real rendered screen, not a blank/forced-blank transition frame.
+    let mut rumble_frames: u64 = 0;
     let mut best_fb: Vec<u16> = Vec::new();
     let mut best_distinct = 0usize;
     let mut best_frame = 0u32;
@@ -471,6 +472,12 @@ fn main() {
                     .unwrap_or(gba_core::rtc::DEFAULT_UNIX_TIME),
             };
             gba.set_rtc_unix_time(t);
+        }
+        // Rumble is a level the game toggles, so count the frames it is on: a
+        // zero here is the difference between a motor that is wired wrong and a
+        // game that never asked for one.
+        if gba.cart_has_rumble() && gba.rumble_on() {
+            rumble_frames += 1;
         }
         // GBA_GYRO=<rad/s> and GBA_TILT=<x>,<y> in m/s^2 stand in for a phone's
         // sensors, so a motion cart can be exercised without a device.
@@ -868,6 +875,9 @@ fn main() {
     }
     if gba.cart_has_rtc() {
         println!("  RTC: present, {} clock latches by the game", gba.rtc_latches());
+    }
+    if gba.cart_has_rumble() {
+        println!("  RUMBLE: present, motor driven on {rumble_frames} of {frames} frames");
     }
     let counter = u32::from_le_bytes(gba.bus.iwram[0..4].try_into().unwrap());
     println!("IWRAM counter @0x03000000 = {counter}  (IRQs taken)");
