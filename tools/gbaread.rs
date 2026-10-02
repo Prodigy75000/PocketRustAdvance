@@ -321,11 +321,42 @@ fn main() {
             if args.iter().any(|a| a == "--autoinput") {
                 AUTOINPUT.store(true, std::sync::atomic::Ordering::Relaxed);
             }
+            // Per-frame watch in RESET mode: print each watched SYSTEM_RAM word
+            // whenever it changes, so a healthy core's trajectory around a scene
+            // change can be compared event-for-event against ours.
+            let sram2 = mem_data(2) as *const u8;
+            let ss2 = mem_size(2);
+            let mut prev: Vec<u32> = vec![0xDEAD_BEEF; addrs.len()];
             for i in 0..n {
                 FRAME.store(i as u32, std::sync::atomic::Ordering::Relaxed);
                 run();
+                if !sram2.is_null() && ss2 > 4 && !addrs.is_empty() {
+                    let w = std::slice::from_raw_parts(sram2, ss2);
+                    for (k, &a) in addrs.iter().enumerate() {
+                        let off = a & (ss2 - 1) & !3;
+                        let v = (w[off] as u32) | ((w[off+1] as u32)<<8) | ((w[off+2] as u32)<<16) | ((w[off+3] as u32)<<24);
+                        if v != prev[k] {
+                            println!("[watch] f{i:<4} {a:#010X} = {v:08X}");
+                            prev[k] = v;
+                        }
+                    }
+                }
             }
             println!("[mesen] ran {n} frames from reset");
+            // --serialize <path>: write the full core savestate after the run, so
+            // regions libretro does not expose (GBA EWRAM) can be mined offline.
+            if let Some(path) = args.iter().position(|a| a == "--serialize").and_then(|i| args.get(i + 1)) {
+                let ser: extern "C" fn(*mut c_void, usize) -> bool =
+                    std::mem::transmute(sym(lib, b"retro_serialize "));
+                let sz = ser_size();
+                let mut buf = vec![0u8; sz];
+                if ser(buf.as_mut_ptr() as *mut c_void, sz) {
+                    std::fs::write(path, &buf).expect("write state");
+                    println!("[mesen] serialized {sz} bytes to {path}");
+                } else {
+                    println!("[mesen] retro_serialize FAILED");
+                }
+            }
         } else if !unser(state.as_ptr() as *const c_void, state.len()) {
             panic!("retro_unserialize FAILED (version/size mismatch?)");
         } else {

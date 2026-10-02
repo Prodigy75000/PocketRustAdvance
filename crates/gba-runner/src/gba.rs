@@ -443,7 +443,16 @@ fn main() {
     // reports who is executing NOW rather than averaging in boot-time SWIs.
     let late_from = frames.saturating_sub(30);
     let (mut late_steps, mut late_bios) = (0u64, 0u64);
+    // GBA_LINEPC=<from>[:<to>]: per-scanline PC snapshot over a frame range.
+    let linepc: Option<(u32,u32)> = std::env::var("GBA_LINEPC").ok().map(|v| {
+        let (a,b) = v.split_once(':').unwrap_or((v.as_str(), v.as_str()));
+        (a.parse().unwrap_or(0), b.parse().unwrap_or(0))
+    });
     for f in 0..frames {
+        if let Some((a,b)) = linepc {
+            gba.linepc = f >= a && f <= b;
+            if gba.linepc { eprintln!("LINEPC frame {f}"); }
+        }
         if autoinput {
             let p = f % 24 < 4; // pulse A + Start to advance title and dialogue
             gba.set_button(gba_core::Button::A, p);
@@ -839,8 +848,8 @@ fn main() {
             gba.bus.watch_addr, gba.bus.watch_len.max(4),
             gba.bus.watch_total, gba.bus.watch_hits.len().min(32));
         let hits = &gba.bus.watch_hits;
-        for (pc, addr, val) in hits.iter().skip(hits.len().saturating_sub(32)) {
-            println!("    PC={pc:08X} w{} [{:07X}] = {val:08X}", addr >> 28, addr & 0x0FFF_FFFF);
+        for (frm, pc, addr, val) in hits.iter().skip(hits.len().saturating_sub(32)) {
+            println!("    f{:<4} L{:<3} m{:X} PC={:08X} w{} [{:07X}] = {val:08X}", frm >> 8, frm & 0xFF, pc >> 28, pc & 0x0FFF_FFFF, addr >> 28, addr & 0x0FFF_FFFF);
         }
     }
     let counter = u32::from_le_bytes(gba.bus.iwram[0..4].try_into().unwrap());

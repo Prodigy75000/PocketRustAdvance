@@ -31,6 +31,14 @@ pub fn execute<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u16) -> bool {
         0b001 => immediate(cpu, op), // format 3
         0b010 => {
             if (op >> 10) & 0x3F == 0b010000 {
+                // Format-4 internal cycles the ARM side also pays: a shift by
+                // register is 1S+1I, and MUL is 1S+mI with m set by how many
+                // significant bytes the accumulator (old Rd) has.
+                match (op >> 6) & 0xF {
+                    0x2 | 0x3 | 0x4 | 0x7 => bus.tick(1),
+                    0xD => bus.tick(super::arm::multiply_m(cpu.r[(op & 7) as usize])),
+                    _ => {}
+                }
                 alu(cpu, op) // format 4
             } else if (op >> 10) & 0x3F == 0b010001 {
                 hi_register(cpu, op) // format 5
@@ -303,6 +311,7 @@ fn hi_register(cpu: &mut Arm7tdmi, op: u32) -> bool {
 fn pc_relative_load<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool {
     let rd = ((op >> 8) & 7) as usize;
     let addr = (cpu.r[15] & !3).wrapping_add((op & 0xFF) << 2);
+    bus.tick(1); // all single-register loads are 1S+1N+1I
     cpu.r[rd] = bus.read32(addr, Access::NonSeq);
     false
 }
@@ -333,12 +342,17 @@ fn load_store_sign_extended<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) ->
             bus.write16(addr, cpu.r[rd] as u16, Access::NonSeq); // STRH
             return false;
         }
-        1 => bus.read8(addr, Access::NonSeq) as i8 as u32, // LDRSB
+        1 => {
+            bus.tick(1); // 1S+1N+1I
+            bus.read8(addr, Access::NonSeq) as i8 as u32 // LDRSB
+        }
         2 => {
+            bus.tick(1);
             let raw = bus.read16(addr, Access::NonSeq) as u32; // LDRH
             raw.rotate_right((addr & 1) * 8)
         }
         _ => {
+            bus.tick(1);
             let raw = bus.read16(addr, Access::NonSeq); // LDRSH
             if addr & 1 != 0 {
                 (raw >> 8) as u8 as i8 as u32
@@ -370,6 +384,7 @@ fn load_store_halfword<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool
     let rd = (op & 7) as usize;
     let addr = cpu.r[rb].wrapping_add(offset);
     if load {
+        bus.tick(1); // 1S+1N+1I
         let raw = bus.read16(addr, Access::NonSeq) as u32;
         cpu.r[rd] = raw.rotate_right((addr & 1) * 8);
     } else {
@@ -429,6 +444,7 @@ fn push_pop<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool {
     }
 
     if load {
+        bus.tick(1); // POP is an LDM: nS+1N+1I
         // POP: read upward from SP, then SP += 4*count.
         let mut addr = cpu.r[13];
         for i in 0..8 {
@@ -479,6 +495,9 @@ fn block_transfer<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool {
         return false;
     }
 
+    if load {
+        bus.tick(1); // LDMIA: nS+1N+1I
+    }
     let wb_value = cpu.r[rb].wrapping_add(4 * list.count_ones());
 
     let mut addr = cpu.r[rb];
@@ -572,6 +591,7 @@ fn software_interrupt<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool 
 /// Shared word/byte transfer used by the register/immediate/SP forms.
 fn transfer<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, addr: u32, rd: usize, load: bool, byte: bool) {
     if load {
+        bus.tick(1); // 1S+1N+1I
         cpu.r[rd] = if byte {
             bus.read8(addr, Access::NonSeq) as u32
         } else {

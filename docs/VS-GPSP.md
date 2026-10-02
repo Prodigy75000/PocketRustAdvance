@@ -17,8 +17,9 @@ silently degrades games that otherwise look fine.
 **No title that gpSP boots is now dead here.** Both of the two that were went in
 `d98365e`: Hikaru no Go 2 boots and plays, and Grand Theft Auto Advance gets from
 a black screen at the save-name prompt through its whole intro cutscene to the
-first mission card. GTA still stops after that, so it is listed below as
-partially working rather than as a win.
+first mission card. The stop after the mission card fell on 2026-10-02 with the
+CPU/DMA cycle-accounting fixes: GTA now reaches Portland gameplay from a cold
+boot under both the open BIOS and a real dump.
 
 The compatibility side of this page was rewritten on 2026-10-02. Three of the
 five regressions went away in one commit (`e1af4e6`, BIOS read protection), and
@@ -62,30 +63,36 @@ the protagonist, so it is better rather than correct.
 This is the whole list, and it is short. Every entry is the owner on hardware;
 nothing here comes from the automated cut.
 
-**Partially working here, works on gpSP (1 title, 2 ROMs)**
-
-| title | here |
-|---|---|
-| Grand Theft Auto Advance (USA, Europe) | boots, takes a save name, plays the whole intro cutscene and reaches the first mission card, then stops. Was a black screen the moment you confirmed a save name until `d98365e`; that part was never a save bug and there are still zero EEPROM transactions anywhere in the run. What remains is a second, unrelated fault in the game's runtime code generator, described below. |
+**Partially working here, works on gpSP: none.** Grand Theft Auto Advance
+headed this table until 2026-10-02. It now plays: boots, takes a save name,
+plays the intro cutscene and runs gameplay in Portland from a cold boot.
 
 Hikaru no Go 2 used to head this table as a white screen dead in all three BIOS
 modes. It boots to its title screen and into the kana name entry as of `d98365e`.
 
-**What is left in GTA Advance.** The game generates ARM code into IWRAM and then
-self-patches 64-byte windows of it. The generated routine at `0x03000100` is
-emitted complete, prologue included, and a later patch copies the block at
-`+0xA0` over its first 64 bytes, which takes the prologue with it. Its epilogue
-still pops fourteen registers that were never pushed, so it returns into the
-stack, executes a byte there as a SWI with a number no BIOS defines, and the
-BIOS's unbounded SWI table branches into unmapped space. The runaway is a
-consequence, not the fault.
+**What GTA Advance's second fault actually was.** Not a code generator: the
+game's cutscene streamer and its software rasteriser SHARE the IWRAM address
+0x03000100 across a scene change (the heap hands the freed stream buffer to the
+rasteriser). The streamer leaves one buffer swap pending every frame, retired by
+a V-count-IRQ callback at line 50. On hardware the scene teardown is still
+short of its code DMA when that IRQ lands, so the stale swap hits the dead
+buffer and the rasteriser loads intact. Our CPU ran the teardown stretch a few
+thousand cycles too fast (missing load/store broken-fetch N cycles, missing
+internal cycles, flat-rate DMA timing), finished the DMA one scanline before
+the IRQ, and the stale swap stamped 64 prologue-less bytes over the fresh code;
+the first call after the mission card then popped fourteen registers that were
+never pushed and ran off through the BIOS SWI table. The owner's two save
+states were captured after that stamp, so they still crash by construction;
+the fix is visible from a cold boot.
 
-It is NOT the bundled BIOS: from a cold boot the open BIOS and a real BIOS dump
-run off the same bogus SWI within two interrupts of each other. The divergence
-is upstream of the generator, in whatever our core tells the game that makes it
-emit that fragment list. Repro with no save state needed:
-
-    GBA_BIOS=<bios> GBA_AUTOINPUT=1 GBA_TRAP=1 ./gba.exe "Grand Theft Auto Advance (USA).gba" 900
+The fix is the missing hardware cycle accounting itself, not a tuned margin:
+after it the code DMA lands 22 scanlines after the swap retires. Corpus sweep
+at 1800 frames (dumps/_dmatime.tsv vs dumps/_catchup2.tsv): flagged 244 vs
+233, but every one of the 42 flag flips is a title caught mid-fade by the
+fixed 30-frame sampling window after the phase shift; all 42 render a full
+screen within 100 frames of the cutoff (scratch/reg_recheck2.txt), and 31
+formerly flagged titles flipped clean by the same mechanism. Zero titles
+actually broke.
 
 **Broken here, not known to work anywhere (1 title)**
 
@@ -261,8 +268,9 @@ Where there is evidence rather than assertion:
    by anything this core gets wrong. But gpSP's narrower map hides a class of set
    bug that this core will surface, and false unlocks reach a player's account and
    cannot be taken back.
-3. **One title falls short of gameplay** where gpSP reaches it, down from five
-   titles that regressed outright.
+3. ~~One title falls short of gameplay where gpSP reaches it~~ - cleared
+   2026-10-02 with the cycle-accounting fixes; no known title now regresses
+   against gpSP.
 
 ## What replacing gpSP actually needs
 
@@ -271,9 +279,8 @@ In the order I would do it:
 1. **Real-time clock.** The only item that makes a popular game quietly worse.
    Shares the GPIO port already built for the gyro, so the hardware plumbing
    exists; this is the S3511 protocol on top of it.
-2. **GTA Advance's second fault.** No longer a regression against gpSP in the
-   boot sense, but it still stops short of gameplay. Narrowed to one generated
-   routine losing its prologue to the game's own self-patch.
+2. ~~GTA Advance's second fault~~ - fixed 2026-10-02 (CPU/DMA cycle
+   accounting; the self-patch race described above).
 3. **Rumble.** Small, and it is the other half of the Twisted cartridge already
    emulated here.
 4. Solar, for Boktai. Neither core has it, so it is a shared gap and not part of

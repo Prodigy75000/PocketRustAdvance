@@ -54,6 +54,12 @@ pub fn execute<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool {
             if (0x8..=0xB).contains(&opcode4) && !s {
                 return psr_transfer(cpu, op);
             }
+            // A register-specified shift inserts one internal cycle (the barrel
+            // shifter needs the extra pipeline step; same step that makes R15
+            // read as PC+12 inside the instruction).
+            if (op >> 25) & 1 == 0 && (op >> 4) & 1 == 1 {
+                bus.tick(1);
+            }
             data_processing(cpu, op)
         }
         0b01 => single_data_transfer(cpu, bus, op), // LDR / STR
@@ -110,6 +116,9 @@ fn single_data_transfer<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> boo
     let mut wrote_pc = false;
 
     if load {
+        // Every single-register load spends one internal cycle moving the data
+        // from the bus into the register file (ARM7TDMI: LDR is 1S+1N+1I).
+        bus.tick(1);
         let value = if byte {
             bus.read8(addr, Access::NonSeq) as u32
         } else {
@@ -326,7 +335,7 @@ fn data_processing(cpu: &mut Arm7tdmi, op: u32) -> bool {
 /// Internal (I) cycle count `m` of the ARM7TDMI 32x8 early-terminating
 /// multiplier (ARM DDI 0029 datasheet): it consumes the multiplier operand 8
 /// bits per cycle, stopping once the remaining high bits are all 0 or all 1.
-fn multiply_m(rs: u32) -> u32 {
+pub(super) fn multiply_m(rs: u32) -> u32 {
     let hi = rs & 0xFFFF_FF00;
     if hi == 0 || hi == 0xFFFF_FF00 {
         1
@@ -433,6 +442,7 @@ fn swap<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool {
     // SWP with R15 operands reads PC+12 (both the base and the stored source).
     let addr = if rn == 15 { cpu.r[15].wrapping_add(4) } else { cpu.r[rn] };
     let src = if rm == 15 { cpu.r[15].wrapping_add(4) } else { cpu.r[rm] };
+    bus.tick(1); // SWP: 1S+2N+1I
     let value = if byte {
         let temp = bus.read8(addr, Access::NonSeq) as u32;
         bus.write8(addr, src as u8, Access::NonSeq);
@@ -545,6 +555,7 @@ fn halfword_signed_transfer<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) ->
     };
 
     if load {
+        bus.tick(1); // 1S+1N+1I, like every other single-register load
         let value = match sh {
             1 => {
                 // LDRH: zero-extend; an odd address rotates the halfword right 8.
@@ -599,6 +610,9 @@ fn block_data_transfer<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool
     let rn = ((op >> 16) & 0xF) as usize;
     let list = op & 0xFFFF;
     let n = list.count_ones();
+    if load {
+        bus.tick(1); // LDM is nS+1N+1I: one internal cycle for the whole block
+    }
 
     let base = cpu.r[rn];
 

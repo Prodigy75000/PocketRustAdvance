@@ -83,6 +83,8 @@ pub struct Gba {
     /// printing the branch that jumped there. Off by default (one cheap compare
     /// per instruction when enabled, nothing otherwise).
     pub trap_unused: bool,
+    /// Debug: print the executing PC at the top of every scanline this frame.
+    pub linepc: bool,
     trap_prev: u32,
     trap_from: u32,
     trapped: bool,
@@ -142,6 +144,7 @@ impl Gba {
             render_enabled: true,
             audio_clock: 0,
             trap_unused: false,
+            linepc: false,
             trap_prev: 0,
             trap_from: 0,
             trapped: false,
@@ -188,9 +191,17 @@ impl Gba {
     /// Run one full frame (228 scanlines) and return the RGB555 framebuffer.
     pub fn run_frame(&mut self) -> &[u16] {
         for line in 0..TOTAL_LINES {
+            if line == 0 {
+                self.bus.frame_no = self.bus.frame_no.wrapping_add(1);
+            }
             self.bus.line_cycle_base = self.bus.cycles;
             self.bus.audio_line_base = self.audio_clock;
             self.bus.ppu.begin_line(line);
+            if self.linepc {
+                let back = if self.cpu.thumb() { 4 } else { 8 };
+                eprintln!("LINEPC L{line:<3} pc={:08X} m{:X} halted={}",
+                    self.cpu.r[15].wrapping_sub(back), self.cpu.cpsr & 0xF, self.bus.halted as u8);
+            }
             self.bus.raise_ppu_irqs(line as u16);
             self.bus.step_timers();
             if line == 160 {
@@ -219,6 +230,11 @@ impl Gba {
                             if pend & (1 << b) != 0 {
                                 self.bus.dbg_irq_src[b] += 1;
                             }
+                        }
+                        if self.linepc {
+                            eprintln!("IRQTAKE L{line} cyc_in_line={} pend={:04X} from={:08X}",
+                                self.bus.cycles - self.bus.line_cycle_base, pend,
+                                self.cpu.r[15].wrapping_sub(if self.cpu.thumb() {4} else {8}));
                         }
                         self.cpu.take_irq(&mut self.bus);
                         self.bus.halted = false;
@@ -278,6 +294,7 @@ impl Gba {
                     if self.bus.watch_addr != 0 {
                         let back = if self.cpu.thumb() { 4 } else { 8 };
                         self.bus.cur_pc = self.cpu.r[15].wrapping_sub(back);
+                        self.bus.cur_mode = self.cpu.cpsr & 0xF;
                     }
                     // One compare on the hot path, with the pipeline offset folded
                     // into the bound: R15 runs 8 bytes (ARM) or 4 (Thumb) ahead of
@@ -339,6 +356,51 @@ impl Gba {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every single-register load spends one internal cycle moving the loaded
+    /// value into the register file (LDR = 1S+1N+1I on the ARM7TDMI). Run the
+    /// same Thumb program from IWRAM twice, once with eight loads and once
+    /// with eight register adds, and the loads must cost exactly their data
+    /// access (1 cycle in IWRAM) plus that internal cycle more. IWRAM code has
+    /// no sequential/non-sequential distinction, so this isolates the I-cycle.
+    #[test]
+    fn a_load_costs_one_internal_cycle_on_top_of_its_data_access() {
+        use crate::bus::{Access, Bus};
+        fn run(body_op: u16) -> u64 {
+            use crate::bus::{Access, Bus};
+            // ROM (ARM): ldr r0, [pc]; bx r0  -> Thumb code at 0x03000005.
+            let mut rom = vec![0u8; 0x100];
+            for (i, w) in [0xE59F_0000u32, 0xE12F_FF10, 0x0300_0005].iter().enumerate() {
+                rom[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            let mut gba = Gba::new(rom, Vec::new());
+            // Thumb at 0x03000004: ldr r2, =0x03000100 ; 8x body ; b .
+            let prog: [u16; 11] = [
+                0x4A06, // ldr r2, [pc, #0x18]  (literal at 0x03000020)
+                body_op, body_op, body_op, body_op, body_op, body_op, body_op, body_op,
+                0xE7FE, // b .
+                0x0000,
+            ];
+            for (i, h) in prog.iter().enumerate() {
+                let a = 0x0300_0004 + i as u32 * 2;
+                gba.bus.write16(a, *h, Access::NonSeq);
+            }
+            gba.bus.write32(0x0300_0020, 0x0300_0100, Access::NonSeq);
+            let setup_cycles = gba.bus.cycles;
+            // 2 ARM instructions + ldr r2 + 8 body instructions = 11 steps.
+            for _ in 0..11 {
+                gba.cpu.step(&mut gba.bus);
+            }
+            gba.bus.cycles - setup_cycles
+        }
+        let loads = run(0x6811); // ldr r1, [r2]
+        let adds = run(0x1C11); // adds r1, r2, #0
+        assert_eq!(
+            loads - adds,
+            8 * (1 + 1),
+            "each load must pay its 1-cycle IWRAM data access plus 1 internal cycle"
+        );
+    }
 
     #[test]
     fn save_state_roundtrip_is_deterministic() {

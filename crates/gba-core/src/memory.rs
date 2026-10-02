@@ -80,6 +80,20 @@ pub struct GbaBus {
     /// Debug write-watchpoint: current CPU PC, watched address (0 = off), and a
     /// capped log of (pc, value, width) writes that hit it.
     pub cur_pc: u32,
+    pub cur_mode: u32,
+    /// Set by any DATA access (and by DMA). A load or store interrupts the
+    /// CPU's sequential fetch stream, so the next opcode fetch is charged at
+    /// the non-sequential cost; this is the implicit N in the ARM7TDMI's
+    /// documented LDR = 1S+1N+1I and STR = 2N timings, and mGBA charges the
+    /// same delta (its LOAD/STORE_POST_BODY). Only fetches from the Game Pak
+    /// bus are affected in practice: IWRAM/BIOS are 1-cycle either way and
+    /// EWRAM's non-sequential and sequential costs are equal. A data access on
+    /// the cart bus additionally tears down the prefetch unit.
+    data_break: bool,
+    /// Real frame counter (incremented by run_frame at line 0) so debug watch
+    /// hits can be stamped with the true frame/scanline instead of a
+    /// cycle-derived estimate that drifts with DMA overshoot.
+    pub frame_no: u32,
     /// Bus cycle, and matching audio-clock position, at the start of the current
     /// scanline. The APU runs on its own exact clock that the frame loop only
     /// advances once per line, so without these a mid-line event is attributed to
@@ -95,7 +109,7 @@ pub struct GbaBus {
     /// When non-zero, only record watch hits made by this PC. A buffer that is
     /// written by several unrelated routines drowns the one you care about.
     pub watch_pc: u32,
-    pub watch_hits: Vec<(u32, u32, u32)>,
+    pub watch_hits: Vec<(u32, u32, u32, u32)>,
     /// Every write that hit the watch block, counted even after `watch_hits` has
     /// rolled. `watch_hits` keeps the MOST RECENT writes, because the interesting
     /// one is nearly always the last: an init sequence floods the first hundred.
@@ -361,6 +375,9 @@ impl GbaBus {
             cycles: 0,
             halted: false,
             cur_pc: 0,
+            cur_mode: 0,
+            data_break: false,
+            frame_no: 0,
             line_cycle_base: 0,
             audio_line_base: 0,
             watch_addr: 0,
@@ -567,6 +584,31 @@ impl GbaBus {
         self.dma_active = false;
     }
 
+    /// Cycles one DMA bus access costs, per region and width. The same
+    /// WAITCNT-derived costs the CPU pays, minus the prefetch unit: DMA owns
+    /// the bus outright, there is no prefetcher running ahead of it and the
+    /// CPU core is stalled for the duration, so the raw N/S cost is the whole
+    /// story. EWRAM, PALRAM and VRAM have no N/S distinction.
+    fn dma_access_cycles(&self, addr: u32, word: bool, seq: bool) -> u64 {
+        match (addr >> 24) & 0xF {
+            0x2 => if word { 6 } else { 3 },       // EWRAM (16-bit bus, 2 WS)
+            0x5 | 0x6 => if word { 2 } else { 1 }, // PALRAM / VRAM (16-bit bus)
+            region @ 0x8..=0xD => {
+                let ws = ((region - 8) >> 1) as usize;
+                let halves = if word { 2 } else { 1 };
+                let mut total = 0;
+                for i in 0..halves {
+                    // Only the first half of a 32-bit access can be
+                    // non-sequential; the second always follows on.
+                    total += if seq || i > 0 { self.waits.rom_s[ws] } else { self.waits.rom_n[ws] };
+                }
+                total
+            }
+            0xE | 0xF => self.waits.sram,
+            _ => 1, // BIOS / IWRAM / I/O / OAM
+        }
+    }
+
     fn run_dma(&mut self, ch: usize) {
         let base = 0xB0 + ch as u32 * 12;
         let control = self.io_u16(base + 10);
@@ -588,7 +630,7 @@ impl GbaBus {
         if ee_src || ee_dst {
             self.save.eeprom_set_dma_len(self.dma_count[ch]);
         }
-        for _ in 0..self.dma_count[ch] {
+        for n in 0..self.dma_count[ch] {
             if ee_src || ee_dst {
                 let v = if ee_src {
                     self.save.eeprom_read_bit() as u32
@@ -607,10 +649,30 @@ impl GbaBus {
                 let v = self.read16_raw(src & !1) as u32;
                 self.write(dst & !1, v, 2);
             }
+            // Hardware DMA timing is 2N + 2(n-1)S + xI: the first transfer
+            // pays the non-sequential cost on both ends, every later one the
+            // sequential cost. The old model charged a flat `size` cycles per
+            // transfer regardless of region, which made big EWRAM/ROM blits
+            // run at roughly double speed. GTA Advance's cutscene streamer is
+            // phase-locked to those blits: undercharging them let the main
+            // pass stage its next code chunk AFTER the per-frame V-count
+            // promote instead of before it, so a promote stayed pending across
+            // the scene switch and stamped a stale 64-byte head over the
+            // freshly loaded rasteriser at 0x03000100.
+            let seq = n > 0;
+            self.cycles += self.dma_access_cycles(src, word, seq)
+                + self.dma_access_cycles(dst, word, seq);
             src = step(src, src_ctrl);
             dst = step(dst, dst_ctrl);
-            self.cycles += size as u64;
         }
+        // Internal overhead: 2I, or 4I when both ends sit on the Game Pak bus.
+        self.cycles += if (8..=0xD).contains(&((src >> 24) & 0xF))
+            && (8..=0xD).contains(&((dst >> 24) & 0xF)) { 4 } else { 2 };
+        // A DMA that used the cart bus leaves the CPU's prefetch buffer empty.
+        if matches!((src >> 24) & 0xF, 0x8..=0xF) || matches!((dst >> 24) & 0xF, 0x8..=0xF) {
+            self.prefetch_credit = 0;
+        }
+        self.data_break = true;
         self.dma_src[ch] = src;
         if control & 0x4000 != 0 {
             self.if_ |= 1 << (8 + ch); // DMA complete IRQ
@@ -719,16 +781,23 @@ impl GbaBus {
         let control = self.io_u16(base + 10);
         let src_ctrl = (control >> 7) & 3;
         let mut src = self.dma_src[ch];
-        for _ in 0..4 {
+        for n in 0..4 {
             let v = self.read32_raw(src & !3);
             self.write(dst, v, 4);
+            // Same real bus costs as any other DMA (the destination is the
+            // FIFO port, a 1-cycle I/O access; the source pays its region).
+            self.cycles += self.dma_access_cycles(src, true, n > 0) + 1;
             src = match src_ctrl {
                 1 => src.wrapping_sub(4),
                 2 => src,
                 _ => src.wrapping_add(4),
             };
-            self.cycles += 4;
         }
+        self.cycles += 2; // internal DMA overhead
+        if matches!((src >> 24) & 0xF, 0x8..=0xF) {
+            self.prefetch_credit = 0;
+        }
+        self.data_break = true;
         self.dma_src[ch] = src;
         if control & 0x4000 != 0 {
             self.if_ |= 1 << (8 + ch); // DMA-complete IRQ
@@ -754,6 +823,29 @@ impl GbaBus {
         if line == stat >> 8 && stat & 0x20 != 0 {
             self.if_ |= 1 << 2; // V-counter match
         }
+    }
+
+    /// Charge one CPU bus access, deciding fetch-vs-data from the address.
+    /// A data access on the Game Pak bus aborts the prefetch unit, and the
+    /// opcode fetch that follows it restarts at the non-sequential cost; that
+    /// is a documented consequence of the cart bus having a single owner.
+    /// The opcode fetch is recognised as the access at (or pipeline-adjacent
+    /// to) the address `set_fetch_pc` recorded this step.
+    fn charge(&mut self, addr: u32, word: bool, a: Access) {
+        let cart = matches!((addr >> 24) & 0xF, 0x8..=0xF);
+        let is_fetch = addr.wrapping_sub(self.last_fetch) <= 4;
+        let mut seq = a == Access::Seq;
+        if !is_fetch {
+            if cart {
+                // Data on the cart bus also kills the prefetcher outright.
+                self.prefetch_credit = 0;
+            }
+            self.data_break = true;
+        } else if self.data_break {
+            seq = false;
+            self.data_break = false;
+        }
+        self.cycles += self.access_cycles(addr, word, seq);
     }
 
     /// Cycles for one access, honouring WAITCNT and whether the access is
@@ -1017,7 +1109,7 @@ impl GbaBus {
         {
             self.watch_total += 1;
             // Stash width in the top nibble (palette values are 16-bit, so free).
-            self.watch_hits.push((self.cur_pc, (width << 28) | addr, val));
+            self.watch_hits.push(((self.frame_no << 8) | (self.ppu.read_reg16(6) as u32 & 0xFF), (self.cur_mode << 28) | self.cur_pc, (width << 28) | addr, val));
             if self.watch_hits.len() > 512 {
                 self.watch_hits.drain(..256);
             }
@@ -1280,6 +1372,54 @@ mod tests {
 
     fn bus() -> GbaBus {
         GbaBus::new(vec![0; 0x100], Vec::new())
+    }
+
+    /// A load or store interrupts the CPU's sequential fetch stream, so the
+    /// opcode fetch after it pays the non-sequential cost. This is the implicit
+    /// 1N in the ARM7TDMI's documented LDR = 1S+1N+1I / STR = 2N timings, and
+    /// it is what GTA Advance's scene teardown is paced by: without it the
+    /// teardown outran the V-count IRQ whose callback retires the cutscene
+    /// streamer's pending buffer swap, and the stale swap then stamped 64 bytes
+    /// of pixels over the freshly loaded IWRAM rasteriser at 0x03000100.
+    #[test]
+    fn a_data_access_makes_the_next_opcode_fetch_non_sequential() {
+        let mut b = bus();
+        // Default WAITCNT: ROM 16-bit N = 5 cycles, S = 3, prefetch off.
+        b.set_fetch_pc(0x0800_0000, false);
+        b.read32(0x0800_0000, Access::NonSeq);
+        let c0 = b.cycles;
+        b.set_fetch_pc(0x0800_0004, false);
+        b.read32(0x0800_0004, Access::Seq);
+        assert_eq!(b.cycles - c0, 6, "straight-line ARM opcode fetch: S+S = 3+3");
+        let c1 = b.cycles;
+        b.read32(0x0200_0000, Access::NonSeq);
+        assert_eq!(b.cycles - c1, 6, "EWRAM word data access: two 16-bit halves at 2 waits");
+        let c2 = b.cycles;
+        b.set_fetch_pc(0x0800_0008, false);
+        b.read32(0x0800_0008, Access::Seq);
+        assert_eq!(b.cycles - c2, 8, "opcode fetch after a data access: N+S = 5+3");
+        // And the stream is sequential again afterwards.
+        let c3 = b.cycles;
+        b.set_fetch_pc(0x0800_000C, false);
+        b.read32(0x0800_000C, Access::Seq);
+        assert_eq!(b.cycles - c3, 6, "one broken fetch, not a permanent penalty");
+    }
+
+    /// DMA transfers pay the real per-region bus cycles (2N + 2(n-1)S + 2I),
+    /// not a flat rate. A 4-word immediate DMA3 from ROM to EWRAM at default
+    /// wait-states costs: reads 8+6+6+6, writes 6*4, plus 2 internal cycles;
+    /// the enabling I/O write itself is 1 cycle. The old flat model charged
+    /// 4 cycles per word and made big blits run at double speed, which is half
+    /// of how GTA Advance's teardown won a race it must lose.
+    #[test]
+    fn dma_is_charged_real_bus_cycles() {
+        let mut b = bus();
+        b.set_fetch_pc(0x0800_0000, false);
+        b.write32(0x0400_00D4, 0x0800_0000, Access::NonSeq); // DMA3SAD
+        b.write32(0x0400_00D8, 0x0200_0000, Access::NonSeq); // DMA3DAD
+        let c0 = b.cycles;
+        b.write32(0x0400_00DC, 0x8400_0004, Access::NonSeq); // enable, 32-bit, 4 words
+        assert_eq!(b.cycles - c0, 1 + (8 + 6 + 6 + 6) + 4 * 6 + 2);
     }
 
     /// The BIOS region must read back its contents only to code executing
@@ -1859,11 +1999,11 @@ mod tests {
 
 impl Bus for GbaBus {
     fn read8(&mut self, addr: u32, a: Access) -> u8 {
-        self.cycles += self.access_cycles(addr, false, a == Access::Seq);
+        self.charge(addr, false, a);
         self.read8_raw(addr)
     }
     fn read16(&mut self, addr: u32, a: Access) -> u16 {
-        self.cycles += self.access_cycles(addr, false, a == Access::Seq);
+        self.charge(addr, false, a);
         // Direct EEPROM access (e.g. a game polling write-ready).
         if self.save.is_eeprom() && (addr >> 24) == 0xD {
             return self.save.eeprom_read_bit() as u16;
@@ -1871,15 +2011,15 @@ impl Bus for GbaBus {
         self.read16_raw(addr)
     }
     fn read32(&mut self, addr: u32, a: Access) -> u32 {
-        self.cycles += self.access_cycles(addr, true, a == Access::Seq);
+        self.charge(addr, true, a);
         self.read32_raw(addr)
     }
     fn write8(&mut self, addr: u32, val: u8, a: Access) {
-        self.cycles += self.access_cycles(addr, false, a == Access::Seq);
+        self.charge(addr, false, a);
         self.write(addr, val as u32, 1);
     }
     fn write16(&mut self, addr: u32, val: u16, a: Access) {
-        self.cycles += self.access_cycles(addr, false, a == Access::Seq);
+        self.charge(addr, false, a);
         if self.save.is_eeprom() && (addr >> 24) == 0xD {
             self.save.eeprom_write_bit(val as u8);
             return;
@@ -1887,7 +2027,7 @@ impl Bus for GbaBus {
         self.write(addr, val as u32, 2);
     }
     fn write32(&mut self, addr: u32, val: u32, a: Access) {
-        self.cycles += self.access_cycles(addr, true, a == Access::Seq);
+        self.charge(addr, true, a);
         self.write(addr, val, 4);
     }
     fn tick(&mut self, n: u32) {
