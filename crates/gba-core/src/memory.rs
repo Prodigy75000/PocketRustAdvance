@@ -22,6 +22,9 @@ pub struct GbaBus {
     /// which is what an unmapped address reads back.
     last_fetch: u32,
     last_fetch_thumb: bool,
+    /// Which exception last vectored into the BIOS, so the value it leaves
+    /// behind on the way out is the right one of the two.
+    bios_entry_irq: bool,
     /// What the BIOS leaves on the bus. A read of region 0 from outside the
     /// BIOS returns THIS rather than the BIOS contents. Starts at the value
     /// GBATEK documents as left over after the boot sequence.
@@ -253,6 +256,7 @@ impl GbaBus {
             exec_in_bios: false,
             last_fetch: 0,
             last_fetch_thumb: false,
+            bios_entry_irq: false,
             bios_prefetch: 0xE129_F000,
             ewram: vec![0; 256 * 1024].into_boxed_slice(),
             iwram: vec![0; 32 * 1024].into_boxed_slice(),
@@ -1160,8 +1164,13 @@ mod tests {
         // Leaving re-protects it, and what it leaves behind is the documented
         // constant rather than anything out of our own image.
         b.set_fetch_pc(0x0300_0000, false);
-        assert_eq!(b.read32(0, Access::NonSeq), 0xE3A0_2004);
+        assert_eq!(b.read32(0, Access::NonSeq), 0xE3A0_2004, "an SWI leaves this");
         assert_eq!(b.read32(4, Access::NonSeq), 0xE3A0_2004);
+
+        // An IRQ leaves the other one. Vector in at 0x18, then back out.
+        b.set_fetch_pc(0x18, false);
+        b.set_fetch_pc(0x0300_0000, false);
+        assert_eq!(b.read32(0, Access::NonSeq), 0xE25E_F004, "an IRQ leaves this");
     }
 
     /// Above the 16 KB BIOS, region 0 is unmapped, and unmapped is open bus:
@@ -1592,6 +1601,13 @@ impl Bus for GbaBus {
         self.last_fetch = addr;
         self.last_fetch_thumb = thumb;
         let now_in_bios = addr < 0x4000;
+        // Vectoring in. 0x18 is the IRQ entry and 0x08 the SWI entry, and the
+        // two leave different words behind.
+        match addr {
+            0x18 => self.bios_entry_irq = true,
+            0x08 => self.bios_entry_irq = false,
+            _ => {}
+        }
         if self.exec_in_bios && !now_in_bios {
             // Just left the BIOS, so stamp what it leaves behind on the bus.
             //
@@ -1604,10 +1620,13 @@ impl Bus for GbaBus {
             // of a literal pool) and runs on any of the three values GBATEK
             // documents. mGBA hardcodes this same value for the same reason.
             //
-            // GBATEK lists 0xE25EF004 after an IRQ and 0xE3A02004 after an
-            // SWI. SWIs outnumber everything else by a wide margin and no
-            // measured title distinguishes the two, so this does not try to.
-            self.bios_prefetch = 0xE3A0_2004;
+            // GBATEK lists 0xE25EF004 after an IRQ (the `subs pc, lr, #4` that
+            // ends the handler) and 0xE3A02004 after an SWI (a `mov r2, #4` in
+            // its epilogue), so which one it is depends on how the BIOS was
+            // entered. A running game leaves through the IRQ path every frame,
+            // so defaulting to the SWI value for both was wrong most of the
+            // time.
+            self.bios_prefetch = if self.bios_entry_irq { 0xE25E_F004 } else { 0xE3A0_2004 };
         }
         self.exec_in_bios = now_in_bios;
     }
