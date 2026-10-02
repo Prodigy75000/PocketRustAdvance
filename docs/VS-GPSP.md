@@ -1,6 +1,6 @@
 # PocketRustAdvance against gpSP
 
-Last measured 2026-10-02 at `d98365e`. gpSP is the GBA core Trophy Hub ships
+Last measured 2026-10-02 at `ebda31a`. gpSP is the GBA core Trophy Hub ships
 today; this core is reachable only behind a debug preference that defaults off.
 
 This is the head-to-head the owner asked for when this work started: not an
@@ -229,6 +229,17 @@ Where there is evidence rather than assertion:
   whole I/O block from the sound FIFO, clearing DISPCNT and DISPSTAT's V-blank
   IRQ enable. mGBA tests the same edge in `GBADMAWriteCNT_HI`. Four other titles
   improved with it, and the corpus showed no regression.
+
+- **A sound FIFO was refilled at scanline granularity rather than at the cycle
+  its DMA was re-armed. Fixed 2026-10-02 in `ebda31a`.** The frame loop advances
+  the APU once per line, so a re-arm executed mid-line was accounted up to 1232
+  cycles away, which is 1.3 Direct Sound samples and enough to move a 16-byte
+  FIFO refill to the wrong side of it. Golden Nugget Casino and Caesars Palace
+  Advance mix exactly 608 bytes of PCM per two frames with no slack and ARM code
+  immediately after the buffer, so the stray refill played that code as 8-bit
+  samples: a loud tick several times a second, which the owner heard on hardware
+  and gpSP does not have. This one was introduced by the DMA edge fix above and
+  found by owner device report, not by the corpus.
 
 - Ghost Rider and Kao the Kangaroo show garbage in the same transitions on gpSP
   and are clean here, so this class of bug runs in both directions.
