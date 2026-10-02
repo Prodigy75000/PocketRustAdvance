@@ -17,10 +17,14 @@ pub struct GbaBus {
     /// `set_fetch_pc`, which maintains this from the fetch address so that
     /// exception entry is covered by the same rule.
     exec_in_bios: bool,
-    /// The last opcode word the BIOS fetched. A read of region 0 from outside
-    /// the BIOS returns THIS rather than the BIOS contents. The initial value
-    /// is the one GBATEK documents as left over after the boot sequence, which
-    /// is what a direct-booted (HLE) game sees, since its BIOS never runs.
+    /// Where the CPU last fetched an instruction from, and whether that fetch
+    /// was a halfword. Together they reconstruct what is sitting on the bus,
+    /// which is what an unmapped address reads back.
+    last_fetch: u32,
+    last_fetch_thumb: bool,
+    /// What the BIOS leaves on the bus. A read of region 0 from outside the
+    /// BIOS returns THIS rather than the BIOS contents. Starts at the value
+    /// GBATEK documents as left over after the boot sequence.
     ///
     /// Deliberately NOT in the save state, because the serialize format is a
     /// binding cross-core contract and this costs nothing to rebuild: the next
@@ -247,6 +251,8 @@ impl GbaBus {
             sensors,
             bios: b.into_boxed_slice(),
             exec_in_bios: false,
+            last_fetch: 0,
+            last_fetch_thumb: false,
             bios_prefetch: 0xE129_F000,
             ewram: vec![0; 256 * 1024].into_boxed_slice(),
             iwram: vec![0; 32 * 1024].into_boxed_slice(),
@@ -688,11 +694,37 @@ impl GbaBus {
 
     // --- Reads: composed little-endian from raw bytes (no side effects) --------
 
+    /// What is sitting on the bus: the last instruction the CPU fetched. An
+    /// unmapped address reads this back. A Thumb fetch only drove sixteen
+    /// lines, so the halfword appears in both halves of the word, which is the
+    /// behaviour mGBA models in `GBALoadBad` for every region but IWRAM, OAM
+    /// and the BIOS.
+    fn open_bus(&self) -> u32 {
+        let a = self.last_fetch;
+        // Executing in unmapped space already (a runaway PC): there is nothing
+        // to report and reading it back here would recurse.
+        if (a >> 24) & 0xF == 0 && a >= 0x4000 {
+            return self.bios_prefetch;
+        }
+        if self.last_fetch_thumb {
+            let h = self.read16_raw(a & !1) as u32;
+            h | (h << 16)
+        } else {
+            self.read32_raw(a & !3)
+        }
+    }
+
     fn read8_raw(&self, addr: u32) -> u8 {
         match (addr >> 24) & 0xF {
-            // Region 0 is read-protected: see `set_fetch_pc`. Outside the BIOS
-            // the byte comes from the stale prefetch word, selected by the low
-            // two address bits exactly as an open-bus read is.
+            // Above the 16 KB BIOS, region 0 is simply NOT MAPPED, and unmapped
+            // is open bus: whatever the CPU last put on it. It is emphatically
+            // not the BIOS, neither mirrored into it (which is what this used
+            // to do) nor the BIOS's own stale prefetch (which is what the first
+            // cut of the read protection did). Mario vs Donkey Kong reads
+            // 0x0000F026 and Harry Potter Quidditch 0x00005498, and handing
+            // either of them a BIOS value hangs the game.
+            0x0 if addr >= 0x4000 => (self.open_bus() >> (8 * (addr & 3))) as u8,
+            // Inside the BIOS, read-protected: see `set_fetch_pc`.
             0x0 if !self.exec_in_bios => (self.bios_prefetch >> (8 * (addr & 3))) as u8,
             0x0 => *self.bios.get((addr & 0x3FFF) as usize).unwrap_or(&0),
             0x2 => self.ewram[(addr & 0x3_FFFF) as usize],
@@ -732,7 +764,7 @@ impl GbaBus {
         match (addr >> 24) & 0xF {
             // Only while executing inside it; otherwise the byte path below
             // synthesises the protected value.
-            0x0 if self.exec_in_bios => Some((&self.bios, (addr & 0x3FFF) as usize)),
+            0x0 if self.exec_in_bios && addr < 0x4000 => Some((&self.bios, (addr & 0x3FFF) as usize)),
             0x2 => Some((&self.ewram, (addr & 0x3_FFFF) as usize)),
             0x3 => Some((&self.iwram, (addr & 0x7FFF) as usize)),
             // The GPIO port lives inside the ROM window at 0x080000C4..C9, so
@@ -1093,7 +1125,7 @@ mod tests {
     }
 
     /// The BIOS region must read back its contents only to code executing
-    /// inside it. Everywhere else it reads the last opcode the BIOS fetched.
+    /// inside it. Everywhere else it reads what the BIOS left on the bus.
     ///
     /// Legends of Wrestling II and both European Tetris Worlds builds all boot
     /// on this and all three died without it: each calls through a pointer that
@@ -1103,32 +1135,63 @@ mod tests {
     /// a path it was never meant to take.
     #[test]
     fn the_bios_reads_back_only_to_code_running_inside_it() {
-        // A BIOS whose first two words are recognisable and are NOT the value
-        // the protected read is supposed to return.
+        // A BIOS whose first two words are recognisable and are NOT either of
+        // the values a protected read is supposed to return.
         let mut img = vec![0u8; 16 * 1024];
         img[0..4].copy_from_slice(&0x1111_1111u32.to_le_bytes());
         img[4..8].copy_from_slice(&0x2222_2222u32.to_le_bytes());
         let mut b = GbaBus::new(vec![0; 0x100], img);
 
         // Boot leaves the CPU fetching from the cartridge.
-        b.set_fetch_pc(0x0800_0000);
+        b.set_fetch_pc(0x0800_0000, false);
         assert_eq!(
             b.read32(0, Access::NonSeq),
             0xE129_F000,
-            "from outside, region 0 must return the stale prefetch word"
+            "from outside, region 0 must return what the BIOS left on the bus"
         );
         assert_eq!(b.read8(1, Access::NonSeq), 0xF0, "byte reads select from that word");
         assert_eq!(b.read16(2, Access::NonSeq), 0xE129, "and so do halfword reads");
 
-        // Executing inside the BIOS, it reads normally, and the prefetch
-        // follows the fetch address.
-        b.set_fetch_pc(4);
+        // Executing inside the BIOS, it reads normally.
+        b.set_fetch_pc(4, false);
         assert_eq!(b.read32(0, Access::NonSeq), 0x1111_1111, "from inside, real contents");
-        assert_eq!(b.bios_prefetch, 0x2222_2222, "the prefetch tracks the fetch address");
+        assert_eq!(b.read32(4, Access::NonSeq), 0x2222_2222);
 
-        // Leaving again re-protects it, now with the value the BIOS left behind.
-        b.set_fetch_pc(0x0300_0000);
-        assert_eq!(b.read32(0, Access::NonSeq), 0x2222_2222);
+        // Leaving re-protects it, and what it leaves behind is the documented
+        // constant rather than anything out of our own image.
+        b.set_fetch_pc(0x0300_0000, false);
+        assert_eq!(b.read32(0, Access::NonSeq), 0xE3A0_2004);
+        assert_eq!(b.read32(4, Access::NonSeq), 0xE3A0_2004);
+    }
+
+    /// Above the 16 KB BIOS, region 0 is unmapped, and unmapped is open bus:
+    /// the last instruction the CPU fetched, NOT the BIOS and not the BIOS's
+    /// prefetch. Mario vs Donkey Kong reads 0x0000F026 and Harry Potter
+    /// Quidditch World Cup 0x00005498; handing either of them a BIOS value
+    /// hangs the game, which is how this was found.
+    #[test]
+    fn unmapped_region_zero_is_open_bus_not_the_bios() {
+        let mut img = vec![0u8; 16 * 1024];
+        img[0x3026..0x302A].copy_from_slice(&0x4444_4444u32.to_le_bytes());
+        // ROM carrying a recognisable word where the CPU will be fetching.
+        let mut rom = vec![0u8; 0x100];
+        rom[0x40..0x44].copy_from_slice(&0x7777_7777u32.to_le_bytes());
+        let mut b = GbaBus::new(rom, img);
+
+        b.set_fetch_pc(0x0800_0040, false);
+        // 0xF026 masked into the BIOS would be 0x3026, which is what this used
+        // to return. It must not.
+        assert_eq!(
+            b.read32(0x0000_F026, Access::NonSeq),
+            0x7777_7777,
+            "unmapped must read the CPU's own last fetch, not a BIOS mirror"
+        );
+        assert_ne!(b.read32(0x0000_F026, Access::NonSeq), 0x4444_4444);
+
+        // A Thumb fetch only drove sixteen lines, so the halfword appears in
+        // both halves.
+        b.set_fetch_pc(0x0800_0040, true);
+        assert_eq!(b.read32(0x0000_F026, Access::NonSeq), 0x7777_7777);
     }
 
     /// Build a 16 KB image carrying only the six words the r12 repair targets.
@@ -1525,10 +1588,27 @@ impl Bus for GbaBus {
     /// goes through the null pointer to the word at address 0, which is the
     /// BIOS reset branch. The PC runs away into unmapped space inside the first
     /// frame and never comes back.
-    fn set_fetch_pc(&mut self, addr: u32) {
-        self.exec_in_bios = addr < 0x4000;
-        if self.exec_in_bios {
-            self.bios_prefetch = self.read32_raw(addr & !3);
+    fn set_fetch_pc(&mut self, addr: u32, thumb: bool) {
+        self.last_fetch = addr;
+        self.last_fetch_thumb = thumb;
+        let now_in_bios = addr < 0x4000;
+        if self.exec_in_bios && !now_in_bios {
+            // Just left the BIOS, so stamp what it leaves behind on the bus.
+            //
+            // This is a CONSTANT on purpose, and the constant is the real
+            // BIOS's, not ours. Reading our own image's last opcode is the
+            // mechanically faithful thing and it produces values no hardware
+            // ever shows, because the bundled open BIOS is a clean-room
+            // rewrite whose literal pools sit in different places. Mario vs
+            // Donkey Kong hangs on one of them (it saw 0x00001524, a word out
+            // of a literal pool) and runs on any of the three values GBATEK
+            // documents. mGBA hardcodes this same value for the same reason.
+            //
+            // GBATEK lists 0xE25EF004 after an IRQ and 0xE3A02004 after an
+            // SWI. SWIs outnumber everything else by a wide margin and no
+            // measured title distinguishes the two, so this does not try to.
+            self.bios_prefetch = 0xE3A0_2004;
         }
+        self.exec_in_bios = now_in_bios;
     }
 }

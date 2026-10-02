@@ -73,6 +73,9 @@ pub trait Bus {
     /// from `prefetch[1]`). Tracking only the branch targets costs three games
     /// their late frames; tracking every fetch costs about 2% of throughput.
     ///
+    /// `thumb` is the fetch width, which open bus needs: a Thumb fetch leaves
+    /// one halfword on the bus and it reads back duplicated into both halves.
+    ///
     /// Default no-op so the TomHarte harness bus need not model it.
-    fn set_fetch_pc(&mut self, _addr: u32) {}
+    fn set_fetch_pc(&mut self, _addr: u32, _thumb: bool) {}
 }

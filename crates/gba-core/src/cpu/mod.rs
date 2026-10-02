@@ -318,7 +318,7 @@ impl Arm7tdmi {
         let fetch_addr = self.r[15];
         // Where instructions are coming from, which decides whether the BIOS
         // region is readable and what a protected read of it returns.
-        bus.set_fetch_pc(fetch_addr);
+        bus.set_fetch_pc(fetch_addr, thumb);
         let (fetched, width) = if thumb {
             (bus.read16(fetch_addr, Access::Seq) as u32, 2)
         } else {
@@ -387,7 +387,7 @@ impl Arm7tdmi {
         // Same hook as the prefetch in `step`, and it has to be here too:
         // exception entry refills straight into the BIOS vectors without ever
         // running a step, so this is what makes those vectors readable.
-        bus.set_fetch_pc(target);
+        bus.set_fetch_pc(target, self.thumb());
         if self.thumb() {
             let aligned = target & !1;
             self.pipeline[0] = bus.read16(aligned, Access::NonSeq) as u32;
