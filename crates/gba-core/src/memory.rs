@@ -1313,7 +1313,12 @@ impl GbaBus {
         // RCNT 8000 -> 80A0 -> 80A2 at boot and this is the 80A2 step.
         if touches_rcnt && self.rfu.is_some() {
             let rcnt = self.io_u16(0x134);
-            if rcnt & 0x20 != 0 && prev_rcnt & 0x02 == 0 {
+            // Only while RCNT selects general-purpose mode (bit 15 set, bit 14
+            // clear). Outside it those low bits are not pins at all, so acting
+            // on them would let a game in serial mode power-cycle the adapter
+            // by accident.
+            let gpio_mode = rcnt & 0xC000 == 0x8000;
+            if gpio_mode && rcnt & 0x20 != 0 && prev_rcnt & 0x02 == 0 {
                 if std::env::var_os("GBA_RFULOG").is_some() {
                     eprintln!("  RFU reset  RCNT {prev_rcnt:04X} -> {rcnt:04X}");
                 }
