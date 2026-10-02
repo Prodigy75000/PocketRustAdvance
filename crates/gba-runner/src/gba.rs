@@ -775,6 +775,48 @@ fn main() {
             println!();
         }
     }
+    // GBA_VRAMDUMP=<path>: the whole 96 KB of VRAM followed by palette RAM, so
+    // both bitmap-mode pages can be rendered offline and compared. This is what
+    // separated "the text is not in the bitmap" from "the text was never drawn"
+    // on Babar to the Rescue: page 1 held the scene with an EMPTY dialogue bar,
+    // which said the glyphs had to be sprites before any sprite code was read.
+    if let Some(path) = std::env::var_os("GBA_VRAMDUMP") {
+        let p = &gba.bus.ppu;
+        let mut out = p.vram.to_vec();
+        out.extend_from_slice(&p.palram);
+        match std::fs::write(&path, &out) {
+            Ok(()) => println!("  wrote {} bytes of VRAM+palette to {path:?}", out.len()),
+            Err(e) => eprintln!("  could not write {path:?}: {e}"),
+        }
+    }
+    // GBA_OAMDUMP: every enabled sprite, so "how many glyphs are actually on
+    // screen" is one command rather than a guess. Babar's dialogue turned out to
+    // be five sprites where a sentence needs dozens.
+    if std::env::var_os("GBA_OAMDUMP").is_some() {
+        let p = &gba.bus.ppu;
+        let h = |i: usize| u16::from_le_bytes([p.oam[i], p.oam[i + 1]]);
+        println!("  OAM (enabled sprites only):");
+        for i in 0..128 {
+            let (a0, a1, a2) = (h(i * 8), h(i * 8 + 2), h(i * 8 + 4));
+            let affine = a0 & 0x100 != 0;
+            if !affine && a0 & 0x200 != 0 {
+                continue;
+            }
+            if (a0 >> 14) & 3 == 3 {
+                continue;
+            }
+            let x = {
+                let v = (a1 & 0x1FF) as i32;
+                if v >= 256 { v - 512 } else { v }
+            };
+            println!(
+                "    [{i:>3}] y={:>3} x={:>4} tile={:>4} prio={} pal={:>2} {} objmode={} shape={} size={}",
+                a0 & 0xFF, x, a2 & 0x3FF, (a2 >> 10) & 3, (a2 >> 12) & 0xF,
+                if a0 & 0x2000 != 0 { "8bpp" } else { "4bpp" },
+                (a0 >> 10) & 3, (a0 >> 14) & 3, (a1 >> 14) & 3
+            );
+        }
+    }
     println!("steps={}  (~{} instr/frame)", gba.steps, gba.steps / frames.max(1) as u64);
     // Who is executing over the closing frames: a cart that crashed back into
     // the BIOS boot animation still draws a colourful, animated screen, so the
