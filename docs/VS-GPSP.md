@@ -1,6 +1,6 @@
 # PocketRustAdvance against gpSP
 
-Last measured 2026-10-02 at `e1af4e6`. gpSP is the GBA core Trophy Hub ships
+Last measured 2026-10-02 at `9e2a100`. gpSP is the GBA core Trophy Hub ships
 today; this core is reachable only behind a debug preference that defaults off.
 
 This is the head-to-head the owner asked for when this work started: not an
@@ -51,43 +51,57 @@ Every verdict below is the owner on hardware, not the sweep.
 everGirl is a qualified win: it reaches gameplay here with a sprite flicker on
 the protagonist, so it is better rather than correct.
 
-### gpSP runs these, this core cannot
+### Open compatibility issues, in full
+
+This is the whole list, and it is short. Every entry is the owner on hardware;
+nothing here comes from the automated cut.
+
+**Broken here, works on gpSP (2 titles, 3 ROMs)**
 
 | title | here |
 |---|---|
-| Hikaru no Go 2 (Japan) | white screen, dead in all three BIOS modes |
-| Grand Theft Auto Advance (USA, Europe) | black screen on confirming a save name |
+| Hikaru no Go 2 (Japan) | white screen, dead in all three BIOS modes. A loop in IWRAM at `0x03000B0C` pinned from frame 10 to 1800, interrupts never enabled. Hikaru no Go 1 is fine. |
+| Grand Theft Auto Advance (USA, Europe) | black screen on confirming a save name, on the first EEPROM write |
 
-Three entries left this table on 2026-10-02 and all three were the same bug.
-**Tetris Worlds** (both European builds and the USA one), **Hagane no
-Renkinjutsushi Omoide no Sonata** and the **Frogger family** were every one of
-them reading the BIOS region from outside the BIOS, which we allowed and
-hardware does not. They now draw: Tetris Worlds at 228 colours from 1, Frogger
-Adventures 2 at 2037 from 16. Awaiting the owner on hardware.
+**Broken here, not known to work anywhere (1 title)**
 
-Hikaru no Go 2 is the one real regression left, and it is narrow rather than
-vague: a pinned loop in IWRAM at `0x03000B0C` from frame 10 through frame 1800,
-interrupts never enabled, no background ever turned on. Hikaru no Go 1 runs
-here without trouble.
+| title | here |
+|---|---|
+| Blades of Thunder (USA) | hangs on garbage VRAM. It walks an allocator free list whose head is zero; the list was never built, and until 2026-10-02 an over-permissive BIOS read was handing it an accidental escape. |
 
-### Neither core runs these
+**Cosmetic, gameplay unaffected (1 title, 2 ROMs)**
 
-Crash and Spyro Superpack (identical white screen after picking a game from the
+| title | here |
+|---|---|
+| Babar to the Rescue (USA, Europe) | one dialogue line renders as two stray glyphs, and a transition shows an undrawn bitmap page. Narrowed to number formatting: the broken line contains "99 99 100" and the pure-text line after it is perfect. |
+
+**Broken on both cores, so not a swap risk**
+
+Crash and Spyro Superpack (white screen after picking a game from the
 collection), Mortal Kombat Deadly Alliance and Tournament Edition (both stick on
 the Midway logo), the first title in 2 Game Pack Hot Wheels. Madden NFL 06 runs
-on both and has the same obscured in-game menu on both.
+on both with the same obscured in-game menu.
 
-**Net: eight titles gained, two lost.** That is no longer a wash. It is still
-not the main argument for a swap, because two of the eight are prototypes or
-collections rather than games anyone is waiting for, but compatibility has
-stopped being a reason against.
+**Never smoked, flagged by the BIOS-crash signal, about 13 ROMs**
 
-Not yet smoked on hardware, flagged by the BIOS-share column rather than the
-colour count, and several of them moved on 2026-10-02: Motocross Maniacs
-Advance (USA + Japan), Disney Princess (five language builds), Gadget Racers and
-Penny Racers, Banjo-Pilot (USA + Europe), Konami Collector's Series Arcade
-Classics, Minna no Shiiku Series 2, and Hagane no Renkinjutsushi Meisou no
-Rondo, a second Hagane title that was missing from this page entirely.
+2 Games in 1 Finding Nemo plus The Incredibles, 3 Games in One Super Breakout
+plus Millipede plus Lunar Lander (USA and Europe), Disney Princess (five
+language builds), Famista Advance (Japan), Gadget Racers and Penny Racers,
+Minna no Shiiku Series 2 (Japan), NHL Hitz 20-03 (USA), Scooby-Doo 2 Monsters
+Unleashed (Europe). Candidates, not failures: the same signal has flagged
+Super Bust-A-Move, Madden NFL 06, the Powerpuff Girls pair and Babar, all four
+of which the owner has since played without trouble.
+
+### What the automated number is worth, which is not much
+
+**The sweep flags 223 of 2727 rows and that is not a failure count.** It pulses
+A and Start forever, which walks a game into pause menus and soft resets no
+player visits, and it scores a frame by counting colours, which calls a dark
+title screen dead. Six of the 223 are titles the owner has personally cleared.
+Over 2026-10-01 and 02 it pointed at healthy games three separate times and
+missed three real regressions that only owner device reports caught.
+
+Quote the titles above. Do not quote a pass rate.
 
 ## Features
 
