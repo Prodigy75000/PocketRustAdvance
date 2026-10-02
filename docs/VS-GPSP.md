@@ -1,6 +1,6 @@
 # PocketRustAdvance against gpSP
 
-Last measured 2026-10-02 at `f768034`. gpSP is the GBA core Trophy Hub ships
+Last measured 2026-10-02 at `a50f8a5`. gpSP is the GBA core Trophy Hub ships
 today; this core is reachable only behind a debug preference that defaults off.
 
 This is the head-to-head the owner asked for when this work started: not an
@@ -10,9 +10,9 @@ would cost, with the losses first-class. Where a number is unmeasured it says so
 ## The short version
 
 A swap today would gain motion-control support, which gpSP does not have at all,
-and seven titles gpSP cannot boot. It would cost real-time clock support and
-rumble. The clock is the serious one: it is the only item on the list that
-silently degrades games that otherwise look fine.
+and seven titles gpSP cannot boot. It would cost rumble, and the link cable,
+which is the real one. The real-time clock was the serious item on this list
+until 2026-10-02 and is now implemented.
 
 **No title that gpSP boots is dead here, and the compatibility list is closed.**
 Both of the two that were went on 2026-10-02: Hikaru no Go 2 boots and plays
@@ -156,7 +156,7 @@ Verified by reading both cores, not by running them.
 | Tilt sensor (Yoshi Topsy-Turvy, Koro Koro Puzzle) | yes, verified on device | **no** |
 | Gyro sensor (WarioWare Twisted, Mawaru) | yes, verified on device | **no** |
 | Rumble (Drill Dozer, Twisted) | **no** | yes, with a core option |
-| Real-time clock (Pokemon berries and tides, Boktai) | **no** | yes |
+| Real-time clock (Pokemon berries and tides, Boktai) | yes, as of `a50f8a5` | yes |
 | Solar sensor (Boktai) | no | no |
 
 gpSP has no sensor emulation whatsoever: the only matches for gyro, tilt or
@@ -169,11 +169,22 @@ gpSP at any level of skill, because the input they require does not exist. A swa
 does not make those games play better, it makes them completable. Nothing else on
 this page changes what a player can finish.
 
-**The real-time clock is the strongest argument against.** It is absent here and
-present in gpSP, and unlike a black screen its absence is invisible: Pokemon
-Ruby, Sapphire and Emerald boot and play fine without it and quietly never grow a
-berry or change tide. That is a worse failure mode than a game that does not
-start, and those are among the most played GBA titles there are.
+**The real-time clock was the strongest argument against, and it closed on
+2026-10-02 (`a50f8a5`).** It is worth recording why it mattered: unlike a black
+screen its absence was invisible. Pokemon Ruby, Sapphire and Emerald boot and
+play perfectly well without a clock and quietly never grow a berry or change a
+tide, which is a worse failure mode than a game that does not start, on some of
+the most played titles there are.
+
+The chip is a Seiko S-3511A on the same GPIO port as the gyro, found by the
+Nintendo RTC library's version string in the ROM, which hits exactly 30 of the
+2727 licensed ROMs and no false positives. All seven clock carts checked latch
+the clock while booting. **Not yet confirmed on hardware**: the test that counts
+is a Pokemon save left overnight with a berry planted, which is the owner's to
+run.
+
+The one piece still missing for these cartridges is the **solar sensor**, which
+neither core has. It is why both Boktai rows sit flagged in the sweep.
 
 ## Performance
 
@@ -274,7 +285,8 @@ Where there is evidence rather than assertion:
 
 ## Risks a swap would carry
 
-1. **No real-time clock.** Silent degradation in heavily played titles.
+1. ~~No real-time clock~~ - implemented 2026-10-02 (`a50f8a5`), pending a
+   hardware confirmation that a berry actually grows.
 2. **A more complete memory map exposes racy achievement sets.** Advance Wars 2
    awards "Shiny Design Room" seconds after boot here. That one is a flaw in RA
    set 1768, reproduced by the owner on Linkboy and ticketed, and it is not caused
@@ -289,21 +301,19 @@ Where there is evidence rather than assertion:
 
 In the order I would do it:
 
-1. **Real-time clock.** The only item that makes a popular game quietly worse.
-   Shares the GPIO port already built for the gyro, so the hardware plumbing
-   exists; this is the S3511 protocol on top of it.
-2. **Rumble.** Small, and it is the other half of the Twisted cartridge already
+1. **Rumble.** Small, and it is the other half of the Twisted cartridge already
    emulated here.
-3. **Link cable and RFU.** Not a defect, but it is the actual reason gpSP is the
+2. **Link cable and RFU.** Not a defect, but it is the actual reason gpSP is the
    incumbent: it was chosen for multiplayer, not for compatibility. Until this
    core serves that, a swap trades a working feature for everything else on this
    page. The serial registers are modelled with no cable attached (`1a58d70`),
    which is the floor to build on, not the feature.
-4. Solar, for Boktai. Neither core has it, so it is a shared gap and not part of
+3. Solar, for Boktai. Neither core has it, so it is a shared gap and not part of
    the promotion case.
 
-~~GTA Advance's second fault~~ was item 2 here until 2026-10-02. Compatibility is
-no longer on this list at all.
+~~GTA Advance's second fault~~ and ~~the real-time clock~~ were both on this
+list until 2026-10-02. Compatibility is no longer on it at all, and the clock is
+done pending a hardware check.
 
 Performance work is deliberately absent. The margin is structural but sits above
 the range anyone can perceive, so chasing it would buy nothing a player notices.
