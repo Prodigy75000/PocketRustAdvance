@@ -185,8 +185,16 @@ extern "C" fn ip_cb() {}
 static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static PRESS_FROM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(9999);
 static PRESS_LEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+// --autoinput replays gba-runner's GBA_AUTOINPUT exactly: A and Start held for
+// frames 0..4 of every 24. Without the identical pattern the oracle walks a
+// different path through the menus and the work-RAM diff is meaningless.
+static AUTOINPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 extern "C" fn is_cb(_port: c_uint, dev: c_uint, _idx: c_uint, id: c_uint) -> i16 {
     use std::sync::atomic::Ordering::Relaxed;
+    if AUTOINPUT.load(Relaxed) && dev == 1 && (id == 3 || id == 8) {
+        // RETRO_DEVICE_ID_JOYPAD_START = 3, _A = 8.
+        return if FRAME.load(Relaxed) % 24 < 4 { 1 } else { 0 };
+    }
     if dev == 1 && id == 3 {
         let f = FRAME.load(Relaxed);
         let from = PRESS_FROM.load(Relaxed);
@@ -310,7 +318,13 @@ fn main() {
         // measure a game's own output geometry (overscan) without needing a save.
         if args[3] == "RESET" {
             let n: usize = args.iter().position(|a| a == "--frames").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(400);
-            for _ in 0..n { run(); }
+            if args.iter().any(|a| a == "--autoinput") {
+                AUTOINPUT.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            for i in 0..n {
+                FRAME.store(i as u32, std::sync::atomic::Ordering::Relaxed);
+                run();
+            }
             println!("[mesen] ran {n} frames from reset");
         } else if !unser(state.as_ptr() as *const c_void, state.len()) {
             panic!("retro_unserialize FAILED (version/size mismatch?)");
