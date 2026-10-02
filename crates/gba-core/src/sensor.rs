@@ -240,6 +240,17 @@ fn clamp12(v: i32) -> u16 {
 pub struct Sensors {
     pub kind: CartSensor,
 
+    /// The cartridge clock, if this cart has one. It shares the GPIO port with
+    /// the gyro and no cartridge carries both, so the port routes to whichever
+    /// is present.
+    pub rtc: crate::rtc::Rtc,
+    /// Combined state of the four GPIO lines for the clock path. The gyro path
+    /// keeps its own `data`/`dir` bookkeeping and is left alone.
+    rtc_pins: u16,
+    /// Last value the CPU wrote to the data register, re-applied when it
+    /// changes a line's direction.
+    rtc_latch: u16,
+
     // GPIO port at 0x080000C4/C6/C8. Only the low 4 bits of each are wired.
     data: u16,
     dir: u16,
@@ -276,6 +287,9 @@ impl Sensors {
     pub fn new(rom: &[u8]) -> Self {
         Sensors {
             kind: CartSensor::detect(rom),
+            rtc: crate::rtc::Rtc::new(rom),
+            rtc_pins: 0,
+            rtc_latch: 0,
             data: 0,
             dir: 0,
             ctrl: 0,
@@ -295,7 +309,7 @@ impl Sensors {
 
     /// True when this cartridge has GPIO hardware worth decoding at 0x080000C4.
     pub fn has_gpio(&self) -> bool {
-        self.kind == CartSensor::Gyro
+        self.kind == CartSensor::Gyro || self.rtc.present
     }
 
     /// True when the top of the SRAM window is the tilt ADC rather than save
@@ -352,6 +366,16 @@ impl Sensors {
         if !self.has_gpio() || self.ctrl & 1 == 0 {
             return None;
         }
+        if self.rtc.present {
+            // The clock drives its lines when the port is written, so a read is
+            // just the latched bus state.
+            return Some(match offset {
+                0xC4 => self.rtc_pins & 0xF,
+                0xC6 => self.dir & 0xF,
+                0xC8 => self.ctrl & 1,
+                _ => 0,
+            });
+        }
         Some(match offset {
             0xC4 => {
                 // Serial data appears on bit 2, and only while that line is
@@ -379,6 +403,28 @@ impl Sensors {
     pub fn gpio_write(&mut self, offset: u32, val: u16) -> bool {
         if !self.has_gpio() {
             return false;
+        }
+        if self.rtc.present {
+            // Writing either the data or the direction register re-drives the
+            // CPU-owned lines and then clocks the chip, which is the only thing
+            // that advances its state machine.
+            match offset {
+                0xC4 => {
+                    self.rtc_latch = val & 0xF;
+                    self.rtc_pins &= !self.dir;
+                    self.rtc_pins |= self.rtc_latch & self.dir;
+                    self.rtc.read_pins(&mut self.rtc_pins, self.dir);
+                }
+                0xC6 => {
+                    self.dir = val & 0xF;
+                    self.rtc_pins &= !self.dir;
+                    self.rtc_pins |= self.rtc_latch & self.dir;
+                    self.rtc.read_pins(&mut self.rtc_pins, self.dir);
+                }
+                0xC8 => self.ctrl = val & 1,
+                _ => {}
+            }
+            return true;
         }
         match offset {
             0xC4 => {
@@ -506,6 +552,23 @@ impl Sensors {
         w.u16(self.tilt_x);
         w.u16(self.tilt_y);
         w.bool(self.tilt_ready);
+    }
+
+    /// The clock block is appended at the very end of the save state rather
+    /// than folded in here, so a state written before the clock existed still
+    /// loads. `unix_time` is deliberately NOT stored: it is the wall clock, the
+    /// front-end pushes it every frame, and restoring a stale one would make a
+    /// loaded save think no time had passed.
+    pub fn serialize_rtc(&self, w: &mut crate::state::Writer) {
+        w.u16(self.rtc_pins);
+        w.u16(self.rtc_latch);
+        self.rtc.serialize(w);
+    }
+
+    pub fn deserialize_rtc(&mut self, r: &mut crate::state::Reader) {
+        self.rtc_pins = r.u16();
+        self.rtc_latch = r.u16();
+        self.rtc.deserialize(r);
     }
 
     pub fn deserialize(&mut self, r: &mut crate::state::Reader) {

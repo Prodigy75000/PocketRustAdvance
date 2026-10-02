@@ -580,6 +580,14 @@ pub extern "C" fn retro_run() {
             }
         }
 
+        // The cartridge clock, pushed every frame. A cartridge clock latches on
+        // demand, so a stale value shows up as a game whose day never turns.
+        if let Some(gba) = &mut s.gba {
+            if gba.cart_has_rtc() {
+                gba.set_rtc_unix_time(host_local_unix_time());
+            }
+        }
+
         // Run one frame and expand the RGB555 framebuffer to XRGB8888.
         if let Some(gba) = &mut s.gba {
             let fb = gba.run_frame();
@@ -954,5 +962,77 @@ mod tests {
             // Put the accepting env back for anything after this.
             retro_set_environment(Some(fake_env));
         }
+    }
+}
+
+/// The host's wall clock in **local** time, as seconds since the Unix epoch.
+///
+/// The GBA clock reports a broken-down local date, so a core that pushes UTC
+/// puts a player's in-game day out by their whole timezone offset. Boktai is
+/// built around day and night and Pokemon grows berries and turns tides on it.
+///
+/// This crate carries no dependencies, so the offset comes from the C runtime
+/// that every target already links. Only the first nine members of `struct tm`
+/// are read, which are `int` and in this order on bionic, the Windows CRT and
+/// glibc alike; glibc's extra members sit after them. The broken-down local
+/// date is then folded back into seconds with the core's own civil-date
+/// arithmetic rather than `mktime`, which keeps the whole conversion inside
+/// code this repo tests.
+#[repr(C)]
+struct CTm {
+    sec: i32,
+    min: i32,
+    hour: i32,
+    mday: i32,
+    mon: i32,
+    year: i32,
+    wday: i32,
+    yday: i32,
+    isdst: i32,
+}
+
+extern "C" {
+    fn localtime(time: *const i64) -> *const CTm;
+}
+
+fn host_local_unix_time() -> i64 {
+    let utc = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(gba_core::rtc::DEFAULT_UNIX_TIME);
+    let tm = unsafe { localtime(&utc as *const i64) };
+    if tm.is_null() {
+        return utc;
+    }
+    let tm = unsafe { &*tm };
+    let days = gba_core::rtc::days_from_civil(
+        i64::from(tm.year) + 1900,
+        (tm.mon + 1) as u32,
+        tm.mday as u32,
+    );
+    days * 86_400 + i64::from(tm.hour) * 3600 + i64::from(tm.min) * 60 + i64::from(tm.sec)
+}
+
+#[cfg(test)]
+mod rtc_tests {
+    /// The local-time conversion reads a C `struct tm` through a hand-written
+    /// layout, and the failure mode of getting that wrong is silent: a garbage
+    /// year or hour that still looks like a number. Every real timezone is
+    /// within 14 hours of UTC, and DST moves it by at most one more, so a
+    /// correct conversion can never be a day away.
+    #[test]
+    fn the_host_local_time_is_a_plausible_offset_from_utc() {
+        let utc = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let local = super::host_local_unix_time();
+        let offset = local - utc;
+        assert!(
+            offset.abs() <= 15 * 3600,
+            "local time is {offset} seconds from UTC, which is not a timezone;              the struct tm layout is probably wrong"
+        );
+        // And it must land on a whole minute offset, which every zone does.
+        assert_eq!(offset % 60, 0, "timezone offsets are whole minutes");
     }
 }

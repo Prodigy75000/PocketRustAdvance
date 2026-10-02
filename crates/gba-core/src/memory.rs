@@ -427,6 +427,9 @@ impl GbaBus {
         w.bool(self.last_fetch_thumb);
         w.bool(self.exec_in_bios);
         w.bool(self.bios_entry_irq);
+        // The cartridge clock, appended last so a state written before it
+        // existed still loads (the reader gates on remaining()).
+        self.sensors.serialize_rtc(w);
     }
 
     pub fn deserialize(&mut self, r: &mut crate::state::Reader) {
@@ -473,6 +476,10 @@ impl GbaBus {
             self.last_fetch_thumb = r.bool();
             self.exec_in_bios = r.bool();
             self.bios_entry_irq = r.bool();
+        }
+        // The cartridge clock, appended last under the same rule.
+        if r.remaining() >= 25 {
+            self.sensors.deserialize_rtc(r);
         }
     }
 

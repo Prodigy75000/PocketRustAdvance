@@ -458,6 +458,20 @@ fn main() {
             gba.set_button(gba_core::Button::A, p);
             gba.set_button(gba_core::Button::Start, p);
         }
+        // The cartridge clock. GBA_RTC=<unix seconds> pins it so a run is
+        // reproducible; otherwise it follows the host clock, which is UTC here
+        // because std has no timezone database. The shipping front-end passes
+        // local time. Pushed every frame: a cartridge clock latches on demand.
+        if gba.cart_has_rtc() {
+            let t = match std::env::var("GBA_RTC").ok().and_then(|v| v.trim().parse::<i64>().ok()) {
+                Some(fixed) => fixed + f as i64 / 60,
+                None => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(gba_core::rtc::DEFAULT_UNIX_TIME),
+            };
+            gba.set_rtc_unix_time(t);
+        }
         // GBA_GYRO=<rad/s> and GBA_TILT=<x>,<y> in m/s^2 stand in for a phone's
         // sensors, so a motion cart can be exercised without a device.
         if let Ok(v) = std::env::var("GBA_GYRO") {
@@ -851,6 +865,9 @@ fn main() {
         for (frm, pc, addr, val) in hits.iter().skip(hits.len().saturating_sub(32)) {
             println!("    f{:<4} L{:<3} m{:X} PC={:08X} w{} [{:07X}] = {val:08X}", frm >> 8, frm & 0xFF, pc >> 28, pc & 0x0FFF_FFFF, addr >> 28, addr & 0x0FFF_FFFF);
         }
+    }
+    if gba.cart_has_rtc() {
+        println!("  RTC: present, {} clock latches by the game", gba.rtc_latches());
     }
     let counter = u32::from_le_bytes(gba.bus.iwram[0..4].try_into().unwrap());
     println!("IWRAM counter @0x03000000 = {counter}  (IRQs taken)");

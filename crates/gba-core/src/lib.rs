@@ -13,6 +13,7 @@ pub mod bus;
 pub mod cpu;
 pub mod memory;
 pub mod ppu;
+pub mod rtc;
 pub mod save;
 pub mod sensor;
 pub mod state;
@@ -334,6 +335,31 @@ impl Gba {
     /// Topsy-Turvy, Yoshi's Universal Gravitation, Koro Koro Puzzle).
     pub fn set_accelerometer(&mut self, x: f32, y: f32, z: f32) {
         self.bus.sensors.set_accelerometer(x, y, z);
+    }
+
+    /// True when the cartridge carries a real-time clock, so a front-end knows
+    /// whether it needs to push the wall clock at all.
+    pub fn cart_has_rtc(&self) -> bool {
+        self.bus.sensors.rtc.present
+    }
+
+    /// Push the wall clock, in seconds since the Unix epoch, **already shifted
+    /// into the player's local time**.
+    ///
+    /// The conversion is the front-end's job on purpose: this core carries no
+    /// timezone database and should not grow one, while the Android side
+    /// already knows the user's zone. Push it every frame; a cartridge clock
+    /// latches on demand and a stale value shows up as a game whose day never
+    /// turns.
+    pub fn set_rtc_unix_time(&mut self, secs: i64) {
+        self.bus.sensors.rtc.unix_time = secs;
+    }
+
+    /// Diagnostics: how many times the game has latched the clock. Zero after a
+    /// run separates "the clock is wrong" from "the game never asked", which
+    /// look the same from outside.
+    pub fn rtc_latches(&self) -> u64 {
+        self.bus.sensors.rtc.latches
     }
 
     /// Feed the gyroscope, in rad/s. Used by WarioWare Twisted, which senses
