@@ -488,6 +488,12 @@ fn main() {
         if gba.bus.ppu.prof.is_some() {
             gba.bus.ppu.prof = Some(Default::default());
         }
+        // Snapshot the step counter too. Dividing a cumulative count by the
+        // MEASURED frames while it also covers the warmup inflates it, which is
+        // the same mistake the profiler made and the reason it carries a
+        // known-value field. Caught here by instructions-per-frame exceeding
+        // cycles-per-frame, which is physically impossible.
+        let steps0 = gba.steps;
         let measured = frames.saturating_sub(warmup);
         // GBA_FBHASH: fold every rendered frame into one hash, so a refactor of
         // the renderer can be proven byte-identical across many ROMs instead of
@@ -518,7 +524,12 @@ fn main() {
             secs * 1e6 / measured.max(1) as f64,
             warm.as_secs_f64()
         );
-        println!("BENCH steps={} (~{} instr/frame)", gba.steps, gba.steps / measured.max(1) as u64);
+        let run_steps = gba.steps - steps0;
+        println!(
+            "BENCH steps={run_steps} (~{} instr/frame, {:.2} cycles/instr at 280896 cyc/frame)",
+            run_steps / measured.max(1) as u64,
+            280896.0 * measured.max(1) as f64 / run_steps.max(1) as f64
+        );
         if let Some(p) = gba.bus.ppu.prof {
             let f = measured.max(1) as f64;
             let tot = (p.semi_ns + p.window_ns + p.bg_ns + p.obj_ns + p.resolve_ns) as f64;
