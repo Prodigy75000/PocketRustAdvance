@@ -169,6 +169,21 @@ fn put32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
+/// One little-endian word out of a byte block, zero filled past the end.
+///
+/// The payload of a data block is little-endian because the machine at each end
+/// is, so a block whose length is not a whole number of words ends in a partial
+/// word whose LOW bytes are the real ones. The header words of a packet are
+/// big-endian and use `get32`; mixing the two up silently swaps every byte of a
+/// trade.
+fn le_word(b: &[u8], off: usize) -> u32 {
+    let mut w = [0u8; 4];
+    for k in 0..4 {
+        w[k] = b.get(off + k).copied().unwrap_or(0);
+    }
+    u32::from_le_bytes(w)
+}
+
 fn get32(buf: &[u8], off: usize) -> u32 {
     u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
@@ -985,35 +1000,69 @@ impl Rfu {
 
             // Collect one queued block. The game reads it as the response to
             // this command, so an empty queue is a zero-word answer.
+            // Collect queued blocks.
+            //
+            // **The response LEADS WITH A LENGTH HEADER WORD**, and this is the
+            // one thing the game cannot work around. Without it the game reads
+            // the first word of data as the header, so it gets a nonsense
+            // length and every word after it is shifted by one: it cannot parse
+            // the block, and it stops talking to a peer that is answering
+            // perfectly. A healthy link carrying unreadable blocks.
+            //
+            // The header differs by role, mirroring the SEND side exactly. A
+            // client gets a plain byte count. A host gets one five-bit count
+            // per slot at `8 + slot * 5`, which is the same field a client used
+            // to say how long its block was, and is how the game attributes
+            // bytes to a player.
+            //
+            // An empty queue still answers with ONE word, a zero header. A
+            // zero-word answer is a different thing and the game reads it as
+            // the adapter having nothing to say about the question it asked.
             CMD_RECV_DATA => {
-                let block = match self.link {
-                    Link::Client => self.client.inbox.pop_front(),
-                    Link::Host => (0..4)
-                        .find(|&i| {
-                            self.host.clients[i].devid != 0 && !self.host.inbox[i].is_empty()
-                        })
-                        .and_then(|i| self.host.inbox[i].pop_front()),
-                    _ => None,
-                };
-                match block {
-                    Some(b) => {
-                        self.blocks_in += 1;
-                        let words = (b.len() + 3) / 4;
-                        let words = words.min(MAX_RESP);
-                        for i in 0..words {
-                            let mut w = [0u8; 4];
-                            for k in 0..4 {
-                                w[k] = b.get(i * 4 + k).copied().unwrap_or(0);
+                match self.link {
+                    Link::Host => {
+                        // Every client is drained into one answer, oldest block
+                        // each, concatenated in slot order. Sixteen bytes per
+                        // client is what the header field can express.
+                        let mut data: Vec<u8> = Vec::with_capacity(4 * 16);
+                        let mut header = 0u32;
+                        for i in 0..4 {
+                            if self.host.clients[i].devid == 0 {
+                                continue;
                             }
-                            // Little-endian, matching how it went on the
-                            // wire. The last word of a block whose length is
-                            // not a multiple of four is a partial word, and the
-                            // game means its LOW bytes.
-                            self.buf[i] = u32::from_le_bytes(w);
+                            let dlen = match self.host.inbox[i].front() {
+                                Some(b) => b.len().min(16),
+                                None => continue,
+                            };
+                            if dlen == 0 {
+                                continue;
+                            }
+                            let b = self.host.inbox[i].pop_front().unwrap_or_default();
+                            data.extend_from_slice(&b[..dlen]);
+                            header |= (dlen as u32) << (8 + i as u32 * 5);
+                            self.blocks_in += 1;
                         }
-                        Ok(words as u8)
+                        self.buf[0] = header;
+                        let words = (data.len() + 3) / 4;
+                        for i in 0..words {
+                            self.buf[1 + i] = le_word(&data, i * 4);
+                        }
+                        Ok((1 + words) as u8)
                     }
-                    None => Ok(0),
+                    Link::Client => {
+                        let dlen = self.client.inbox.front().map_or(0, |b| b.len());
+                        self.buf[0] = dlen as u32;
+                        let words = (dlen + 3) / 4;
+                        if dlen > 0 {
+                            let b = self.client.inbox.pop_front().unwrap_or_default();
+                            self.blocks_in += 1;
+                            for i in 0..words {
+                                self.buf[1 + i] = le_word(&b, i * 4);
+                            }
+                        }
+                        Ok((1 + words) as u8)
+                    }
+                    _ => Ok(0),
                 }
             }
 
@@ -1831,7 +1880,9 @@ mod tests {
         cmd(&mut host, CMD_SEND_DATA, &[4, 0xDEAD_BEEF]);
         deliver(&mut host, 0, &mut client, 1);
         let got = cmd(&mut client, CMD_RECV_DATA, &[]);
-        assert_eq!(got, vec![0xDEAD_BEEF], "the block arrives intact");
+        // The answer LEADS WITH A LENGTH HEADER. For a client that is a plain
+        // byte count; the game reads it to know how much of the block is real.
+        assert_eq!(got, vec![4, 0xDEAD_BEEF], "a length, then the block");
         // And the client acknowledged it, which is how the host knows it lives.
         assert!(client
             .take_outbox()
@@ -1846,7 +1897,9 @@ mod tests {
         cmd(&mut client, CMD_SEND_DATA, &[4 << 8, 0x0BAD_F00D]);
         deliver(&mut client, 1, &mut host, 0);
         let got = cmd(&mut host, CMD_RECV_DATA, &[]);
-        assert_eq!(got, vec![0x0BAD_F00D]);
+        // A host header packs one five-bit byte count per slot, at 8 + slot * 5.
+        // This client is in slot 0, so four bytes land at bit 8.
+        assert_eq!(got, vec![4 << 8, 0x0BAD_F00D]);
     }
 
     #[test]
@@ -1871,7 +1924,7 @@ mod tests {
         assert_eq!(out.len(), 1, "one packet, to the one attached client");
         assert_eq!(get32(&out[0].bytes, 4), PKT_HOST_SEND);
         client.net_receive(&out[0].bytes, 0);
-        assert_eq!(cmd(&mut client, CMD_RECV_DATA, &[]), vec![0xDEAD_BEEF]);
+        assert_eq!(cmd(&mut client, CMD_RECV_DATA, &[]), vec![4, 0xDEAD_BEEF]);
     }
 
     #[test]
@@ -1888,7 +1941,7 @@ mod tests {
         deliver(&mut host, 0, &mut client, 1);
         assert_eq!(
             cmd(&mut client, CMD_RECV_DATA, &[]),
-            vec![0x1122_3344, 0],
+            vec![8, 0x1122_3344, 0],
             "eight bytes arrive, the tail zero filled rather than stale"
         );
     }
@@ -1924,9 +1977,64 @@ mod tests {
         deliver(&mut host, 0, &mut client, 1);
         assert_eq!(
             cmd(&mut client, CMD_RECV_DATA, &[]),
-            vec![0x1122_3344, 0x0000_7788],
+            vec![6, 0x1122_3344, 0x0000_7788],
             "six bytes is one word and the LOW half of the next"
         );
+    }
+
+    #[test]
+    fn an_empty_queue_still_answers_with_a_zero_header() {
+        let (mut host, mut client) = joined_pair();
+        // ONE word, zero. Not a zero-word answer: the game asked how much
+        // arrived and the answer is none, which is a different statement from
+        // the adapter declining to answer at all, and the game acts on each
+        // differently.
+        assert_eq!(cmd(&mut client, CMD_RECV_DATA, &[]), vec![0], "client");
+        assert_eq!(cmd(&mut host, CMD_RECV_DATA, &[]), vec![0], "host");
+    }
+
+    #[test]
+    fn a_host_drains_every_client_into_one_answer() {
+        let mut host = Rfu::new();
+        handshake(&mut host);
+        cmd(&mut host, CMD_HOST_START, &[]);
+        for id in [7u16, 9u16] {
+            let mut req = Vec::new();
+            put32(&mut req, NET_HEADER);
+            put32(&mut req, PKT_CONNECT_REQ);
+            put32(&mut req, 0);
+            put32(&mut req, 0);
+            host.net_receive(&req, id);
+        }
+        let (d0, d1) = (host.host.clients[0].devid, host.host.clients[1].devid);
+        assert_ne!(d0, 0, "slot 0 filled");
+        assert_ne!(d1, 0, "slot 1 filled");
+        host.take_outbox();
+
+        let send = |h: &mut Rfu, from: u16, devid: u16, slot: u32, bytes: &[u8]| {
+            let mut v = Vec::new();
+            put32(&mut v, NET_HEADER);
+            put32(&mut v, PKT_CLIENT_SEND);
+            put32(&mut v, devid as u32 | (slot << 16) | ((bytes.len() as u32) << 24));
+            v.resize(12 + DATA_FIELD, 0);
+            v[12..12 + bytes.len()].copy_from_slice(bytes);
+            h.net_receive(&v, from);
+        };
+        send(&mut host, 7, d0, 0, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        send(&mut host, 9, d1, 1, &[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        // One header naming every slot, then the blocks concatenated in slot
+        // order. Answering with a single client's block instead loses a player
+        // in a three or four way session, and the header is the only thing that
+        // tells the game whose bytes are whose.
+        let got = cmd(&mut host, CMD_RECV_DATA, &[]);
+        assert_eq!(
+            got[0],
+            (4 << 8) | (8 << 13),
+            "four bytes at slot 0, eight at slot 1"
+        );
+        assert_eq!(&got[1..], &[0xDDCC_BBAA, 0x0403_0201, 0x0807_0605]);
+        assert_eq!(host.blocks_in, 2, "both blocks counted");
     }
 
     #[test]
@@ -1936,7 +2044,7 @@ mod tests {
         deliver(&mut host, 0, &mut client, 1);
         assert_eq!(
             cmd(&mut client, CMD_RECV_DATA, &[]),
-            vec![0x1111_1111, 0x2222_2222]
+            vec![8, 0x1111_1111, 0x2222_2222]
         );
 
         // Ask for eight bytes again, handing over only the first word. The
@@ -1949,7 +2057,7 @@ mod tests {
         deliver(&mut host, 0, &mut client, 1);
         assert_eq!(
             cmd(&mut client, CMD_RECV_DATA, &[]),
-            vec![0x3333_3333, 0x2222_2222],
+            vec![8, 0x3333_3333, 0x2222_2222],
             "the second word survives from the previous load"
         );
     }
@@ -1999,7 +2107,7 @@ mod tests {
         cmd(&mut client, CMD_SEND_DATA, &[16 << 8, 1, 2, 3, 4]);
         assert_eq!(client.blocks_out, 1, "a full slot is fine");
         deliver(&mut client, 1, &mut host, 0);
-        assert_eq!(cmd(&mut host, CMD_RECV_DATA, &[]), vec![1, 2, 3, 4]);
+        assert_eq!(cmd(&mut host, CMD_RECV_DATA, &[]), vec![16 << 8, 1, 2, 3, 4]);
     }
 
     #[test]
@@ -2065,8 +2173,8 @@ mod tests {
         deliver(&mut client, 1, &mut host, 0);
         assert_eq!(
             cmd(&mut host, CMD_RECV_DATA, &[]),
-            vec![0xFEED_FACE],
-            "a slot 1 client is understood by the host"
+            vec![4 << 13, 0xFEED_FACE],
+            "a slot 1 client is understood by the host, and named by the header"
         );
     }
 
@@ -2134,8 +2242,12 @@ mod tests {
         put32(&mut v, 0xDEAD | (0 << 16) | (4 << 24));
         put32(&mut v, 0x4141_4141);
         host.net_receive(&v, 9);
-        assert!(
-            cmd(&mut host, CMD_RECV_DATA, &[]).is_empty(),
+        // One word, a zero header: no bytes from any slot. An EMPTY answer is
+        // a different thing on this wire and the game reads it differently, so
+        // "nothing arrived" has to be stated rather than left unsaid.
+        assert_eq!(
+            cmd(&mut host, CMD_RECV_DATA, &[]),
+            vec![0],
             "a packet with the wrong device id is dropped"
         );
     }
