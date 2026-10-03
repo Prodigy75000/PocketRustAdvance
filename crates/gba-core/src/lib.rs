@@ -579,6 +579,63 @@ mod tests {
     /// with eight register adds, and the loads must cost exactly their data
     /// access (1 cycle in IWRAM) plus that internal cycle more. IWRAM code has
     /// no sequential/non-sequential distinction, so this isolates the I-cycle.
+    /// A frame must offer the adapter a chance to pull packets MID-FRAME, not
+    /// only at the frame boundary.
+    ///
+    /// Draining the transport once per frame and then running 16 ms with nothing
+    /// arriving makes the receive queue peak at the frame edge. Measured on two
+    /// devices during a trade: the host reached the queue ceiling of 16 and
+    /// discarded 14 blocks, and the trade only survived because the game
+    /// retried. The reference polls in two places, once a frame and again
+    /// whenever the adapter is mid-wait; this is the second.
+    #[test]
+    fn a_frame_polls_the_network_while_the_adapter_waits() {
+        fn rom_coded(code: &[u8; 4]) -> Vec<u8> {
+            let mut rom = vec![0u8; 0x200];
+            rom[0xAC..0xB0].copy_from_slice(code);
+            rom
+        }
+
+        // No adapter in the cart: the hook is never called, so a cart without
+        // one pays nothing for this.
+        let mut plain = Gba::new(rom_coded(b"ZZZZ"), Vec::new());
+        assert!(plain.bus.rfu.is_none(), "no adapter on a plain cart");
+        let mut calls = 0u32;
+        plain.run_frame_polling(&mut || {
+            calls += 1;
+            Vec::new()
+        });
+        assert_eq!(calls, 0, "nothing to poll for");
+
+        // FireRed. Wake the adapter, then hand it the clock with a WAIT, which
+        // is the state where the game is sitting on the air waiting for a peer.
+        let mut gba = Gba::new(rom_coded(b"BPRE"), Vec::new());
+        let rfu = gba.bus.rfu.as_mut().expect("FireRed has an adapter");
+        rfu.transfer(0x0000_494E);
+        rfu.transfer(0x1234_5678);
+        rfu.transfer(0xB0BB_8001);
+        assert_eq!(rfu.state_name(), "idle", "handshake complete");
+        // Host a room first. A WAIT with no session resolves immediately as a
+        // disconnection, which is correct and would end the wait before the
+        // first scanline check.
+        rfu.transfer(0x9966_0019); // HOST_START
+        rfu.transfer(0);
+        assert_eq!(rfu.state_name(), "hosting");
+        rfu.transfer(0x9966_0027); // WAIT, no payload
+        rfu.transfer(0);           // the ack hands the clock over
+        assert!(rfu.awaiting_event(), "the adapter now holds the clock");
+
+        let mut polls = 0u32;
+        gba.run_frame_polling(&mut || {
+            polls += 1;
+            Vec::new()
+        });
+        assert!(
+            polls > 0,
+            "a waiting adapter is offered the network during the frame"
+        );
+    }
+
     #[test]
     fn a_load_costs_one_internal_cycle_on_top_of_its_data_access() {
         use crate::bus::{Access, Bus};
