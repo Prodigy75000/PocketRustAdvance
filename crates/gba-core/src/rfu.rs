@@ -302,6 +302,14 @@ pub struct Rfu {
     /// Peers seen and sessions formed, for the runner summary.
     pub peers_seen: u64,
     pub connections: u64,
+    /// Bitmask of every command code the game has issued, bit `cmd & 0x3F`.
+    /// One number that says exactly which of the protocol the game uses, which
+    /// is far more useful on a device than a count: the adapter has no way to
+    /// log and the games differ in which commands they drive.
+    pub cmd_seen: u64,
+    /// The same, for commands we do not implement. Non-zero here means the
+    /// game is asking for something this adapter has never heard of.
+    pub unknown_seen: u64,
     /// Our own id in the netplay session, as the frontend assigned it.
     ///
     /// The ONLY thing that distinguishes two otherwise identical emulators:
@@ -335,6 +343,8 @@ impl Default for Rfu {
             peers_seen: 0,
             connections: 0,
             self_id: 0,
+            cmd_seen: 0,
+            unknown_seen: 0,
         }
     }
 }
@@ -362,11 +372,13 @@ impl Rfu {
         }
         let (commands, resets) = (self.commands, self.resets);
         let (dropped, seen, conns) = (self.dropped, self.peers_seen, self.connections);
-        let self_id = self.self_id;
+        let (self_id, cmd_seen, unknown_seen) = (self.self_id, self.cmd_seen, self.unknown_seen);
         let outbox = std::mem::take(&mut self.outbox);
         *self = Self::default();
         self.outbox = outbox;
         self.self_id = self_id;
+        self.cmd_seen = cmd_seen;
+        self.unknown_seen = unknown_seen;
         self.commands = commands;
         self.resets = resets + 1;
         self.dropped = dropped;
@@ -417,6 +429,7 @@ impl Rfu {
                     self.cmd = sent as u8;
                     self.pos = 0;
                     self.commands += 1;
+                    self.cmd_seen |= 1u64 << (self.cmd & 0x3F);
                     if self.len == 0 {
                         self.run_command();
                     } else {
@@ -500,22 +513,32 @@ impl Rfu {
             // something with these, but a bare ack is all any game needs.
             CMD_INIT1 | CMD_INIT2 | CMD_CFGSTAT => Ok(0),
 
-            // Tear the session down and tell the other end, so nobody is left
+            // Tell the other end before dropping it, so nobody is left
             // waiting on a peer that has gone.
+            //
+            // The two roles mean DIFFERENT things here, and conflating them was
+            // a bug. A client disconnects ITSELF and goes idle. A host is
+            // dropping SELECTED clients, named by a bitmask in the payload, and
+            // **stays hosting**: the room outlives any one guest. Dropping every
+            // client and leaving host mode on a request to remove one is how a
+            // Union Room ends up with two devices that both think they are the
+            // host and neither of which will accept the other's data.
             CMD_DISCONNECT => {
                 match self.link {
                     Link::Host => {
+                        let mask = if self.len > 0 { self.buf[0] } else { 0 };
                         for i in 0..4 {
                             let c = self.host.clients[i];
-                            if c.devid != 0 {
+                            if mask & (1 << i) != 0 && c.devid != 0 {
                                 self.send_cmd(
                                     c.client_id,
                                     PKT_DISCONNECT,
                                     c.devid as u32 | ((i as u32) << 16),
                                 );
+                                self.host.clients[i] = HostClient::default();
+                                self.host.inbox[i].clear();
                             }
                         }
-                        self.host = HostState::default();
                     }
                     Link::Client => {
                         let (host, devid, clnum) =
@@ -526,10 +549,10 @@ impl Rfu {
                             devid as u32 | ((clnum as u32) << 16),
                         );
                         self.client = ClientState::default();
+                        self.link = Link::Idle;
                     }
                     _ => {}
                 }
-                self.link = Link::Idle;
                 Ok(0)
             }
 
@@ -802,10 +825,22 @@ impl Rfu {
                 }
             }
 
-            // An unknown command is rejected rather than quietly acknowledged.
-            // A game that gets an ack for something we did not do waits
-            // forever for the effect.
-            _ => Err(1),
+            // **Acknowledged, not rejected, and that is deliberate.**
+            //
+            // This shipped as `Err(1)` on the reasoning that a game told we
+            // did something we did not will wait forever for the effect. The
+            // reference implementation acks instead, and it drives these exact
+            // games successfully, so the reasoning was wrong here: an error
+            // frame derails a state machine that would have shrugged off an
+            // empty ack. Measured on device, both players reported the other
+            // as permanently busy.
+            //
+            // The code is recorded rather than swallowed, so an unimplemented
+            // command shows up in the log as a bit rather than as a silence.
+            _ => {
+                self.unknown_seen |= 1u64 << (self.cmd & 0x3F);
+                Ok(0)
+            }
         }
     }
 
@@ -1217,13 +1252,65 @@ mod tests {
     }
 
     #[test]
-    fn unknown_commands_are_rejected_not_acknowledged() {
+    fn unknown_commands_are_acknowledged_and_recorded() {
+        // This asserted the OPPOSITE until 2026-10-03, on the reasoning that a
+        // game told we did something we did not will wait forever for the
+        // effect. The reference acks, and drives these games successfully; an
+        // error frame derails a state machine that would have shrugged off an
+        // empty ack. The test was a faithful record of a wrong decision, which
+        // is why it had to be rewritten rather than deleted.
         let mut rfu = Rfu::new();
         handshake(&mut rfu);
-        rfu.transfer(0x9966_0099); // no such command
-        assert_eq!(rfu.transfer(0), 0x9966_01EE, "error frame");
-        assert_eq!(rfu.transfer(0), 1, "error code");
+        rfu.transfer(0x9966_0039); // no such command
+        assert_eq!(rfu.transfer(0), 0x9966_0039 | 0x80, "a plain ack, no payload");
         assert_eq!(rfu.transfer(0), IDLE, "and back to command wait");
+        // But it is recorded, so an unimplemented command shows up in the log
+        // as a bit rather than as a silence.
+        assert_eq!(rfu.unknown_seen, 1 << 0x39);
+        assert_ne!(rfu.cmd_seen & (1 << 0x39), 0);
+    }
+
+    #[test]
+    fn a_host_disconnecting_one_client_keeps_the_room_and_the_others() {
+        // A client disconnects ITSELF. A host drops the clients named in a
+        // bitmask and STAYS HOSTING. Conflating the two left two devices both
+        // believing they were the host, each rejecting the other's data as
+        // coming from a non-client, which reads in game as the other trainer
+        // being permanently busy.
+        let mut host = Rfu::new();
+        host.set_self_id(0);
+        handshake(&mut host);
+        cmd(&mut host, CMD_HOST_START, &[]);
+        let mut req = Vec::new();
+        put32(&mut req, NET_HEADER);
+        put32(&mut req, PKT_CONNECT_REQ);
+        put32(&mut req, 0x1234);
+        put32(&mut req, 0);
+        host.net_receive(&req, 1);
+        host.net_receive(&req, 2);
+        assert_eq!(cmd(&mut host, CMD_SLOTSTAT, &[])[0], 2, "two guests");
+
+        // Drop slot 0 only.
+        host.take_outbox();
+        cmd(&mut host, CMD_DISCONNECT, &[0b0001]);
+        assert_eq!(host.state_name(), "hosting", "the room outlives the guest");
+        let slots = cmd(&mut host, CMD_SLOTSTAT, &[]);
+        assert_eq!(slots[0], 1, "one guest left");
+        assert_eq!(slots[1] >> 16, 1, "and it is the one in slot 1");
+        // The dropped one was told.
+        let out = host.take_outbox();
+        assert!(out.iter().any(|p| get32(&p.bytes, 4) == PKT_DISCONNECT));
+    }
+
+    #[test]
+    fn a_client_disconnecting_leaves_and_tells_the_host() {
+        let (mut host, mut client) = joined_pair();
+        client.take_outbox();
+        cmd(&mut client, CMD_DISCONNECT, &[0]);
+        assert_eq!(client.state_name(), "idle", "the client has left");
+        deliver(&mut client, 1, &mut host, 0);
+        assert_eq!(cmd(&mut host, CMD_SLOTSTAT, &[])[0], 0, "host sees it go");
+        assert_eq!(host.state_name(), "hosting", "and keeps the room open");
     }
 
     #[test]

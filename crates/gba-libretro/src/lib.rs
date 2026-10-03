@@ -244,7 +244,7 @@ struct State {
     log: Option<RetroLogPrintf>,
     /// Last reported adapter session counters, so a line is logged only when
     /// something actually changes rather than sixty times a second.
-    rfu_last: Option<(u64, u64, u64, u64, &'static str)>,
+    rfu_last: Option<(u64, u64, u64, u64, &'static str, u64, u64)>,
 }
 
 impl State {
@@ -760,13 +760,17 @@ pub extern "C" fn retro_run() {
             if let (Some((cmds, _resets, state)), Some((peers, conns, dropped))) =
                 (gba.rfu_stats(), gba.rfu_session_stats())
             {
-                let now = (cmds, peers, conns, dropped, state);
+                let (seen, unknown) = gba.rfu_command_masks().unwrap_or((0, 0));
+                // The command count moves every frame on a busy link, so it is
+                // deliberately NOT part of the change test: including it would
+                // log sixty lines a second and bury the transitions that matter.
+                let now = (0, peers, conns, dropped, state, seen, unknown);
                 if s.rfu_last != Some(now) {
                     s.rfu_last = Some(now);
                     log_line(
                         s.log,
                         &format!(
-                            "[rfu] state={state} self_id={} commands={cmds} peers_seen={peers} connections={conns} dropped={dropped}",
+                            "[rfu] state={state} self_id={} commands={cmds} peers_seen={peers} connections={conns} dropped={dropped} cmds_seen={seen:016X} unknown={unknown:016X}",
                             netpacket::self_id()
                         ),
                     );

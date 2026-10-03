@@ -441,6 +441,13 @@ impl Gba {
             .map(|r| (r.peers_seen, r.connections, r.dropped))
     }
 
+    /// Bitmasks of every command code the game has issued, and of the ones we
+    /// do not implement. Two numbers that say exactly which of the protocol a
+    /// game drives, which cannot be learned any other way on a device.
+    pub fn rfu_command_masks(&self) -> Option<(u64, u64)> {
+        self.bus.rfu.as_ref().map(|r| (r.cmd_seen, r.unknown_seen))
+    }
+
     /// Feed the gyroscope, in rad/s. Used by WarioWare Twisted, which senses
     /// rotation about Z only.
     pub fn set_gyroscope(&mut self, x: f32, y: f32, z: f32) {
