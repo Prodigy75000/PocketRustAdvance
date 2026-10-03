@@ -453,6 +453,15 @@ impl Gba {
     /// need opposite fixes, and none of them errors on a device.
     /// What the adapter reported while holding the clock (timeout, event,
     /// disconnection) and how many blocks actually crossed the air.
+    /// Clients attached right now, peers heard right now, and why clients
+    /// have left: added, timed out, told to go, wiped by a restart.
+    pub fn rfu_client_life(&self) -> Option<(u32, u32, u64, u64, u64, u64)> {
+        self.bus.rfu.as_ref().map(|r| {
+            let (clients, peers) = r.live_counts();
+            (clients, peers, r.cl_added, r.cl_timeout, r.cl_told, r.cl_wiped)
+        })
+    }
+
     pub fn rfu_wait_stats(&self) -> Option<(u64, u64, u64, u64, u64)> {
         self.bus.rfu.as_ref().map(|r| {
             (r.resp_timeout, r.resp_data, r.resp_disc, r.blocks_out, r.blocks_in)

@@ -318,6 +318,12 @@ pub struct Rfu {
     /// need opposite fixes: the game never asked, we could not find the host
     /// it named, we asked and were refused, or we were asked and refused.
     /// None of them produce an error anywhere on a device.
+    /// Why a host stopped having a client. All four look identical from
+    /// outside (the room simply empties) and they need different fixes.
+    pub cl_added: u64,
+    pub cl_timeout: u64,
+    pub cl_told: u64,
+    pub cl_wiped: u64,
     /// What the adapter reported back while it held the clock: a timeout, an
     /// event, or a disconnection. The game drives its whole link state off
     /// these, and all three look the same from outside.
@@ -374,6 +380,10 @@ impl Default for Rfu {
             peers_seen: 0,
             connections: 0,
             self_id: 0,
+            cl_added: 0,
+            cl_timeout: 0,
+            cl_told: 0,
+            cl_wiped: 0,
             resp_timeout: 0,
             resp_data: 0,
             resp_disc: 0,
@@ -415,6 +425,7 @@ impl Rfu {
         let (commands, resets) = (self.commands, self.resets);
         let (dropped, seen, conns) = (self.dropped, self.peers_seen, self.connections);
         let (self_id, cmd_seen, unknown_seen) = (self.self_id, self.cmd_seen, self.unknown_seen);
+        let life_dbg = (self.cl_added, self.cl_timeout, self.cl_told, self.cl_wiped);
         let resp_dbg = (
             self.resp_timeout,
             self.resp_data,
@@ -436,6 +447,10 @@ impl Rfu {
         self.self_id = self_id;
         self.cmd_seen = cmd_seen;
         self.unknown_seen = unknown_seen;
+        self.cl_added = life_dbg.0;
+        self.cl_timeout = life_dbg.1;
+        self.cl_told = life_dbg.2;
+        self.cl_wiped = life_dbg.3;
         self.resp_timeout = resp_dbg.0;
         self.resp_data = resp_dbg.1;
         self.resp_disc = resp_dbg.2;
@@ -598,6 +613,7 @@ impl Rfu {
                         for i in 0..4 {
                             let c = self.host.clients[i];
                             if mask & (1 << i) != 0 && c.devid != 0 {
+                                self.cl_told += 1;
                                 self.send_cmd(
                                     c.client_id,
                                     PKT_DISCONNECT,
@@ -745,6 +761,9 @@ impl Rfu {
                     return Err(1);
                 }
                 if self.link == Link::Idle {
+                    if self.host.clients.iter().any(|c| c.devid != 0) {
+                        self.cl_wiped += 1;
+                    }
                     self.host.devid = self.new_devid();
                     self.host.clients = Default::default();
                     self.link = Link::Host;
@@ -934,6 +953,16 @@ impl Rfu {
         std::mem::take(&mut self.outbox)
     }
 
+    /// How many clients are attached RIGHT NOW, and how many peers are
+    /// currently being heard. The counters elsewhere are cumulative and
+    /// survive an adapter reset on purpose, which makes them useless for
+    /// answering "is there a link at this instant".
+    pub fn live_counts(&self) -> (u32, u32) {
+        let clients = self.host.clients.iter().filter(|c| c.devid != 0).count() as u32;
+        let peers = self.peers.iter().filter(|p| p.valid).count() as u32;
+        (clients, peers)
+    }
+
     /// True when a session is worth keeping alive: hosting, attached, or
     /// part way between the two.
     pub fn in_session(&self) -> bool {
@@ -987,6 +1016,7 @@ impl Rfu {
                 if self.host.clients[i].devid != 0 {
                     self.host.clients[i].ttl = self.host.clients[i].ttl.saturating_add(1);
                     if self.host.clients[i].ttl >= CLIENT_TTL {
+                        self.cl_timeout += 1;
                         self.host.clients[i] = HostClient::default();
                         self.host.inbox[i].clear();
                     }
@@ -1059,6 +1089,7 @@ impl Rfu {
                             ttl: 0,
                         };
                         self.connections += 1;
+                        self.cl_added += 1;
                         self.send_cmd(from, PKT_CONNECT_ACK, newid as u32 | ((i as u32) << 16));
                     }
                     None => self.send_cmd(from, PKT_CONNECT_NACK, 0),
@@ -1097,6 +1128,7 @@ impl Rfu {
                         .iter()
                         .position(|c| c.client_id == from && c.devid != 0)
                     {
+                        self.cl_told += 1;
                         self.host.clients[i] = HostClient::default();
                         self.host.inbox[i].clear();
                     }
