@@ -825,6 +825,9 @@ mod tests {
     use super::*;
 
     static mut CAPTURED: Option<Vec<(u64, usize, usize, usize)>> = None;
+    /// (cmd, data pointer) of the netpacket interface offer, if the core made
+    /// one. See `offers_the_netpacket_interface_to_the_frontend`.
+    static mut NETPACKET_OFFER: Option<(u32, *mut c_void)> = None;
 
     /// The core keeps ONE global `State`, and `CAPTURED` below is global too, so
     /// every test that touches it must hold this for its WHOLE body, not just
@@ -859,6 +862,10 @@ mod tests {
             RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, 23,
             "GET_RUMBLE_INTERFACE is a PLAIN 23, with no EXPERIMENTAL bit;              copying the sensor interface's shape and ORing 0x10000 asks for a              different command and the front-end writes a different struct back"
         );
+        if cmd == 78 {
+            NETPACKET_OFFER = Some((cmd, data));
+            return true;
+        }
         if cmd == RETRO_ENVIRONMENT_SET_MEMORY_MAPS {
             let map = &*(data as *const retro_memory_map);
             let descs =
@@ -979,6 +986,36 @@ mod tests {
             };
             assert!(retro_load_game(&info));
             CAPTURED.take().expect("core published no memory map")
+        }
+    }
+
+    /// The wireless adapter is only reachable if the core OFFERS the netpacket
+    /// interface, and it has to do so from `retro_set_environment`.
+    ///
+    /// This is pinned by a test because the failure is completely silent and
+    /// cost real time on device: the frontend brings a session up, reports a
+    /// healthy LAN match, and the core simply never gets `start()`, so both
+    /// players sit in an empty room with no error anywhere. Worse, the host
+    /// does NOT re-run `set_environment` on a plain ROM reload (only on a
+    /// fresh core load), so the one log line that proves it is easy to miss
+    /// and easy to misread as absent.
+    #[test]
+    fn offers_the_netpacket_interface_to_the_frontend() {
+        let _core = CORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            NETPACKET_OFFER = None;
+            retro_set_environment(Some(fake_env));
+            let (cmd, data) = NETPACKET_OFFER.take().expect(
+                "the core must offer the netpacket interface from retro_set_environment",
+            );
+            // The literal, not our constant: a test phrased against the symbol
+            // it is checking agrees with any bug in it. 78 is plain, with no
+            // experimental bit.
+            assert_eq!(cmd, 78);
+            assert!(!data.is_null(), "the frontend is handed a real struct");
+            // And the struct must carry the three callbacks a session needs.
+            let cb = &*(data as *const netpacket::RetroNetpacketCallback);
+            assert!(cb.has_start_receive_stop(), "start / receive / stop are all set");
         }
     }
 

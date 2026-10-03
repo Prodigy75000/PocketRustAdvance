@@ -55,6 +55,15 @@ pub struct RetroNetpacketCallback {
     protocol_version: *const c_char,
 }
 
+impl RetroNetpacketCallback {
+    /// Are the three callbacks a session actually needs all present? A struct
+    /// handed over with a null `start` is accepted by the frontend and then
+    /// silently never drives the core.
+    pub fn has_start_receive_stop(&self) -> bool {
+        self.start.is_some() && self.receive.is_some() && self.stop.is_some()
+    }
+}
+
 // SAFETY: the frontend only reads this struct (function pointers and a static
 // string), and we share it as a &'static.
 unsafe impl Sync for RetroNetpacketCallback {}
@@ -179,6 +188,29 @@ pub fn send(to: u16, bytes: &[u8]) {
 mod tests {
     use super::*;
 
+    /// Session state is a process global, and cargo runs tests on parallel
+    /// threads, so anything that touches it has to be serialized here.
+    ///
+    /// This is not paranoia: without it the suite corrupted the heap. Every
+    /// test still PASSED and the process then died at exit with
+    /// STATUS_HEAP_CORRUPTION, because two threads were pushing into the same
+    /// `Vec` at once. Production is unaffected, since libretro serializes every
+    /// call into a core onto the emulation thread, which is the same guarantee
+    /// `Global` documents.
+    static NET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the lock and start from a clean session.
+    fn locked() -> std::sync::MutexGuard<'static, ()> {
+        let g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        with_net(|n| {
+            n.inbox.clear();
+            n.send_fn = None;
+            n.poll_receive_fn = None;
+            n.active = false;
+        });
+        g
+    }
+
     #[test]
     fn the_env_command_is_the_literal_78() {
         // Asserted against the number rather than against our own constant,
@@ -210,7 +242,7 @@ mod tests {
 
     #[test]
     fn a_null_or_empty_packet_is_ignored() {
-        with_net(|n| n.inbox.clear());
+        let _g = locked();
         unsafe {
             np_receive(std::ptr::null(), 16, 1);
             np_receive([1u8, 2, 3].as_ptr() as *const c_void, 0, 1);
@@ -220,7 +252,7 @@ mod tests {
 
     #[test]
     fn a_received_packet_is_copied_out_with_its_sender() {
-        with_net(|n| n.inbox.clear());
+        let _g = locked();
         let buf = [0xDEu8, 0xAD, 0xBE, 0xEF];
         unsafe { np_receive(buf.as_ptr() as *const c_void, buf.len(), 7) };
         let got = with_net(|n| std::mem::take(&mut n.inbox));
@@ -229,6 +261,7 @@ mod tests {
 
     #[test]
     fn stopping_a_session_drops_everything_including_queued_packets() {
+        let _g = locked();
         unsafe {
             np_receive([9u8].as_ptr() as *const c_void, 1, 1);
             np_stop();
