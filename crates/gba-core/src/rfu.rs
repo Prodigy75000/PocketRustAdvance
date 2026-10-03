@@ -373,6 +373,19 @@ pub struct Rfu {
     pub cl_timeout: u64,
     pub cl_told: u64,
     pub cl_wiped: u64,
+    /// Why a CLIENT lost its link, the mirror of the four above. A trade
+    /// completes and then one side is booted out while the other has to reset,
+    /// so the teardown is where to look, and these three routes are
+    /// indistinguishable from outside: the game asked to leave, the host told
+    /// us to go, or the host went silent long enough for the watchdog.
+    ///
+    /// The watchdog one is the suspicious route: an ex-host goes straight back
+    /// to announcing its room twice a second, and ANY packet from it feeds the
+    /// watchdog, so a client whose session ended can be kept alive forever by
+    /// the very broadcasts that say the room is open.
+    pub cl_left_self: u64,
+    pub cl_left_told: u64,
+    pub cl_left_silent: u64,
     /// What the adapter reported back while it held the clock: a timeout, an
     /// event, or a disconnection. The game drives its whole link state off
     /// these, and all three look the same from outside.
@@ -458,6 +471,9 @@ impl Default for Rfu {
             cl_timeout: 0,
             cl_told: 0,
             cl_wiped: 0,
+            cl_left_self: 0,
+            cl_left_told: 0,
+            cl_left_silent: 0,
             resp_timeout: 0,
             resp_data: 0,
             resp_disc: 0,
@@ -508,6 +524,7 @@ impl Rfu {
         let (dropped, seen, conns) = (self.dropped, self.peers_seen, self.connections);
         let (self_id, cmd_seen, unknown_seen) = (self.self_id, self.cmd_seen, self.unknown_seen);
         let life_dbg = (self.cl_added, self.cl_timeout, self.cl_told, self.cl_wiped);
+        let cl_left = (self.cl_left_self, self.cl_left_told, self.cl_left_silent);
         let resp_dbg = (
             self.resp_timeout,
             self.resp_data,
@@ -547,6 +564,9 @@ impl Rfu {
         self.cl_timeout = life_dbg.1;
         self.cl_told = life_dbg.2;
         self.cl_wiped = life_dbg.3;
+        self.cl_left_self = cl_left.0;
+        self.cl_left_told = cl_left.1;
+        self.cl_left_silent = cl_left.2;
         self.resp_timeout = resp_dbg.0;
         self.resp_data = resp_dbg.1;
         self.resp_disc = resp_dbg.2;
@@ -740,6 +760,7 @@ impl Rfu {
                         );
                         self.client = ClientState::default();
                         self.link = Link::Idle;
+                        self.cl_left_self += 1;
                     }
                     _ => {}
                 }
@@ -1240,6 +1261,7 @@ impl Rfu {
             if self.client.host_ttl >= CLIENT_TTL {
                 self.link = Link::Idle;
                 self.client = ClientState::default();
+                self.cl_left_silent += 1;
             }
         }
     }
@@ -1334,6 +1356,7 @@ impl Rfu {
                 if self.link == Link::Client && from == self.client.host_id {
                     self.link = Link::Idle;
                     self.client = ClientState::default();
+                    self.cl_left_told += 1;
                 } else if self.link == Link::Host {
                     if let Some(i) = self
                         .host
@@ -2034,6 +2057,52 @@ mod tests {
             vec![6, 0x1122_3344, 0x0000_7788],
             "six bytes is one word and the LOW half of the next"
         );
+    }
+
+    #[test]
+    fn the_three_ways_a_client_loses_its_link_are_told_apart() {
+        // A trade completes and then one side is booted out while the other has
+        // to reset, so the teardown is where the remaining bug lives. These
+        // three routes are indistinguishable from outside, because all a player
+        // sees is a communication error.
+
+        // The game asked to leave.
+        let (_h, mut c) = joined_pair();
+        cmd(&mut c, CMD_DISCONNECT, &[0]);
+        assert_eq!((c.cl_left_self, c.cl_left_told, c.cl_left_silent), (1, 0, 0));
+        assert_eq!(c.state_name(), "idle");
+
+        // The host told it to go.
+        let (mut h, mut c) = joined_pair();
+        cmd(&mut h, CMD_DISCONNECT, &[0b0001]);
+        deliver(&mut h, 0, &mut c, 1);
+        assert_eq!((c.cl_left_self, c.cl_left_told, c.cl_left_silent), (0, 1, 0));
+        assert_eq!(c.state_name(), "idle");
+
+        // The host went silent and the watchdog gave up.
+        let (_h, mut c) = joined_pair();
+        for _ in 0..CLIENT_TTL {
+            c.frame_update();
+        }
+        assert_eq!((c.cl_left_self, c.cl_left_told, c.cl_left_silent), (0, 0, 1));
+        assert_eq!(c.state_name(), "idle");
+    }
+
+    #[test]
+    fn a_broadcasting_host_keeps_its_client_alive_indefinitely() {
+        // Correct, and worth pinning because it constrains how the teardown can
+        // possibly work. A host announces its room about twice a second and ANY
+        // packet from it feeds the client watchdog, so the watchdog can never
+        // fire while the peer is still announcing. Whatever ends a session, it
+        // cannot be the watchdog unless the host actually goes away.
+        let (mut host, mut client) = joined_pair();
+        for _ in 0..(CLIENT_TTL as u32 * 3) {
+            host.frame_update();
+            deliver(&mut host, 0, &mut client, 1);
+            client.frame_update();
+        }
+        assert_eq!(client.cl_left_silent, 0, "the watchdog never fires");
+        assert_eq!(client.state_name(), "client", "still attached");
     }
 
     #[test]

@@ -539,6 +539,16 @@ impl Gba {
         ))
     }
 
+    /// Why a client lost its link: the game asked, the host told it, or the
+    /// host went silent. The mirror of `rfu_client_life`, which only covers how
+    /// a HOST loses a client.
+    pub fn rfu_client_left(&self) -> Option<(u64, u64, u64)> {
+        self.bus
+            .rfu
+            .as_ref()
+            .map(|r| (r.cl_left_self, r.cl_left_told, r.cl_left_silent))
+    }
+
     pub fn rfu_connect_stats(&self) -> Option<(u64, u64, u64, u64, u64, u64)> {
         self.bus.rfu.as_ref().map(|r| {
             (
