@@ -473,6 +473,12 @@ impl Rfu {
             self.blocks_in,
         );
         let tx_dbg = (self.tx_rtx, self.tx_no_client, self.tx_too_long);
+        // The reference holds the transmit buffer in a static that its reset
+        // does not touch, so it outlives a power cycle. Ours is part of the
+        // device and would not. Matching it rather than reasoning about it:
+        // every divergence from the reference on this protocol so far has been
+        // a bug, and this one is free.
+        let tx_keep = (self.tx_buf, self.tx_blen);
         let conns_dbg = (
             self.conn_asked,
             self.conn_no_peer,
@@ -499,6 +505,8 @@ impl Rfu {
         self.tx_rtx = tx_dbg.0;
         self.tx_no_client = tx_dbg.1;
         self.tx_too_long = tx_dbg.2;
+        self.tx_buf = tx_keep.0;
+        self.tx_blen = tx_keep.1;
         self.conn_asked = conns_dbg.0;
         self.conn_no_peer = conns_dbg.1;
         self.conn_sent = conns_dbg.2;
@@ -911,8 +919,14 @@ impl Rfu {
                         // an answer forever.
                         _ => return Err(1),
                     };
+                    // Overwrite ONLY the words the game handed over, and keep
+                    // the rest of the buffer. The game routinely asks to send
+                    // more bytes than it just supplied, and the tail it means
+                    // is what is already here. Clearing first looks safer and
+                    // is not: it replaces the tail of a real block with zeros,
+                    // so the peer gets something it cannot parse while every
+                    // counter on both sides reports a perfectly healthy link.
                     let words = ((self.len - 1) as usize).min(TX_WORDS);
-                    self.tx_buf = [0; TX_WORDS];
                     self.tx_buf[..words].copy_from_slice(&self.buf[1..1 + words]);
                 }
 
@@ -1842,6 +1856,49 @@ mod tests {
             vec![0x1122_3344, 0],
             "eight bytes arrive, the tail zero filled rather than stale"
         );
+    }
+
+    #[test]
+    fn a_short_load_keeps_the_tail_of_the_last_block() {
+        let (mut host, mut client) = joined_pair();
+        cmd(&mut host, CMD_SEND_DATA, &[8, 0x1111_1111, 0x2222_2222]);
+        deliver(&mut host, 0, &mut client, 1);
+        assert_eq!(
+            cmd(&mut client, CMD_RECV_DATA, &[]),
+            vec![0x1111_1111, 0x2222_2222]
+        );
+
+        // Ask for eight bytes again, handing over only the first word. The
+        // adapter holds a buffer and the reference overwrites only what it was
+        // given, sending the rest from what it still has. Zero filling the tail
+        // instead replaces half of a real block with nothing, and the peer gets
+        // something it cannot parse while every counter on both sides reports a
+        // healthy link.
+        cmd(&mut host, CMD_SEND_DATA, &[8, 0x3333_3333]);
+        deliver(&mut host, 0, &mut client, 1);
+        assert_eq!(
+            cmd(&mut client, CMD_RECV_DATA, &[]),
+            vec![0x3333_3333, 0x2222_2222],
+            "the second word survives from the previous load"
+        );
+    }
+
+    #[test]
+    fn a_power_cycle_leaves_the_transmit_buffer_alone() {
+        let (mut host, _client) = joined_pair();
+        cmd(&mut host, CMD_SEND_DATA, &[4, 0xFEED_FACE]);
+        host.reset();
+        // Verified at source: the reference clears its host table and its peer
+        // list on a reset and deliberately not its transmit buffer, which lives
+        // in a static. So a game that power-cycles the adapter mid-exchange and
+        // resumes sending short loads still has the tail it is counting on.
+        // Pinned rather than merely matched, because an untested behaviour
+        // change is a guess however good its provenance.
+        assert_eq!(host.tx_buf[0], 0xFEED_FACE, "the block survives a power cycle");
+        assert_eq!(host.tx_blen, 4);
+        // The things the reference DOES clear are still cleared.
+        assert_eq!(host.state_name(), "reset");
+        assert_eq!(host.live_counts(), (0, 0), "host table and peers go");
     }
 
     #[test]
