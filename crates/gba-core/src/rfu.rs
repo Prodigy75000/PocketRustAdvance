@@ -76,6 +76,17 @@ const MAX_RESP: usize = 4 * 7;
 /// One adapter frame, in system cycles: a sixtieth of a second.
 const FRAME_CYCLES: u32 = 16_777_216 / 60;
 
+/// How long the adapter waits for an event before reporting a timeout, and how
+/// many times it retransmits, until the game configures them with SYSCFG.
+///
+/// **These must not start at zero.** A zero wait means the adapter answers
+/// "nothing happened" the instant the game hands it the clock, every time, and
+/// a game whose peer never appears to respond reports that peer as busy. The
+/// reference applies these same defaults on every reset, which is also when
+/// ours were being cleared back to zero.
+const DEF_TIMEOUT_FRAMES: u8 = 32;
+const DEF_RTX_MAX: u8 = 4;
+
 // --- The wire, between two adapters -----------------------------------------
 //
 // Deliberately byte-identical to gpSP's RFU packets: four-byte big-endian
@@ -307,6 +318,15 @@ pub struct Rfu {
     /// need opposite fixes: the game never asked, we could not find the host
     /// it named, we asked and were refused, or we were asked and refused.
     /// None of them produce an error anywhere on a device.
+    /// What the adapter reported back while it held the clock: a timeout, an
+    /// event, or a disconnection. The game drives its whole link state off
+    /// these, and all three look the same from outside.
+    pub resp_timeout: u64,
+    pub resp_data: u64,
+    pub resp_disc: u64,
+    /// Blocks actually handed over the air, and collected from it.
+    pub blocks_out: u64,
+    pub blocks_in: u64,
     pub conn_asked: u64,
     pub conn_no_peer: u64,
     pub conn_sent: u64,
@@ -340,8 +360,8 @@ impl Default for Rfu {
             pos: 0,
             buf: [0; MAX_RESP],
             prev: 0,
-            timeout: 0,
-            rtx_max: 0,
+            timeout: DEF_TIMEOUT_FRAMES,
+            rtx_max: DEF_RTX_MAX,
             timeout_cycles: 0,
             resp_cycles: 0,
             commands: 0,
@@ -354,6 +374,11 @@ impl Default for Rfu {
             peers_seen: 0,
             connections: 0,
             self_id: 0,
+            resp_timeout: 0,
+            resp_data: 0,
+            resp_disc: 0,
+            blocks_out: 0,
+            blocks_in: 0,
             conn_asked: 0,
             conn_no_peer: 0,
             conn_sent: 0,
@@ -390,6 +415,13 @@ impl Rfu {
         let (commands, resets) = (self.commands, self.resets);
         let (dropped, seen, conns) = (self.dropped, self.peers_seen, self.connections);
         let (self_id, cmd_seen, unknown_seen) = (self.self_id, self.cmd_seen, self.unknown_seen);
+        let resp_dbg = (
+            self.resp_timeout,
+            self.resp_data,
+            self.resp_disc,
+            self.blocks_out,
+            self.blocks_in,
+        );
         let conns_dbg = (
             self.conn_asked,
             self.conn_no_peer,
@@ -404,6 +436,11 @@ impl Rfu {
         self.self_id = self_id;
         self.cmd_seen = cmd_seen;
         self.unknown_seen = unknown_seen;
+        self.resp_timeout = resp_dbg.0;
+        self.resp_data = resp_dbg.1;
+        self.resp_disc = resp_dbg.2;
+        self.blocks_out = resp_dbg.3;
+        self.blocks_in = resp_dbg.4;
         self.conn_asked = conns_dbg.0;
         self.conn_no_peer = conns_dbg.1;
         self.conn_sent = conns_dbg.2;
@@ -800,6 +837,7 @@ impl Rfu {
                             for i in 0..4 {
                                 let c = self.host.clients[i];
                                 if c.devid != 0 {
+                                    self.blocks_out += 1;
                                     self.send_data(
                                         c.client_id,
                                         PKT_HOST_SEND,
@@ -821,6 +859,7 @@ impl Rfu {
                                 | ((self.client.clnum as u32) << 16)
                                 | ((blen as u32) << 24);
                             let host = self.client.host_id;
+                            self.blocks_out += 1;
                             self.send_data(host, PKT_CLIENT_SEND, h, &payload);
                         }
                     }
@@ -845,6 +884,7 @@ impl Rfu {
                 };
                 match block {
                     Some(b) => {
+                        self.blocks_in += 1;
                         let words = (b.len() + 3) / 4;
                         let words = words.min(MAX_RESP);
                         for i in 0..words {
@@ -1182,6 +1222,7 @@ impl Rfu {
                     self.len = 3;
                     self.pos = 0;
                     self.com = Com::WaitResp;
+                    self.resp_disc += 1;
                 } else if self.data_available() {
                     // Something arrived from the air. The game answers this by
                     // issuing RECV_DATA to collect it.
@@ -1190,6 +1231,7 @@ impl Rfu {
                     self.len = 2;
                     self.pos = 0;
                     self.com = Com::WaitResp;
+                    self.resp_data += 1;
                 } else if self.link == Link::Host && self.resp_cycles == 0 {
                     // A retransmit round elapsed with no client answering.
                     self.buf[0] = 0x9966_0000 | (1 << 8) | RESP_DATA as u32;
@@ -1198,12 +1240,14 @@ impl Rfu {
                     self.len = 3;
                     self.pos = 0;
                     self.com = Com::WaitResp;
+                    self.resp_data += 1;
                 } else if self.timeout_cycles == 0 {
                     self.buf[0] = 0x9966_0000 | RESP_TIMEOUT as u32;
                     self.buf[1] = IDLE;
                     self.len = 2;
                     self.pos = 0;
                     self.com = Com::WaitResp;
+                    self.resp_timeout += 1;
                 }
             }
         }
@@ -1690,6 +1734,42 @@ mod tests {
             vec![0xFEED_FACE],
             "a slot 1 client is understood by the host"
         );
+    }
+
+    #[test]
+    fn a_connected_client_waiting_is_given_time_before_a_timeout() {
+        // The adapter wait defaulted to ZERO frames, so a client handed the
+        // clock was told "nothing happened" on the very first instant, every
+        // time. A game whose peer never appears to answer reports that peer as
+        // busy, which is precisely what two devices did for several rounds.
+        // The reference applies a 32-frame default and re-applies it on reset.
+        let (_host, mut client) = joined_pair();
+        cmd(&mut client, CMD_WAIT, &[]);
+        assert!(client.is_master());
+        // A frame of waiting, with the game listening, must NOT produce a
+        // timeout: there is a peer and it has been given no chance to answer.
+        assert_eq!(
+            client.step(FRAME_CYCLES, true, true, true),
+            None,
+            "a connected client must be given its wait before being told it timed out"
+        );
+        assert_eq!(client.resp_timeout, 0);
+        // Only once the configured wait has actually elapsed.
+        for _ in 0..DEF_TIMEOUT_FRAMES as u32 {
+            client.step(FRAME_CYCLES, true, true, true);
+        }
+        assert_eq!(client.resp_timeout, 1, "and then exactly once");
+    }
+
+    #[test]
+    fn a_reset_restores_the_wait_defaults_rather_than_zeroing_them() {
+        let mut rfu = Rfu::new();
+        handshake(&mut rfu);
+        cmd(&mut rfu, CMD_SYSCFG, &[0x0000_0105]); // timeout 5, 1 retransmit
+        assert_eq!(rfu.timeout, 5);
+        rfu.reset();
+        assert_eq!(rfu.timeout, DEF_TIMEOUT_FRAMES, "not zero");
+        assert_eq!(rfu.rtx_max, DEF_RTX_MAX, "not zero");
     }
 
     #[test]

@@ -451,6 +451,14 @@ impl Gba {
     /// Connection accounting: asked, no-peer, sent, nacked, requests received,
     /// requests refused. "The connect failed" has several distinct causes that
     /// need opposite fixes, and none of them errors on a device.
+    /// What the adapter reported while holding the clock (timeout, event,
+    /// disconnection) and how many blocks actually crossed the air.
+    pub fn rfu_wait_stats(&self) -> Option<(u64, u64, u64, u64, u64)> {
+        self.bus.rfu.as_ref().map(|r| {
+            (r.resp_timeout, r.resp_data, r.resp_disc, r.blocks_out, r.blocks_in)
+        })
+    }
+
     pub fn rfu_connect_stats(&self) -> Option<(u64, u64, u64, u64, u64, u64)> {
         self.bus.rfu.as_ref().map(|r| {
             (

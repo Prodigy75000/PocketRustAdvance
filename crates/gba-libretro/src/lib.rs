@@ -765,15 +765,20 @@ pub extern "C" fn retro_run() {
                 // deliberately NOT part of the change test: including it would
                 // log sixty lines a second and bury the transitions that matter.
                 let cs = gba.rfu_connect_stats().unwrap_or((0, 0, 0, 0, 0, 0));
-                let now = (cs.0 + cs.1 + cs.2 + cs.3 + cs.4 + cs.5, peers, conns, dropped, state, seen, unknown);
+                let ws = gba.rfu_wait_stats().unwrap_or((0, 0, 0, 0, 0));
+                let now = (
+                    cs.0 + cs.1 + cs.2 + cs.3 + cs.4 + cs.5 + ws.1 + ws.2 + ws.3 + ws.4,
+                    peers, conns, dropped, state, seen, unknown,
+                );
                 if s.rfu_last != Some(now) {
                     s.rfu_last = Some(now);
                     log_line(
                         s.log,
                         &format!(
-                            "[rfu] state={state} self_id={} commands={cmds} peers_seen={peers} connections={conns} dropped={dropped} cmds_seen={seen:016X} unknown={unknown:016X} connect(asked={} nopeer={} sent={} nacked={}) incoming(got={} refused={})",
+                            "[rfu] state={state} self_id={} commands={cmds} peers_seen={peers} connections={conns} dropped={dropped} cmds_seen={seen:016X} unknown={unknown:016X} connect(asked={} nopeer={} sent={} nacked={}) incoming(got={} refused={}) wait(timeout={} data={} disc={}) blocks(out={} in={})",
                             netpacket::self_id(),
-                            cs.0, cs.1, cs.2, cs.3, cs.4, cs.5
+                            cs.0, cs.1, cs.2, cs.3, cs.4, cs.5,
+                            ws.0, ws.1, ws.2, ws.3, ws.4
                         ),
                     );
                 }
