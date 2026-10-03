@@ -477,6 +477,20 @@ impl Gba {
             .map(|r| (r.tx_rtx, r.tx_no_client, r.tx_too_long))
     }
 
+    /// The arrival side of the link: queued, rejected, dropped by role, and
+    /// the deepest any queue has been.
+    pub fn rfu_rx_stats(&self) -> Option<(u64, u64, u64, u64, u32)> {
+        self.bus.rfu.as_ref().map(|r| {
+            (
+                r.rx_queued,
+                r.rx_reject,
+                r.drop_host,
+                r.drop_client,
+                r.queue_max,
+            )
+        })
+    }
+
     pub fn rfu_connect_stats(&self) -> Option<(u64, u64, u64, u64, u64, u64)> {
         self.bus.rfu.as_ref().map(|r| {
             (

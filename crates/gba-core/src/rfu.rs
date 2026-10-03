@@ -380,8 +380,24 @@ pub struct Rfu {
     pub resp_data: u64,
     pub resp_disc: u64,
     /// Blocks actually handed over the air, and collected from it.
+    ///
+    /// Note `blocks_in` counts blocks DRAINED by the game, not blocks received.
+    /// The difference is where a trade dies, so the arrival side is counted
+    /// separately below rather than inferred from these two.
     pub blocks_out: u64,
     pub blocks_in: u64,
+    /// The arrival side, which `blocks_in` cannot see. A block that arrives is
+    /// queued, dropped for want of room, or rejected before either. Four
+    /// blocks going missing in a lockstep trade is fatal and these three say
+    /// which way they went.
+    pub rx_queued: u64,
+    pub rx_reject: u64,
+    pub drop_host: u64,
+    pub drop_client: u64,
+    /// Deepest any receive queue has been. A burst that nearly overflows and a
+    /// burst that does are the same bug one packet apart, so the high-water
+    /// mark is worth more than the drop count on its own.
+    pub queue_max: u32,
     /// Why a block the game asked us to send did not go out, and how often one
     /// went out as a retransmit. `blocks_out` staying at zero while the game is
     /// plainly sending has several causes that need opposite fixes, and none of
@@ -447,6 +463,11 @@ impl Default for Rfu {
             resp_disc: 0,
             blocks_out: 0,
             blocks_in: 0,
+            rx_queued: 0,
+            rx_reject: 0,
+            drop_host: 0,
+            drop_client: 0,
+            queue_max: 0,
             tx_rtx: 0,
             tx_no_client: 0,
             tx_too_long: 0,
@@ -495,6 +516,13 @@ impl Rfu {
             self.blocks_in,
         );
         let tx_dbg = (self.tx_rtx, self.tx_no_client, self.tx_too_long);
+        let rx_dbg = (
+            self.rx_queued,
+            self.rx_reject,
+            self.drop_host,
+            self.drop_client,
+            self.queue_max,
+        );
         // The reference holds the transmit buffer in a static that its reset
         // does not touch, so it outlives a power cycle. Ours is part of the
         // device and would not. Matching it rather than reasoning about it:
@@ -527,6 +555,11 @@ impl Rfu {
         self.tx_rtx = tx_dbg.0;
         self.tx_no_client = tx_dbg.1;
         self.tx_too_long = tx_dbg.2;
+        self.rx_queued = rx_dbg.0;
+        self.rx_reject = rx_dbg.1;
+        self.drop_host = rx_dbg.2;
+        self.drop_client = rx_dbg.3;
+        self.queue_max = rx_dbg.4;
         self.tx_buf = tx_keep.0;
         self.tx_blen = tx_keep.1;
         self.conn_asked = conns_dbg.0;
@@ -1311,6 +1344,7 @@ impl Rfu {
                 }
                 let blen = (hdata & 0x7F) as usize;
                 if payload.len() < blen {
+                    self.rx_reject += 1;
                     return;
                 }
                 // Acknowledge first, so the host knows we are still here even
@@ -1319,8 +1353,12 @@ impl Rfu {
                 self.send_cmd(from, PKT_CLIENT_ACK, ack);
                 if self.client.inbox.len() >= QUEUE_DEPTH {
                     self.dropped += 1;
+                    self.drop_client += 1;
                 } else {
                     self.client.inbox.push_back(payload[..blen].to_vec());
+                    self.rx_queued += 1;
+                    let depth = self.client.inbox.len() as u32;
+                    self.queue_max = self.queue_max.max(depth);
                 }
             }
 
@@ -1335,16 +1373,22 @@ impl Rfu {
                 // so a stale or forged packet cannot write into the queue of a
                 // different client.
                 if cdevid == 0 || self.host.clients[slot].devid != cdevid {
+                    self.rx_reject += 1;
                     return;
                 }
                 if payload.len() < blen {
+                    self.rx_reject += 1;
                     return;
                 }
                 self.host.clients[slot].ttl = 0;
                 if self.host.inbox[slot].len() >= QUEUE_DEPTH {
                     self.dropped += 1;
+                    self.drop_host += 1;
                 } else {
                     self.host.inbox[slot].push_back(payload[..blen].to_vec());
+                    self.rx_queued += 1;
+                    let depth = self.host.inbox[slot].len() as u32;
+                    self.queue_max = self.queue_max.max(depth);
                 }
             }
 
