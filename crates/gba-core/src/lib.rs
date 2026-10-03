@@ -401,6 +401,15 @@ impl Gba {
             .map(|r| (r.commands, r.resets, r.state_name()))
     }
 
+    /// Tell the adapter which peer the frontend thinks we are. The device id
+    /// it advertises is derived from this, so without it two devices running
+    /// the same ROM advertise the same id and refuse to join each other.
+    pub fn rfu_set_self_id(&mut self, id: u16) {
+        if let Some(rfu) = self.bus.rfu.as_mut() {
+            rfu.set_self_id(id);
+        }
+    }
+
     /// Hand the adapter a packet that arrived from `from`, the frontend id of
     /// the peer that sent it.
     pub fn rfu_net_receive(&mut self, buf: &[u8], from: u16) {

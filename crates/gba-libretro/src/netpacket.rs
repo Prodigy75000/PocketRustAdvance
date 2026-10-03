@@ -150,6 +150,11 @@ pub fn is_active() -> bool {
     with_net(|n| n.active)
 }
 
+/// Our own peer id in the session, as the frontend assigned it.
+pub fn self_id() -> u16 {
+    with_net(|n| n.self_id)
+}
+
 /// Ask the frontend to deliver anything waiting, then take what arrived.
 ///
 /// Calling `poll_receive` re-enters us through `np_receive`, which is why that

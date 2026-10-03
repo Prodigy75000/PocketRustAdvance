@@ -302,6 +302,13 @@ pub struct Rfu {
     /// Peers seen and sessions formed, for the runner summary.
     pub peers_seen: u64,
     pub connections: u64,
+    /// Our own id in the netplay session, as the frontend assigned it.
+    ///
+    /// The ONLY thing that distinguishes two otherwise identical emulators:
+    /// same ROM, same save, same menus, same instruction stream. A real
+    /// adapter has a unique id burned in and can derive one from a clock; a
+    /// deterministic core can do neither without giving up reproducibility.
+    self_id: u16,
 }
 
 impl Default for Rfu {
@@ -327,6 +334,7 @@ impl Default for Rfu {
             dropped: 0,
             peers_seen: 0,
             connections: 0,
+            self_id: 0,
         }
     }
 }
@@ -354,9 +362,11 @@ impl Rfu {
         }
         let (commands, resets) = (self.commands, self.resets);
         let (dropped, seen, conns) = (self.dropped, self.peers_seen, self.connections);
+        let self_id = self.self_id;
         let outbox = std::mem::take(&mut self.outbox);
         *self = Self::default();
         self.outbox = outbox;
+        self.self_id = self_id;
         self.commands = commands;
         self.resets = resets + 1;
         self.dropped = dropped;
@@ -801,6 +811,14 @@ impl Rfu {
 
     // --- the air -------------------------------------------------------------
 
+    /// Tell the adapter which peer the frontend thinks we are.
+    ///
+    /// Must be set before a room is hosted, because the device id is derived
+    /// from it. Cheap and idempotent, so the front-end pushes it every frame.
+    pub fn set_self_id(&mut self, id: u16) {
+        self.self_id = id;
+    }
+
     /// Drain the packets the frontend should put on the wire.
     pub fn take_outbox(&mut self) -> Vec<OutPacket> {
         std::mem::take(&mut self.outbox)
@@ -1040,12 +1058,27 @@ impl Rfu {
         }
     }
 
-    /// A device id for a host or a client slot. Real adapters have one burned
-    /// in; any non-zero value will do, and peers compare the whole half-word.
+    /// A device id for a host or a client slot.
+    ///
+    /// **This has to differ between two devices, and that is harder for us
+    /// than for hardware.** A real adapter has an id burned in, and gpSP uses
+    /// `rand() ^ time()`. A deterministic core has neither: two phones running
+    /// the same ROM from the same save through the same menus execute the same
+    /// instructions and would mint the same id.
+    ///
+    /// That is not a cosmetic collision. A game that scans and finds a room
+    /// advertising its OWN device id has found itself, and will not connect to
+    /// it. Measured on device 2026-10-03: both players saw each other in the
+    /// Union Room and neither ever sent a single connect request, because the
+    /// id came only from the command count and both sides had minted the same
+    /// one. Every packet on the wire was a 36-byte broadcast and not one was
+    /// unicast.
+    ///
+    /// So the high nibble-and-a-bit comes from the frontend's peer id, which
+    /// is the one thing that genuinely differs, and the rest keeps a single
+    /// device reproducible across runs.
     fn new_devid(&self) -> u16 {
-        // Derived from how much the game has already said to us, so a replay
-        // of the same ROM is reproducible rather than random.
-        0x1000 | ((self.commands as u16) & 0x0FFF) | 1
+        0x1000 | ((self.self_id & 0x0F) << 8) | ((self.commands as u16) & 0x00FF) | 1
     }
 
     /// Advance the adapter's own clock by `cycles`.
@@ -1297,6 +1330,11 @@ mod tests {
     fn hosted_pair() -> (Rfu, Rfu, u16) {
         let mut host = Rfu::new();
         let mut client = Rfu::new();
+        // Two devices are two different peers, and the fixtures have to say so.
+        // Left at the default they are indistinguishable, which is exactly the
+        // condition that hid the device-id collision from this suite.
+        host.set_self_id(0);
+        client.set_self_id(1);
         handshake(&mut host);
         handshake(&mut client);
         cmd(&mut host, CMD_BCST_DATA, &[11, 22, 33, 44, 55, 66]);
@@ -1319,6 +1357,44 @@ mod tests {
             "the advertisement survives the wire, which is the trainer name"
         );
         assert_eq!(client.peers_seen, 1);
+    }
+
+    #[test]
+    fn two_devices_running_in_lockstep_still_mint_different_device_ids() {
+        // The bug this pins cost a device session. Two phones on the same ROM,
+        // same save and same menus execute the same instructions, so anything
+        // derived purely from emulated state is identical on both. A game that
+        // scans and finds a room advertising its own id has found itself and
+        // will not connect, which presents as the other player being busy
+        // while not one connect request is ever sent.
+        let mut a = Rfu::new();
+        let mut b = Rfu::new();
+        a.set_self_id(0);
+        b.set_self_id(1);
+        handshake(&mut a);
+        handshake(&mut b);
+        // Identical command streams from here on, deliberately.
+        cmd(&mut a, CMD_HOST_START, &[]);
+        cmd(&mut b, CMD_HOST_START, &[]);
+        assert_ne!(
+            a.host.devid, b.host.devid,
+            "two devices must not advertise the same device id"
+        );
+        assert_ne!(a.host.devid, 0);
+        assert_ne!(b.host.devid, 0);
+    }
+
+    #[test]
+    fn a_scan_never_turns_up_the_scanning_device_itself() {
+        // The end-to-end shape of the same bug: whatever a device finds in a
+        // scan must not be its own id, or the game has nothing valid to join.
+        let (host, mut client, devid) = hosted_pair();
+        cmd(&mut client, CMD_HOST_START, &[]);
+        let own = client.host.devid;
+        let scan = cmd(&mut client, CMD_BCRD_FETCH, &[]);
+        assert_eq!(scan[0], devid as u32, "it found the other room");
+        assert_ne!(scan[0], own as u32, "and that room is not itself");
+        assert_ne!(host.host.devid, own);
     }
 
     #[test]

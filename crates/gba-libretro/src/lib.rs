@@ -105,6 +105,35 @@ const RETRO_SENSOR_GYROSCOPE_Z: u32 = 5;
 /// been in the stable libretro API for years, unlike the sensor interface above
 /// which carries 0x10000 and is easy to copy the shape of by mistake.
 const RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE: u32 = 23;
+/// The front-end's logger. Plain 27, no experimental bit.
+const RETRO_ENVIRONMENT_GET_LOG_INTERFACE: u32 = 27;
+const RETRO_LOG_INFO: u32 = 1;
+
+/// libretro's logger is printf-shaped, so this is a variadic pointer and every
+/// call goes through a literal "%s" with one argument. Passing a message as
+/// the format string itself would let a game-supplied percent sign read
+/// arbitrary varargs.
+type RetroLogPrintf = unsafe extern "C" fn(level: u32, fmt: *const c_char, ...);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct retro_log_callback {
+    log: Option<RetroLogPrintf>,
+}
+
+/// Write one line to the front-end's log, if it gave us one.
+///
+/// This exists because the wireless adapter failures are all SILENT: a session
+/// bound to the wrong core, two devices minting the same id, a connect that is
+/// never sent. None of them error, and on a phone there is no GBA_RFULOG to
+/// fall back on, so without this the only evidence is the absence of packets.
+fn log_line(logger: Option<RetroLogPrintf>, msg: &str) {
+    let Some(log) = logger else { return };
+    let Ok(c) = std::ffi::CString::new(msg) else { return };
+    // SAFETY: the front-end owns the callback for the core's lifetime, and the
+    // format string is a literal with exactly one matching argument.
+    unsafe { log(RETRO_LOG_INFO, c"%s".as_ptr(), c.as_ptr()) };
+}
 
 const RETRO_RUMBLE_STRONG: u32 = 0;
 const RETRO_RUMBLE_WEAK: u32 = 1;
@@ -211,6 +240,11 @@ struct State {
     /// Whether the front-end accepted the memory map. See
     /// `retro_get_memory_data`: when it did not, we must not answer SYSTEM_RAM.
     map_published: bool,
+    /// The front-end's logger, when it offered one.
+    log: Option<RetroLogPrintf>,
+    /// Last reported adapter session counters, so a line is logged only when
+    /// something actually changes rather than sixty times a second.
+    rfu_last: Option<(u64, u64, u64, u64, &'static str)>,
 }
 
 impl State {
@@ -229,6 +263,8 @@ impl State {
             rumble: None,
             rumble_last: false,
             map_published: false,
+            log: None,
+            rfu_last: None,
         }
     }
 }
@@ -331,6 +367,13 @@ pub extern "C" fn retro_set_environment(cb: retro_environment_t) {
                 netpacket::RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE,
                 &netpacket::CALLBACK as *const _ as *mut c_void,
             );
+            let mut lg = retro_log_callback { log: None };
+            if env(
+                RETRO_ENVIRONMENT_GET_LOG_INTERFACE,
+                &mut lg as *mut retro_log_callback as *mut c_void,
+            ) {
+                with_state(|s| s.log = lg.log);
+            }
         }
     }
 }
@@ -653,6 +696,11 @@ pub extern "C" fn retro_run() {
         // safe to do from inside `with_state`.
         if netpacket::is_active() {
             if let Some(gba) = &mut s.gba {
+                // Cheap and idempotent, and it has to land before the game
+                // hosts a room: the adapter derives its advertised device id
+                // from this, and two devices that both think they are peer 0
+                // advertise the same id and will not join each other.
+                gba.rfu_set_self_id(netpacket::self_id());
                 for (from, bytes) in netpacket::drain_inbound() {
                     gba.rfu_net_receive(&bytes, from);
                 }
@@ -700,6 +748,28 @@ pub extern "C" fn retro_run() {
             if let Some(gba) = &mut s.gba {
                 for pkt in gba.rfu_take_outbox() {
                     netpacket::send(pkt.to, &pkt.bytes);
+                }
+            }
+        }
+
+        // Report what the adapter is doing, but only when it changes. Every
+        // way this feature fails is silent, so without a line here the only
+        // evidence on a phone is the absence of packets, which is exactly how
+        // two separate bugs stayed invisible for a whole device session.
+        if let Some(gba) = &s.gba {
+            if let (Some((cmds, _resets, state)), Some((peers, conns, dropped))) =
+                (gba.rfu_stats(), gba.rfu_session_stats())
+            {
+                let now = (cmds, peers, conns, dropped, state);
+                if s.rfu_last != Some(now) {
+                    s.rfu_last = Some(now);
+                    log_line(
+                        s.log,
+                        &format!(
+                            "[rfu] state={state} self_id={} commands={cmds} peers_seen={peers} connections={conns} dropped={dropped}",
+                            netpacket::self_id()
+                        ),
+                    );
                 }
             }
         }
