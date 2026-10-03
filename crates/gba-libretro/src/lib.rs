@@ -764,14 +764,16 @@ pub extern "C" fn retro_run() {
                 // The command count moves every frame on a busy link, so it is
                 // deliberately NOT part of the change test: including it would
                 // log sixty lines a second and bury the transitions that matter.
-                let now = (0, peers, conns, dropped, state, seen, unknown);
+                let cs = gba.rfu_connect_stats().unwrap_or((0, 0, 0, 0, 0, 0));
+                let now = (cs.0 + cs.1 + cs.2 + cs.3 + cs.4 + cs.5, peers, conns, dropped, state, seen, unknown);
                 if s.rfu_last != Some(now) {
                     s.rfu_last = Some(now);
                     log_line(
                         s.log,
                         &format!(
-                            "[rfu] state={state} self_id={} commands={cmds} peers_seen={peers} connections={conns} dropped={dropped} cmds_seen={seen:016X} unknown={unknown:016X}",
-                            netpacket::self_id()
+                            "[rfu] state={state} self_id={} commands={cmds} peers_seen={peers} connections={conns} dropped={dropped} cmds_seen={seen:016X} unknown={unknown:016X} connect(asked={} nopeer={} sent={} nacked={}) incoming(got={} refused={})",
+                            netpacket::self_id(),
+                            cs.0, cs.1, cs.2, cs.3, cs.4, cs.5
                         ),
                     );
                 }

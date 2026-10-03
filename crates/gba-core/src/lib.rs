@@ -448,6 +448,22 @@ impl Gba {
         self.bus.rfu.as_ref().map(|r| (r.cmd_seen, r.unknown_seen))
     }
 
+    /// Connection accounting: asked, no-peer, sent, nacked, requests received,
+    /// requests refused. "The connect failed" has several distinct causes that
+    /// need opposite fixes, and none of them errors on a device.
+    pub fn rfu_connect_stats(&self) -> Option<(u64, u64, u64, u64, u64, u64)> {
+        self.bus.rfu.as_ref().map(|r| {
+            (
+                r.conn_asked,
+                r.conn_no_peer,
+                r.conn_sent,
+                r.conn_nacked,
+                r.req_got,
+                r.req_refused,
+            )
+        })
+    }
+
     /// Feed the gyroscope, in rad/s. Used by WarioWare Twisted, which senses
     /// rotation about Z only.
     pub fn set_gyroscope(&mut self, x: f32, y: f32, z: f32) {

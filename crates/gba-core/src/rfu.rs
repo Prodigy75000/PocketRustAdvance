@@ -302,6 +302,17 @@ pub struct Rfu {
     /// Peers seen and sessions formed, for the runner summary.
     pub peers_seen: u64,
     pub connections: u64,
+    /// Why a connection attempt did or did not happen. Six counters because
+    /// "the connect failed" has at least that many distinct causes and they
+    /// need opposite fixes: the game never asked, we could not find the host
+    /// it named, we asked and were refused, or we were asked and refused.
+    /// None of them produce an error anywhere on a device.
+    pub conn_asked: u64,
+    pub conn_no_peer: u64,
+    pub conn_sent: u64,
+    pub conn_nacked: u64,
+    pub req_got: u64,
+    pub req_refused: u64,
     /// Bitmask of every command code the game has issued, bit `cmd & 0x3F`.
     /// One number that says exactly which of the protocol the game uses, which
     /// is far more useful on a device than a count: the adapter has no way to
@@ -343,6 +354,12 @@ impl Default for Rfu {
             peers_seen: 0,
             connections: 0,
             self_id: 0,
+            conn_asked: 0,
+            conn_no_peer: 0,
+            conn_sent: 0,
+            conn_nacked: 0,
+            req_got: 0,
+            req_refused: 0,
             cmd_seen: 0,
             unknown_seen: 0,
         }
@@ -373,12 +390,26 @@ impl Rfu {
         let (commands, resets) = (self.commands, self.resets);
         let (dropped, seen, conns) = (self.dropped, self.peers_seen, self.connections);
         let (self_id, cmd_seen, unknown_seen) = (self.self_id, self.cmd_seen, self.unknown_seen);
+        let conns_dbg = (
+            self.conn_asked,
+            self.conn_no_peer,
+            self.conn_sent,
+            self.conn_nacked,
+            self.req_got,
+            self.req_refused,
+        );
         let outbox = std::mem::take(&mut self.outbox);
         *self = Self::default();
         self.outbox = outbox;
         self.self_id = self_id;
         self.cmd_seen = cmd_seen;
         self.unknown_seen = unknown_seen;
+        self.conn_asked = conns_dbg.0;
+        self.conn_no_peer = conns_dbg.1;
+        self.conn_sent = conns_dbg.2;
+        self.conn_nacked = conns_dbg.3;
+        self.req_got = conns_dbg.4;
+        self.req_refused = conns_dbg.5;
         self.commands = commands;
         self.resets = resets + 1;
         self.dropped = dropped;
@@ -705,12 +736,16 @@ impl Rfu {
                 }
                 // The game names a host it saw in a scan. Find whose broadcast
                 // carried that device id and ask them to let us in.
+                self.conn_asked += 1;
                 let want = self.buf[0] as u16;
                 if let Some(i) = (0..MAX_PEERS)
                     .find(|&i| self.peers[i].valid && self.peers[i].device_id == want)
                 {
+                    self.conn_sent += 1;
                     self.link = Link::Connecting;
                     self.send_cmd(i as u16, PKT_CONNECT_REQ, want as u32);
+                } else {
+                    self.conn_no_peer += 1;
                 }
                 // An unknown id is still acknowledged: ISCONNECTED then
                 // reports the failure, which is a path the game handles.
@@ -959,7 +994,9 @@ impl Rfu {
             }
 
             PKT_CONNECT_REQ => {
+                self.req_got += 1;
                 if self.link != Link::Host {
+                    self.req_refused += 1;
                     self.send_cmd(from, PKT_CONNECT_NACK, 0);
                     return;
                 }
@@ -1003,6 +1040,7 @@ impl Rfu {
             }
 
             PKT_CONNECT_NACK => {
+                self.conn_nacked += 1;
                 if self.link == Link::Connecting {
                     self.link = Link::Idle;
                 }
