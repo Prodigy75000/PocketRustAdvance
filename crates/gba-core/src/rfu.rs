@@ -93,6 +93,13 @@ const TX_WORDS: usize = 23;
 /// what this used to do: a game may legitimately ask to send more than it just
 /// handed over, because the adapter is still holding the rest.
 const TX_MAX_HOST: usize = 90;
+
+/// The data field of a data packet, which is a FIXED size on the wire. The
+/// reference sends a struct of three header words and 92 payload bytes, zero
+/// filled past the block, so a short block is padding rather than a shorter
+/// datagram. Ours were 12 + blen bytes, which only ever worked because both
+/// ends were ours.
+const DATA_FIELD: usize = 92;
 const TX_MAX_CLIENT: usize = 16;
 
 /// One adapter frame, in system cycles: a sixtieth of a second.
@@ -931,24 +938,26 @@ impl Rfu {
                 }
 
                 let blen = self.tx_blen as usize;
-                let mut payload = Vec::with_capacity(TX_WORDS * 4);
-                for i in 0..TX_WORDS {
-                    put32(&mut payload, self.tx_buf[i]);
-                }
+                let txb = self.tx_buf;
                 match self.link {
                     Link::Host => {
                         if blen > TX_MAX_HOST {
                             self.tx_too_long += 1;
                             return Ok(0);
                         }
-                        payload.truncate(blen);
                         let mut any = false;
                         for i in 0..4 {
                             let c = self.host.clients[i];
                             if c.devid != 0 {
                                 any = true;
                                 self.blocks_out += 1;
-                                self.send_data(c.client_id, PKT_HOST_SEND, blen as u32, &payload);
+                                self.send_data(
+                                    c.client_id,
+                                    PKT_HOST_SEND,
+                                    blen as u32,
+                                    &txb,
+                                    blen,
+                                );
                             }
                         }
                         if !any {
@@ -960,13 +969,12 @@ impl Rfu {
                             self.tx_too_long += 1;
                             return Ok(0);
                         }
-                        payload.truncate(blen);
                         let h = self.client.devid as u32
                             | ((self.client.clnum as u32) << 16)
                             | ((blen as u32) << 24);
                         let host = self.client.host_id;
                         self.blocks_out += 1;
-                        self.send_data(host, PKT_CLIENT_SEND, h, &payload);
+                        self.send_data(host, PKT_CLIENT_SEND, h, &txb, blen);
                     }
                     _ => return Err(1),
                 }
@@ -997,7 +1005,11 @@ impl Rfu {
                             for k in 0..4 {
                                 w[k] = b.get(i * 4 + k).copied().unwrap_or(0);
                             }
-                            self.buf[i] = u32::from_be_bytes(w);
+                            // Little-endian, matching how it went on the
+                            // wire. The last word of a block whose length is
+                            // not a multiple of four is a partial word, and the
+                            // game means its LOW bytes.
+                            self.buf[i] = u32::from_le_bytes(w);
                         }
                         Ok(words as u8)
                     }
@@ -1064,12 +1076,39 @@ impl Rfu {
         self.outbox.push(OutPacket { to, bytes });
     }
 
-    fn send_data(&mut self, to: u16, ptype: u32, header: u32, payload: &[u8]) {
-        let mut bytes = Vec::with_capacity(12 + payload.len());
+    /// A room announcement: nine big-endian words, 36 bytes. Its six payload
+    /// words are NOT byte swapped the way a data block is, because the
+    /// reference writes them one word at a time in network order. Two framings
+    /// for two packet types, which is why this is its own function rather than
+    /// a data packet with a short payload.
+    fn send_bcast(&mut self, header: u32, bdata: &[u32; 6]) {
+        let mut bytes = Vec::with_capacity(36);
+        put32(&mut bytes, NET_HEADER);
+        put32(&mut bytes, PKT_BROADCAST);
+        put32(&mut bytes, header);
+        for &w in bdata {
+            put32(&mut bytes, w);
+        }
+        self.outbox.push(OutPacket { to: BROADCAST_ID, bytes });
+    }
+
+    /// One data packet: **always exactly 104 bytes**, three big-endian header
+    /// words then a fixed 92-byte data field zero filled past the block.
+    ///
+    /// The payload bytes go out LITTLE-endian within each word, which is what
+    /// the reference does and what its comment says the radio does. This is not
+    /// only about interop. A block length that is not a whole number of words
+    /// cuts the final word, and big-endian packing keeps the WRONG HALF of it:
+    /// the game means the low bytes, because it is a little-endian machine.
+    fn send_data(&mut self, to: u16, ptype: u32, header: u32, words: &[u32], plen: usize) {
+        let mut bytes = Vec::with_capacity(12 + DATA_FIELD);
         put32(&mut bytes, NET_HEADER);
         put32(&mut bytes, ptype);
         put32(&mut bytes, header);
-        bytes.extend_from_slice(payload);
+        bytes.resize(12 + DATA_FIELD, 0);
+        for i in 0..plen.min(DATA_FIELD) {
+            bytes[12 + i] = (words[i / 4] >> (8 * (i as u32 & 3))) as u8;
+        }
         self.outbox.push(OutPacket { to, bytes });
     }
 
@@ -1092,11 +1131,7 @@ impl Rfu {
             if self.host.tx_ttl >= ANNOUNCE_FRAMES {
                 self.host.tx_ttl = 0;
                 let (devid, bdata) = (self.host.devid, self.host.bdata);
-                let mut payload = Vec::with_capacity(24);
-                for w in bdata {
-                    put32(&mut payload, w);
-                }
-                self.send_data(BROADCAST_ID, PKT_BROADCAST, devid as u32, &payload);
+                self.send_bcast(devid as u32, &bdata);
             }
             for i in 0..4 {
                 if self.host.clients[i].devid != 0 {
@@ -1855,6 +1890,42 @@ mod tests {
             cmd(&mut client, CMD_RECV_DATA, &[]),
             vec![0x1122_3344, 0],
             "eight bytes arrive, the tail zero filled rather than stale"
+        );
+    }
+
+    #[test]
+    fn a_data_packet_matches_the_reference_byte_for_byte() {
+        // The one packet whose framing was never pinned, and the one that was
+        // wrong. Asserted as literal bytes rather than against our own
+        // constants, because the point is agreeing with the reference.
+        let (mut host, _client) = joined_pair();
+        host.take_outbox();
+        cmd(&mut host, CMD_SEND_DATA, &[6, 0x1122_3344, 0x5566_7788]);
+        let out = host.take_outbox();
+        let pkt = &out[0];
+        assert_eq!(pkt.bytes.len(), 104, "a fixed size struct, not a short packet");
+        assert_eq!(&pkt.bytes[0..4], b"RFU1");
+        assert_eq!(&pkt.bytes[4..8], &[0, 0, 0, 5], "type 5 is a host send");
+        assert_eq!(&pkt.bytes[8..12], &[0, 0, 0, 6], "the header word carries the length");
+        // Six bytes of a two word block, little-endian: the whole first word
+        // low byte first, then the LOW half of the second. Big-endian packing
+        // puts the high half here, which is the wrong half of the word.
+        assert_eq!(&pkt.bytes[12..18], &[0x44, 0x33, 0x22, 0x11, 0x88, 0x77]);
+        assert!(
+            pkt.bytes[18..].iter().all(|&b| b == 0),
+            "zero filled past the block"
+        );
+    }
+
+    #[test]
+    fn a_block_that_is_not_whole_words_keeps_the_low_half_of_the_last() {
+        let (mut host, mut client) = joined_pair();
+        cmd(&mut host, CMD_SEND_DATA, &[6, 0x1122_3344, 0x5566_7788]);
+        deliver(&mut host, 0, &mut client, 1);
+        assert_eq!(
+            cmd(&mut client, CMD_RECV_DATA, &[]),
+            vec![0x1122_3344, 0x0000_7788],
+            "six bytes is one word and the LOW half of the next"
         );
     }
 
