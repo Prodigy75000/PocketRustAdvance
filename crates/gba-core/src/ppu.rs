@@ -831,12 +831,33 @@ impl Ppu {
         let py = bgy % 8;
 
         let key = ((priority as u16) << 8) | rank as u16;
-        for x in 0..SCREEN_W {
-            // Skip if this BG can't beat the winner (or, when blending, the second).
-            if key >= comp.threshold(x) {
+        // Walked a TILE AT A TIME rather than a pixel at a time.
+        //
+        // Every value below that names a tile is identical for the eight pixels
+        // of that tile, and this loop used to recompute all of it per pixel:
+        // the screenblock `match`, the tile coordinates, the map address, two
+        // folded VRAM reads for the map entry, and the tile's row of pixels. On
+        // LeafGreen the backgrounds were 264 us of a 917 us frame, 76% of all
+        // render time, measured with GBA_PPUPROF.
+        //
+        // Safe because `w` and `h` are always multiples of 8: a tile can never
+        // straddle a screenblock boundary and `bgx` cannot wrap mid-run, so the
+        // per-tile values really are constant across the run.
+        let mut x = 0usize;
+        while x < SCREEN_W {
+            let bgx = (x + hofs) & (w - 1);
+            let in_tile = bgx % 8;
+            let run = (8 - in_tile).min(SCREEN_W - x);
+
+            // If this BG cannot beat the winner anywhere in the run, skip the
+            // whole tile. Keeping this check FIRST preserves the pruning the
+            // per-pixel loop had: without it, hoisting the fetches would make a
+            // fully covered tile more expensive rather than less.
+            if !(0..run).any(|k| key < comp.threshold(x + k)) {
+                x += run;
                 continue;
             }
-            let bgx = (x + hofs) & (w - 1);
+
             let sb_x = bgx / 256;
             // Screenblock index within the (up to 2x2) map arrangement.
             let sb = match (w, h) {
@@ -850,26 +871,43 @@ impl Ppu {
             let entry =
                 u16::from_le_bytes([self.vram[Self::vram_fold(map)], self.vram[Self::vram_fold(map + 1)]]);
             let tile = (entry & 0x3FF) as usize;
-            let px = if entry & 0x400 != 0 { 7 - (bgx % 8) } else { bgx % 8 };
-            let py = if entry & 0x800 != 0 { 7 - py } else { py };
+            let flip_x = entry & 0x400 != 0;
+            let tpy = if entry & 0x800 != 0 { 7 - py } else { py };
+            let pal_hi = ((entry >> 12) & 0xF) as usize * 16;
 
-            let idx = if is_8bpp {
-                self.vram[Self::vram_fold(char_base + tile * 64 + py * 8 + px)] as usize
+            // The tile's eight pixels for this row, fetched once.
+            let mut row = [0u8; 8];
+            if is_8bpp {
+                let base = char_base + tile * 64 + tpy * 8;
+                for (i, r) in row.iter_mut().enumerate() {
+                    *r = self.vram[Self::vram_fold(base + i)];
+                }
             } else {
-                let b = self.vram[Self::vram_fold(char_base + tile * 32 + py * 4 + px / 2)];
-                (if px & 1 == 0 { b & 0xF } else { b >> 4 }) as usize
-            };
-            if idx == 0 {
-                continue; // transparent
+                let base = char_base + tile * 32 + tpy * 4;
+                for i in 0..4 {
+                    let b = self.vram[Self::vram_fold(base + i)];
+                    row[i * 2] = b & 0xF;
+                    row[i * 2 + 1] = b >> 4;
+                }
             }
-            let pal = if is_8bpp {
-                idx
-            } else {
-                ((entry >> 12) & 0xF) as usize * 16 + idx
-            };
-            let color =
-                u16::from_le_bytes([self.palram[pal * 2], self.palram[pal * 2 + 1]]) & 0x7FFF;
-            comp.place(x, color, bg as u8, priority, rank, false);
+
+            for k in 0..run {
+                let xx = x + k;
+                if key >= comp.threshold(xx) {
+                    continue;
+                }
+                let bx = in_tile + k;
+                let px = if flip_x { 7 - bx } else { bx };
+                let idx = row[px] as usize;
+                if idx == 0 {
+                    continue; // transparent
+                }
+                let pal = if is_8bpp { idx } else { pal_hi + idx };
+                let color =
+                    u16::from_le_bytes([self.palram[pal * 2], self.palram[pal * 2 + 1]]) & 0x7FFF;
+                comp.place(xx, color, bg as u8, priority, rank, false);
+            }
+            x += run;
         }
     }
 

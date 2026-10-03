@@ -489,12 +489,27 @@ fn main() {
             gba.bus.ppu.prof = Some(Default::default());
         }
         let measured = frames.saturating_sub(warmup);
+        // GBA_FBHASH: fold every rendered frame into one hash, so a refactor of
+        // the renderer can be proven byte-identical across many ROMs instead of
+        // eyeballed. Off by default because reading the framebuffer back would
+        // perturb the benchmark.
+        let want_hash = std::env::var_os("GBA_FBHASH").is_some();
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let t1 = std::time::Instant::now();
         for f in 0..measured {
             press(&mut gba, warmup + f);
-            gba.run_frame();
+            let fb = gba.run_frame();
+            if want_hash {
+                for &px in fb.iter() {
+                    hash ^= px as u64;
+                    hash = hash.wrapping_mul(0x100_0000_01b3);
+                }
+            }
         }
         let el = t1.elapsed();
+        if want_hash {
+            println!("FBHASH {hash:016X}");
+        }
         let secs = el.as_secs_f64();
         println!(
             "BENCH warmup={warmup} frames={measured} {:.3}s {:.1} fps {:.0} us/frame (warmup {:.3}s)",
