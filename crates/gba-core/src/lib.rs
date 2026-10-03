@@ -192,6 +192,28 @@ impl Gba {
 
     /// Run one full frame (228 scanlines) and return the RGB555 framebuffer.
     pub fn run_frame(&mut self) -> &[u16] {
+        self.run_frame_polling(&mut || Vec::new())
+    }
+
+    /// Run one frame, asking `poll` for inbound adapter packets **while the
+    /// adapter is holding the clock**, not only at the frame boundary.
+    ///
+    /// Draining the transport once per frame and then running 16 ms with
+    /// nothing arriving makes the receive queue peak at the frame edge: a peer
+    /// streaming a trade can put more blocks on the wire during one of our
+    /// frames than the queue can hold, and the overflow is then arithmetic
+    /// rather than bad luck. Measured on hardware: a host reached the queue
+    /// ceiling of 16 and discarded 14 blocks during a trade that only survived
+    /// because the game retried.
+    ///
+    /// The reference polls in two places, once a frame and again whenever the
+    /// adapter is mid-wait, and this is the second of those. `poll` must not
+    /// reach back into this core; the front-end's netpacket state is separate
+    /// from it for exactly this reason.
+    pub fn run_frame_polling<F>(&mut self, poll: &mut F) -> &[u16]
+    where
+        F: FnMut() -> Vec<(u16, Vec<u8>)>,
+    {
         for line in 0..TOTAL_LINES {
             if line == 0 {
                 self.bus.frame_no = self.bus.frame_no.wrapping_add(1);
@@ -214,6 +236,16 @@ impl Gba {
             self.bus.raise_ppu_irqs(line as u16);
             self.bus.step_timers();
             self.bus.step_serial();
+            // Only while the adapter is waiting on the air. Outside that window
+            // the game is driving transfers itself and an early delivery buys
+            // nothing, so this costs one check per scanline when idle.
+            if self.bus.rfu.as_ref().map_or(false, |r| r.awaiting_event()) {
+                for (from, bytes) in poll() {
+                    if let Some(rfu) = self.bus.rfu.as_mut() {
+                        rfu.net_receive(&bytes, from);
+                    }
+                }
+            }
             if line == 160 {
                 self.bus.trigger_dma(1); // V-blank DMA
             }
@@ -489,6 +521,22 @@ impl Gba {
                 r.queue_max,
             )
         })
+    }
+
+    /// What the flash save has been asked to do. A non-zero chip-erase count on
+    /// a Gen 3 game means the save was wiped by a COMMAND rather than the
+    /// buffer having been reallocated, and those two are impossible to tell
+    /// apart from the file: both are all 0xFF.
+    pub fn flash_stats(&self) -> Option<(u64, u64, u64, u64, u32, u8)> {
+        let s = &self.bus.save;
+        Some((
+            s.flash_chip_erases,
+            s.flash_sector_erases,
+            s.flash_programs,
+            s.flash_bank_sets,
+            s.flash_last_sector,
+            s.flash_bank_now,
+        ))
     }
 
     pub fn rfu_connect_stats(&self) -> Option<(u64, u64, u64, u64, u64, u64)> {

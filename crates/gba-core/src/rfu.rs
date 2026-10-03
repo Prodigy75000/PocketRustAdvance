@@ -1143,6 +1143,16 @@ impl Rfu {
         (clients, peers)
     }
 
+    /// Is the adapter holding the clock, waiting for something to arrive?
+    ///
+    /// This is the window where the game has stopped driving transfers and is
+    /// waiting on the air, and it is where the reference polls the network. A
+    /// packet that arrives here can end the wait immediately instead of sitting
+    /// in the front-end until the next frame boundary.
+    pub fn awaiting_event(&self) -> bool {
+        self.com == Com::WaitEvent
+    }
+
     /// True when a session is worth keeping alive: hosting, attached, or
     /// part way between the two.
     pub fn in_session(&self) -> bool {

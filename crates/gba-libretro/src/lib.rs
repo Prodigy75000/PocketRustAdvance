@@ -245,6 +245,7 @@ struct State {
     /// Last reported adapter session counters, so a line is logged only when
     /// something actually changes rather than sixty times a second.
     rfu_last: Option<(u64, u64, u64, u64, &'static str, u64, u64)>,
+    flash_last: Option<(u64, u64, u64, u64, u32, u8)>,
 }
 
 impl State {
@@ -265,6 +266,7 @@ impl State {
             map_published: false,
             log: None,
             rfu_last: None,
+            flash_last: None,
         }
     }
 }
@@ -424,7 +426,30 @@ unsafe fn resolve_bios(env: retro_environment_t) -> Vec<u8> {
 pub extern "C" fn retro_reset() {
     with_state(|s| {
         if !s.rom.is_empty() {
+            // **A reset is a power cycle, not a new cartridge.** Rebuilding the
+            // machine runs save detection again, which allocates a BLANK save
+            // (all 0xFF, the erased state of flash), and the front-end then
+            // flushes that over the player's .sav. The save has to be carried
+            // across by hand.
+            //
+            // This destroyed two real saves before it was found, and it looked
+            // like a wireless-adapter bug for hours because the owner reset
+            // after each failed Union Room session: the reset was doing the
+            // damage, not the trade. It is also invisible in the moment, since
+            // the game keeps running on the blank save and only the next flush
+            // writes the file.
+            //
+            // A blank save and a chip-erased one are byte-identical, so the
+            // file cannot tell you which happened. Guarded on the length
+            // matching so a change in save detection can never paste a buffer
+            // of the wrong size into the new machine.
+            let save = s.gba.as_ref().map(|g| g.bus.save.data.clone());
             s.gba = Some(Gba::new(s.rom.clone(), s.bios.clone()));
+            if let (Some(gba), Some(save)) = (s.gba.as_mut(), save) {
+                if gba.bus.save.data.len() == save.len() {
+                    gba.bus.save.data = save;
+                }
+            }
             machine_rebuilt(s);
         }
     });
@@ -735,7 +760,14 @@ pub extern "C" fn retro_run() {
 
         // Run one frame and expand the RGB555 framebuffer to XRGB8888.
         if let Some(gba) = &mut s.gba {
-            let fb = gba.run_frame();
+            // Hand the frame a way to pull packets mid-flight. This closure
+            // only touches the netpacket module's own state, never `State`,
+            // which is what makes it safe to call with the core borrowed.
+            let fb = if netpacket::is_active() {
+                gba.run_frame_polling(&mut netpacket::drain_inbound)
+            } else {
+                gba.run_frame()
+            };
             for (dst, &px) in s.frame.iter_mut().zip(fb.iter()) {
                 *dst = rgb555_to_xrgb8888(px);
             }
@@ -788,6 +820,23 @@ pub extern "C" fn retro_run() {
                             tx.0, tx.1, tx.2,
                             rx.0, rx.1, rx.4, rx.2, rx.3,
                             cl.0, cl.1, cl.2, cl.3, cl.4, cl.5
+                        ),
+                    );
+                }
+            }
+        }
+        // The flash save, which a trade destroyed on both devices at once. A
+        // fresh buffer and a chip-erased one are both all 0xFF, so the file
+        // cannot say which happened and this can. Logged on change only.
+        if let Some(gba) = &s.gba {
+            if let Some(f) = gba.flash_stats() {
+                if s.flash_last != Some(f) {
+                    s.flash_last = Some(f);
+                    log_line(
+                        s.log,
+                        &format!(
+                            "[save] flash chip_erase={} sector_erase={} program={} bank_set={} last_sector={:#06X} bank={}",
+                            f.0, f.1, f.2, f.3, f.4, f.5
                         ),
                     );
                 }
@@ -1076,6 +1125,59 @@ mod tests {
             };
             assert!(retro_load_game(&info));
             CAPTURED.take().expect("core published no memory map")
+        }
+    }
+
+    /// A reset must not erase the cartridge save.
+    ///
+    /// Rebuilding the machine re-runs save detection, which allocates a blank
+    /// all-0xFF buffer, and the front-end flushes whatever
+    /// `retro_get_memory_data` points at to the .sav file. So a reset used to
+    /// destroy the player's save, silently, with the damage only landing on the
+    /// next flush. Two real saves were lost to this on device.
+    ///
+    /// Pinned with a non-0xFF pattern specifically, because a blank save and an
+    /// erased one are both 0xFF and a test written with 0xFF would pass either
+    /// way.
+    #[test]
+    fn a_reset_keeps_the_cartridge_save() {
+        let _core = CORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            retro_unload_game();
+            retro_set_environment(Some(fake_env));
+            let rom = rom_with(b"FLASH1M_V103");
+            let info = retro_game_info {
+                path: ptr::null(),
+                data: rom.as_ptr() as *const c_void,
+                size: rom.len(),
+                meta: ptr::null(),
+            };
+            assert!(retro_load_game(&info));
+
+            let size = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
+            assert!(size >= 0x2_0000, "a 1 Mbit flash save, got {size:#X}");
+
+            // Write a pattern the way a game would see it, through the live
+            // buffer the front-end is handed.
+            let before: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let ptr = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM) as *mut u8;
+            assert!(!ptr.is_null());
+            std::ptr::copy_nonoverlapping(before.as_ptr(), ptr, size);
+
+            retro_reset();
+
+            // The front-end may hold a NEW pointer after a rebuild, so ask
+            // again rather than reusing the old one.
+            let after_ptr = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM) as *const u8;
+            assert!(!after_ptr.is_null(), "still a save after the reset");
+            assert_eq!(
+                retro_get_memory_size(RETRO_MEMORY_SAVE_RAM),
+                size,
+                "the save did not change size"
+            );
+            let after = std::slice::from_raw_parts(after_ptr, size);
+            assert_eq!(after, &before[..], "the save survived the reset");
+            retro_unload_game();
         }
     }
 

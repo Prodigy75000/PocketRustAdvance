@@ -28,6 +28,24 @@ pub struct Save {
     flash_phase: u8,      // 0/1/2 progress through the AA/55/cmd unlock sequence
     flash_id_mode: bool,  // autoselect (device ID) mode
     flash_erase_prep: bool,
+    /// What the flash has been asked to do, for diagnosis only.
+    ///
+    /// **A fresh save and a chip-erased one are byte-identical**, both all
+    /// 0xFF, so a wiped save file cannot say which happened and these can.
+    /// A Gen 3 game erases and rewrites single 4 KB sectors when it saves and
+    /// should never chip erase at all, so a non-zero `flash_chip_erases` is a
+    /// defect on its own.
+    ///
+    /// Deliberately NOT serialized: the savestate format is a byte-identical
+    /// contract across every in-house core and a diagnostic must not touch it.
+    pub flash_chip_erases: u64,
+    pub flash_sector_erases: u64,
+    pub flash_programs: u64,
+    pub flash_bank_sets: u64,
+    /// The last sector erased, and the last bank selected, which is what
+    /// distinguishes "erased the right sector" from "erased sector 0 forever".
+    pub flash_last_sector: u32,
+    pub flash_bank_now: u8,
     flash_write_pending: bool,
     flash_bank_pending: bool,
     flash_bank: usize, // 0/1 for 128 KB
@@ -58,6 +76,12 @@ impl Save {
             flash_phase: 0,
             flash_id_mode: false,
             flash_erase_prep: false,
+            flash_chip_erases: 0,
+            flash_sector_erases: 0,
+            flash_programs: 0,
+            flash_bank_sets: 0,
+            flash_last_sector: 0,
+            flash_bank_now: 0,
             flash_write_pending: false,
             flash_bank_pending: false,
             flash_bank: 0,
@@ -173,11 +197,14 @@ impl Save {
                 self.dirty = true;
             }
             self.flash_write_pending = false;
+            self.flash_programs += 1;
             return;
         }
         if self.flash_bank_pending {
             self.flash_bank = (val & 1) as usize;
             self.flash_bank_pending = false;
+            self.flash_bank_sets += 1;
+            self.flash_bank_now = self.flash_bank as u8;
             return;
         }
         // The reset command (0xF0) returns to read mode from any phase, and is
@@ -202,6 +229,7 @@ impl Save {
                             self.data.fill(0xFF); // chip erase
                             self.dirty = true;
                             self.flash_erase_prep = false;
+                            self.flash_chip_erases += 1;
                         }
                         _ => {}
                     }
@@ -213,6 +241,8 @@ impl Save {
                     }
                     self.dirty = true;
                     self.flash_erase_prep = false;
+                    self.flash_sector_erases += 1;
+                    self.flash_last_sector = base as u32;
                 }
                 self.flash_phase = 0;
             }
