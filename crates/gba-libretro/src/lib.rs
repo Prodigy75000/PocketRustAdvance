@@ -19,6 +19,8 @@
 use gba_core::save::SaveKind;
 use gba_core::sensor::CartSensor;
 use gba_core::{Button, Gba, SCREEN_H, SCREEN_W};
+mod netpacket;
+
 use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_uint, c_void};
 use std::ptr;
@@ -317,6 +319,20 @@ pub unsafe extern "C" fn retro_get_system_av_info(info: *mut retro_system_av_inf
 #[no_mangle]
 pub extern "C" fn retro_set_environment(cb: retro_environment_t) {
     with_state(|s| s.env = cb);
+    // Offer the wireless adapter over the frontend netplay here, NOT from
+    // retro_load_game: the frontend brings a session up around the load, and
+    // an interface registered after that is never started. The host's own
+    // transport notes record melonDS-DS hitting exactly that and silently
+    // falling back to in-process loopback. The frontend keeps the struct, so
+    // it has to be a &'static.
+    if let Some(env) = cb {
+        unsafe {
+            env(
+                netpacket::RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE,
+                &netpacket::CALLBACK as *const _ as *mut c_void,
+            );
+        }
+    }
 }
 
 #[no_mangle]
@@ -626,6 +642,23 @@ pub extern "C" fn retro_run() {
             }
         }
 
+        // The wireless adapter, if a session is live. Inbound first so a
+        // packet that arrived during the last frame is visible to this one,
+        // then outbound so anything the game just produced leaves immediately
+        // rather than waiting a frame.
+        //
+        // `drain_inbound` calls the frontend's poll, which re-enters us
+        // through the receive callback; that callback only touches the
+        // netpacket module's own state, never `State`, which is why this is
+        // safe to do from inside `with_state`.
+        if netpacket::is_active() {
+            if let Some(gba) = &mut s.gba {
+                for (from, bytes) in netpacket::drain_inbound() {
+                    gba.rfu_net_receive(&bytes, from);
+                }
+            }
+        }
+
         // Rumble. The game toggles GPIO bit 3 far faster than a phone motor can
         // follow, so this is a level rather than an event, and it is only sent
         // when it changes: a front-end that queues every call would otherwise
@@ -657,6 +690,17 @@ pub extern "C" fn retro_run() {
             let fb = gba.run_frame();
             for (dst, &px) in s.frame.iter_mut().zip(fb.iter()) {
                 *dst = rgb555_to_xrgb8888(px);
+            }
+        }
+
+        // Anything the adapter produced during that frame goes out now. Doing
+        // it after the frame rather than before means a reply leaves in the
+        // same frame the game asked for it, instead of sitting for 16 ms.
+        if netpacket::is_active() {
+            if let Some(gba) = &mut s.gba {
+                for pkt in gba.rfu_take_outbox() {
+                    netpacket::send(pkt.to, &pkt.bytes);
+                }
             }
         }
         if let Some(video) = s.video {

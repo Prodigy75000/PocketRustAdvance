@@ -195,6 +195,13 @@ impl Gba {
         for line in 0..TOTAL_LINES {
             if line == 0 {
                 self.bus.frame_no = self.bus.frame_no.wrapping_add(1);
+                // The adapter re-announces a hosted room about twice a second
+                // and ages out peers it has stopped hearing from. Driven from
+                // here rather than from the front-end so the offline runner
+                // behaves the same way.
+                if let Some(rfu) = self.bus.rfu.as_mut() {
+                    rfu.frame_update();
+                }
             }
             self.bus.line_cycle_base = self.bus.cycles;
             self.bus.audio_line_base = self.audio_clock;
@@ -392,6 +399,37 @@ impl Gba {
             .rfu
             .as_ref()
             .map(|r| (r.commands, r.resets, r.state_name()))
+    }
+
+    /// Hand the adapter a packet that arrived from `from`, the frontend id of
+    /// the peer that sent it.
+    pub fn rfu_net_receive(&mut self, buf: &[u8], from: u16) {
+        if let Some(rfu) = self.bus.rfu.as_mut() {
+            rfu.net_receive(buf, from);
+        }
+    }
+
+    /// Take the packets the adapter wants put on the wire.
+    pub fn rfu_take_outbox(&mut self) -> Vec<crate::rfu::OutPacket> {
+        match self.bus.rfu.as_mut() {
+            Some(rfu) => rfu.take_outbox(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Is the adapter hosting a room or attached to one?
+    pub fn rfu_in_session(&self) -> bool {
+        self.bus.rfu.as_ref().is_some_and(|r| r.in_session())
+    }
+
+    /// Peers heard from, sessions formed, and packets dropped for want of
+    /// queue space. A drop in the middle of a trade shifts every later block,
+    /// so it is counted rather than swallowed.
+    pub fn rfu_session_stats(&self) -> Option<(u64, u64, u64)> {
+        self.bus
+            .rfu
+            .as_ref()
+            .map(|r| (r.peers_seen, r.connections, r.dropped))
     }
 
     /// Feed the gyroscope, in rad/s. Used by WarioWare Twisted, which senses

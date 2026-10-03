@@ -1,0 +1,240 @@
+//! libretro netpacket interface (env 78): the wireless adapter over the
+//! frontend's netplay.
+//!
+//! Trophy Hub's host (and any libretro netplay frontend) drives cores that
+//! implement `RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE`. We hand it a struct
+//! of callbacks; on session start it gives us a `send_fn` for pushing bytes at
+//! peers and calls our `receive` for each inbound packet. We bridge that to
+//! `gba_core::rfu`, which holds the whole protocol and is unit-tested against
+//! a model of this transport.
+//!
+//! **Netpacket state lives in its own global, deliberately separate from the
+//! core's `State`.** The frontend calls `receive` from inside `poll_receive`,
+//! which we call from `retro_run` while `State` is already borrowed, so
+//! reaching for the core from the callback would be a re-entrant `&mut`. The
+//! callback therefore only queues bytes; `retro_run` drains the queue into the
+//! core afterwards. The same shape as PocketRust's link cable, for the same
+//! reason.
+
+use std::cell::UnsafeCell;
+use std::ffi::{c_char, c_void};
+
+pub const RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE: u32 = 78;
+const RETRO_NETPACKET_RELIABLE: i32 = 1 << 0;
+const RETRO_NETPACKET_FLUSH_HINT: i32 = 1 << 2;
+
+/// The protocol string the frontend compares between peers before it will pair
+/// them.
+///
+/// Our packets are byte-identical to gpSP's `RFU1` format, so claiming gpSP's
+/// `"gpSP v1.0"` here would let a device running gpSP into a session with one
+/// running this core, which would be a useful reference peer. That is
+/// deliberately NOT done yet: a peer that is not genuinely compatible must
+/// refuse a session rather than corrupt one silently, and our session layer has
+/// not been checked against gpSP's end to end. Bump the number here whenever
+/// the wire changes in a way an older build would mis-parse.
+static PROTOCOL: &[u8] = b"pocketrustadvance-rfu-1\0";
+
+type SendFn = unsafe extern "C" fn(flags: i32, buf: *const c_void, len: usize, client_id: u16);
+type PollReceiveFn = unsafe extern "C" fn();
+type StartFn = unsafe extern "C" fn(u16, SendFn, PollReceiveFn);
+type ReceiveFn = unsafe extern "C" fn(*const c_void, usize, u16);
+type StopFn = unsafe extern "C" fn();
+type PollFn = unsafe extern "C" fn();
+type ConnectedFn = unsafe extern "C" fn(u16) -> bool;
+type DisconnectedFn = unsafe extern "C" fn(u16);
+
+#[repr(C)]
+pub struct RetroNetpacketCallback {
+    start: Option<StartFn>,
+    receive: Option<ReceiveFn>,
+    stop: Option<StopFn>,
+    poll: Option<PollFn>,
+    connected: Option<ConnectedFn>,
+    disconnected: Option<DisconnectedFn>,
+    protocol_version: *const c_char,
+}
+
+// SAFETY: the frontend only reads this struct (function pointers and a static
+// string), and we share it as a &'static.
+unsafe impl Sync for RetroNetpacketCallback {}
+
+/// The callback struct handed to the frontend via env 78.
+pub static CALLBACK: RetroNetpacketCallback = RetroNetpacketCallback {
+    start: Some(np_start),
+    receive: Some(np_receive),
+    stop: Some(np_stop),
+    poll: None,
+    connected: None,
+    disconnected: None,
+    protocol_version: PROTOCOL.as_ptr() as *const c_char,
+};
+
+struct Net {
+    send_fn: Option<SendFn>,
+    poll_receive_fn: Option<PollReceiveFn>,
+    active: bool,
+    /// Our own id in the session. Kept for diagnostics; the adapter addresses
+    /// peers by the ids the frontend reports on inbound packets.
+    self_id: u16,
+    /// Packets received inside `poll_receive`, waiting to be handed to the
+    /// core once it is no longer borrowed.
+    inbox: Vec<(u16, Vec<u8>)>,
+}
+
+impl Net {
+    const fn new() -> Net {
+        Net {
+            send_fn: None,
+            poll_receive_fn: None,
+            active: false,
+            self_id: 0,
+            inbox: Vec::new(),
+        }
+    }
+}
+
+struct Global(UnsafeCell<Net>);
+// SAFETY: libretro serializes every call into the core, and the netpacket
+// callbacks are documented to run on the emulation thread inside `retro_run`
+// or inside one another, never concurrently.
+unsafe impl Sync for Global {}
+
+static NET: Global = Global(UnsafeCell::new(Net::new()));
+
+fn with_net<R>(f: impl FnOnce(&mut Net) -> R) -> R {
+    // SAFETY: see `Global`.
+    unsafe { f(&mut *NET.0.get()) }
+}
+
+unsafe extern "C" fn np_start(client_id: u16, send: SendFn, poll_receive: PollReceiveFn) {
+    with_net(|n| {
+        n.send_fn = Some(send);
+        n.poll_receive_fn = Some(poll_receive);
+        n.self_id = client_id;
+        n.active = true;
+        n.inbox.clear();
+    });
+}
+
+unsafe extern "C" fn np_receive(buf: *const c_void, len: usize, client_id: u16) {
+    if buf.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: the frontend guarantees `buf` is readable for `len` bytes for the
+    // duration of this call, so the copy has to happen here.
+    let bytes = unsafe { std::slice::from_raw_parts(buf as *const u8, len) }.to_vec();
+    with_net(|n| n.inbox.push((client_id, bytes)));
+}
+
+unsafe extern "C" fn np_stop() {
+    with_net(|n| {
+        n.send_fn = None;
+        n.poll_receive_fn = None;
+        n.active = false;
+        n.inbox.clear();
+    });
+}
+
+/// Is a netplay session live?
+pub fn is_active() -> bool {
+    with_net(|n| n.active)
+}
+
+/// Ask the frontend to deliver anything waiting, then take what arrived.
+///
+/// Calling `poll_receive` re-enters us through `np_receive`, which is why that
+/// callback only touches this module's own state.
+pub fn drain_inbound() -> Vec<(u16, Vec<u8>)> {
+    let poll = with_net(|n| n.poll_receive_fn);
+    if let Some(poll) = poll {
+        // SAFETY: called from `retro_run` on the emulation thread, which is
+        // where libretro requires it.
+        unsafe { poll() };
+    }
+    with_net(|n| std::mem::take(&mut n.inbox))
+}
+
+/// Put one packet on the wire.
+///
+/// Reliable and flushed: the adapter protocol has no sequence numbers of its
+/// own, so a dropped connect or disconnect would strand a player, and a
+/// re-ordered data block would corrupt a trade.
+pub fn send(to: u16, bytes: &[u8]) {
+    let send_fn = with_net(|n| n.send_fn);
+    if let Some(send_fn) = send_fn {
+        // SAFETY: called from `retro_run`, as libretro requires.
+        unsafe {
+            send_fn(
+                RETRO_NETPACKET_RELIABLE | RETRO_NETPACKET_FLUSH_HINT,
+                bytes.as_ptr() as *const c_void,
+                bytes.len(),
+                to,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_env_command_is_the_literal_78() {
+        // Asserted against the number rather than against our own constant,
+        // for the same reason the rumble interface is: a test phrased in terms
+        // of the symbol it is checking agrees with any bug in it. 78 is plain,
+        // with no experimental bit, unlike the sensor interface.
+        assert_eq!(RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE, 78);
+        assert_eq!(RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE & 0x1_0000, 0);
+    }
+
+    #[test]
+    fn the_protocol_string_is_nul_terminated() {
+        // It is handed to the frontend as a C string. Without the terminator
+        // the frontend reads off the end of our static and compares garbage,
+        // which would fail to pair two identical builds.
+        assert_eq!(*PROTOCOL.last().unwrap(), 0);
+        assert!(PROTOCOL[..PROTOCOL.len() - 1].iter().all(|&b| b != 0));
+    }
+
+    #[test]
+    fn the_protocol_string_is_not_gpsps() {
+        // Our packets are deliberately byte-compatible with gpSP, which makes
+        // it tempting to claim its version string and gain a reference peer.
+        // Until the session layer has been checked against gpSP end to end,
+        // pairing with it would risk corrupting a real trade rather than
+        // failing cleanly.
+        assert_ne!(PROTOCOL, b"gpSP v1.0\0");
+    }
+
+    #[test]
+    fn a_null_or_empty_packet_is_ignored() {
+        with_net(|n| n.inbox.clear());
+        unsafe {
+            np_receive(std::ptr::null(), 16, 1);
+            np_receive([1u8, 2, 3].as_ptr() as *const c_void, 0, 1);
+        }
+        assert!(with_net(|n| n.inbox.is_empty()));
+    }
+
+    #[test]
+    fn a_received_packet_is_copied_out_with_its_sender() {
+        with_net(|n| n.inbox.clear());
+        let buf = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        unsafe { np_receive(buf.as_ptr() as *const c_void, buf.len(), 7) };
+        let got = with_net(|n| std::mem::take(&mut n.inbox));
+        assert_eq!(got, vec![(7u16, vec![0xDE, 0xAD, 0xBE, 0xEF])]);
+    }
+
+    #[test]
+    fn stopping_a_session_drops_everything_including_queued_packets() {
+        unsafe {
+            np_receive([9u8].as_ptr() as *const c_void, 1, 1);
+            np_stop();
+        }
+        assert!(!is_active());
+        assert!(with_net(|n| n.inbox.is_empty()));
+        assert!(with_net(|n| n.send_fn.is_none()));
+    }
+}

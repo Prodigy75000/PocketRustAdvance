@@ -76,6 +76,108 @@ const MAX_RESP: usize = 4 * 7;
 /// One adapter frame, in system cycles: a sixtieth of a second.
 const FRAME_CYCLES: u32 = 16_777_216 / 60;
 
+// --- The wire, between two adapters -----------------------------------------
+//
+// Deliberately byte-identical to gpSP's RFU packets: four-byte big-endian
+// words, a magic header, a type, a header word, then payload. Keeping the
+// format identical costs nothing now and leaves the door open to pairing a
+// gpSP device with one running this core, which would give us a reference peer
+// to debug against. The protocol VERSION string we hand the frontend is our
+// own, so the frontend will not actually pair us with gpSP until we say it is
+// safe: a peer that is not truly compatible must refuse a session rather than
+// corrupt it silently.
+
+/// "RFU1".
+const NET_HEADER: u32 = 0x5246_5531;
+
+const PKT_BROADCAST: u32 = 0x00;
+const PKT_CONNECT_REQ: u32 = 0x01;
+const PKT_CONNECT_ACK: u32 = 0x02;
+const PKT_CONNECT_NACK: u32 = 0x03;
+const PKT_DISCONNECT: u32 = 0x04;
+const PKT_HOST_SEND: u32 = 0x05;
+const PKT_CLIENT_SEND: u32 = 0x06;
+const PKT_CLIENT_ACK: u32 = 0x07;
+
+/// The frontend's "send to everyone" client id.
+pub const BROADCAST_ID: u16 = 0xFFFF;
+
+/// Peers we will remember broadcasting. gpSP's cap, and the table is indexed
+/// by the frontend's client id so it has to be at least as large as a session.
+const MAX_PEERS: usize = 32;
+
+/// A host re-announces itself this often, in frames: about twice a second.
+const ANNOUNCE_FRAMES: u8 = 30;
+
+/// Frames of silence before a peer's broadcast is forgotten, and before a host
+/// gives up on a client. Both are about four seconds.
+const PEER_TTL: u8 = 255;
+const CLIENT_TTL: u8 = 240;
+
+/// How many packets each direction will hold before dropping. A drop is
+/// visible rather than silent, see `dropped`.
+const QUEUE_DEPTH: usize = 16;
+
+/// One packet the frontend should put on the wire.
+pub struct OutPacket {
+    /// Frontend client id, or `BROADCAST_ID`.
+    pub to: u16,
+    pub bytes: Vec<u8>,
+}
+
+fn put32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+fn get32(buf: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+/// A host another adapter has announced, as last heard.
+#[derive(Clone, Copy, Default)]
+struct Peer {
+    valid: bool,
+    device_id: u16,
+    ttl: u8,
+    /// The six words of game-supplied advertisement: in Pokemon this carries
+    /// the trainer name and what the room is for.
+    data: [u32; 6],
+}
+
+/// A client attached to us while we are the host.
+#[derive(Clone, Copy, Default)]
+struct HostClient {
+    /// Adapter-assigned id. Zero means the slot is free.
+    devid: u16,
+    /// The frontend's id for that peer, which is how we address it.
+    client_id: u16,
+    /// Frames since we last heard from it.
+    ttl: u8,
+}
+
+#[derive(Default)]
+struct HostState {
+    devid: u16,
+    clients: [HostClient; 4],
+    /// What we advertise, set by BCST_DATA.
+    bdata: [u32; 6],
+    /// Frames since our last announcement.
+    tx_ttl: u8,
+    /// Data each client has sent us, oldest first.
+    inbox: [std::collections::VecDeque<Vec<u8>>; 4],
+}
+
+#[derive(Default)]
+struct ClientState {
+    devid: u16,
+    clnum: u8,
+    /// Frontend id of the host we are attached to.
+    host_id: u16,
+    /// Frames since we last heard from it.
+    host_ttl: u8,
+    inbox: std::collections::VecDeque<Vec<u8>>,
+}
+
 /// Where the adapter is in a single command exchange.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum Com {
@@ -172,8 +274,6 @@ pub struct Rfu {
     /// SYSCFG.
     timeout: u8,
     rtx_max: u8,
-    /// Our own device id once hosting. Zero until then.
-    devid: u16,
     /// Cycles left before the adapter gives up waiting for an event, and
     /// before it decides a retransmit round has elapsed.
     timeout_cycles: u32,
@@ -186,6 +286,22 @@ pub struct Rfu {
     /// climbing while `commands` stays put is the signature of a failed
     /// handshake rather than of a failed command.
     pub resets: u64,
+
+    // --- session, everything below is the air rather than the game ---
+    /// Hosts we have heard announce themselves, indexed by frontend client id.
+    peers: [Peer; MAX_PEERS],
+    host: HostState,
+    client: ClientState,
+    /// Packets waiting for the frontend to send. The core cannot reach the
+    /// network itself, so it produces these and the libretro layer drains
+    /// them. That keeps this module pure and testable against a model wire.
+    outbox: Vec<OutPacket>,
+    /// Packets dropped because a queue was full. A silent drop in a trade
+    /// shifts every later byte, so it is counted rather than ignored.
+    pub dropped: u64,
+    /// Peers seen and sessions formed, for the runner summary.
+    pub peers_seen: u64,
+    pub connections: u64,
 }
 
 impl Default for Rfu {
@@ -200,11 +316,17 @@ impl Default for Rfu {
             prev: 0,
             timeout: 0,
             rtx_max: 0,
-            devid: 0,
             timeout_cycles: 0,
             resp_cycles: 0,
             commands: 0,
             resets: 0,
+            peers: [Peer::default(); MAX_PEERS],
+            host: HostState::default(),
+            client: ClientState::default(),
+            outbox: Vec::new(),
+            dropped: 0,
+            peers_seen: 0,
+            connections: 0,
         }
     }
 }
@@ -218,10 +340,28 @@ impl Rfu {
     /// diagnostic counters deliberately survive, since they are about the run
     /// rather than about the device.
     pub fn reset(&mut self) {
+        // Tell any attached clients we are going BEFORE wiping the table.
+        // A game power-cycling the adapter mid-session would otherwise orphan
+        // them, and they spin on a wait that never resolves. gpSP carries the
+        // same fix; it was not in upstream.
+        if self.link == Link::Host {
+            for i in 0..4 {
+                let c = self.host.clients[i];
+                if c.devid != 0 {
+                    self.send_cmd(c.client_id, PKT_DISCONNECT, c.devid as u32 | ((i as u32) << 16));
+                }
+            }
+        }
         let (commands, resets) = (self.commands, self.resets);
+        let (dropped, seen, conns) = (self.dropped, self.peers_seen, self.connections);
+        let outbox = std::mem::take(&mut self.outbox);
         *self = Self::default();
+        self.outbox = outbox;
         self.commands = commands;
         self.resets = resets + 1;
+        self.dropped = dropped;
+        self.peers_seen = seen;
+        self.connections = conns;
     }
 
     /// True when the adapter holds the clock and the game should be listening.
@@ -348,7 +488,40 @@ impl Rfu {
         match self.cmd {
             // Acknowledged without further effect. The adapter clearly does
             // something with these, but a bare ack is all any game needs.
-            CMD_INIT1 | CMD_INIT2 | CMD_CFGSTAT | CMD_RECV_DATA | CMD_DISCONNECT => Ok(0),
+            CMD_INIT1 | CMD_INIT2 | CMD_CFGSTAT => Ok(0),
+
+            // Tear the session down and tell the other end, so nobody is left
+            // waiting on a peer that has gone.
+            CMD_DISCONNECT => {
+                match self.link {
+                    Link::Host => {
+                        for i in 0..4 {
+                            let c = self.host.clients[i];
+                            if c.devid != 0 {
+                                self.send_cmd(
+                                    c.client_id,
+                                    PKT_DISCONNECT,
+                                    c.devid as u32 | ((i as u32) << 16),
+                                );
+                            }
+                        }
+                        self.host = HostState::default();
+                    }
+                    Link::Client => {
+                        let (host, devid, clnum) =
+                            (self.client.host_id, self.client.devid, self.client.clnum);
+                        self.send_cmd(
+                            host,
+                            PKT_DISCONNECT,
+                            devid as u32 | ((clnum as u32) << 16),
+                        );
+                        self.client = ClientState::default();
+                    }
+                    _ => {}
+                }
+                self.link = Link::Idle;
+                Ok(0)
+            }
 
             CMD_SYSCFG => {
                 // Low byte is the slave timeout, next byte the retransmit
@@ -365,8 +538,12 @@ impl Rfu {
 
             CMD_SYSSTAT => {
                 self.buf[0] = match self.link {
-                    Link::Host => (1 << 24) | self.devid as u32,
-                    // With no session layer we are never a client.
+                    Link::Host => (1 << 24) | self.host.devid as u32,
+                    Link::Client => {
+                        (5 << 24)
+                            | ((1u32 << self.client.clnum) << 16)
+                            | self.client.devid as u32
+                    }
                     _ => 0,
                 };
                 Ok(1)
@@ -376,44 +553,104 @@ impl Rfu {
             // Slot status leads with a count; accept leads straight into the
             // list, so an empty list is a zero-word response.
             CMD_SLOTSTAT => {
-                if self.link == Link::Host {
-                    self.buf[0] = 0;
-                    Ok(1)
-                } else {
-                    Ok(0)
+                if self.link != Link::Host {
+                    return Ok(0);
                 }
+                // Leads with a count, then one word per attached client.
+                let mut n = 1;
+                self.buf[0] = 0;
+                for i in 0..4 {
+                    let c = self.host.clients[i];
+                    if c.devid != 0 {
+                        self.buf[0] += 1;
+                        self.buf[n] = c.devid as u32 | ((i as u32) << 16);
+                        n += 1;
+                    }
+                }
+                Ok(n as u8)
             }
             CMD_HOST_ACCEPT => {
                 if self.link == Link::Idle {
                     return Err(1);
                 }
-                Ok(0)
+                // Despite the name this lists who is attached rather than
+                // accepting anyone: the adapter has already done that.
+                let mut n = 0;
+                for i in 0..4 {
+                    let c = self.host.clients[i];
+                    if c.devid != 0 {
+                        self.buf[n] = c.devid as u32 | ((i as u32) << 16);
+                        n += 1;
+                    }
+                }
+                Ok(n as u8)
             }
 
             CMD_LINKPWR => {
-                // Signal strength per slot. Nobody connected, no signal.
-                self.buf[0] = 0;
+                // Signal strength, one byte per slot. We have no real measure,
+                // so an attached peer reads as full strength and an empty slot
+                // as none.
+                self.buf[0] = match self.link {
+                    Link::Host => (0..4).fold(0u32, |acc, i| {
+                        if self.host.clients[i].devid != 0 {
+                            acc | (0xFF << (i * 8))
+                        } else {
+                            acc
+                        }
+                    }),
+                    Link::Client => 0xFFFF_FFFF,
+                    _ => 0,
+                };
                 Ok(1)
             }
 
-            // A broadcast-read session is how a game finds nearby hosts. With
-            // no session layer there is never anything in the air, so a fetch
-            // returns no peers. That is a legitimate answer rather than a
-            // stub: it is exactly what a real adapter reports in an empty room.
-            CMD_BCRD_START | CMD_BCRD_STOP | CMD_BCRD_FETCH => Ok(0),
+            // Opening and closing a broadcast-read session need no state of
+            // their own: we are always listening, and peers age out on their
+            // own schedule.
+            CMD_BCRD_START | CMD_BCRD_STOP => Ok(0),
 
-            // The data a host puts in the air for others to find. Nothing is
-            // listening yet, so record nothing and tell the game it landed.
-            CMD_BCST_DATA => Ok(0),
+            // The actual scan result: up to four hosts, each as a device-id
+            // word followed by its six words of advertisement. An empty answer
+            // is a legitimate one, and is what a real adapter reports in an
+            // empty room.
+            CMD_BCRD_FETCH => {
+                let mut n = 0;
+                for i in 0..MAX_PEERS {
+                    if n + 7 > MAX_RESP {
+                        break;
+                    }
+                    let p = self.peers[i];
+                    if p.valid {
+                        self.buf[n] = p.device_id as u32;
+                        self.buf[n + 1..n + 7].copy_from_slice(&p.data);
+                        n += 7;
+                    }
+                }
+                Ok(n as u8)
+            }
+
+            // What a host advertises: in Pokemon this carries the trainer name
+            // and what the room is for, which is what the other player reads
+            // off the list before joining.
+            CMD_BCST_DATA => {
+                if self.len == 6 {
+                    self.host.bdata.copy_from_slice(&self.buf[..6]);
+                }
+                Ok(0)
+            }
 
             CMD_HOST_START => {
                 if self.link == Link::Client {
                     return Err(1);
                 }
                 if self.link == Link::Idle {
-                    self.devid = self.new_devid();
+                    self.host.devid = self.new_devid();
+                    self.host.clients = Default::default();
                     self.link = Link::Host;
                 }
+                // Announce on the next frame rather than waiting out the
+                // interval, so the other player sees the room promptly.
+                self.host.tx_ttl = ANNOUNCE_FRAMES;
                 Ok(0)
             }
 
@@ -421,9 +658,9 @@ impl Rfu {
                 if self.link == Link::Idle {
                     return Err(1);
                 }
-                // This stops accepting newcomers. With no clients attached
-                // there is nothing left to host, so the adapter goes idle.
-                if self.link == Link::Host {
+                // This stops accepting newcomers, so a host that already has
+                // someone stays a host. Only an empty room goes idle.
+                if self.link == Link::Host && self.host.clients.iter().all(|c| c.devid == 0) {
                     self.link = Link::Idle;
                 }
                 Ok(0)
@@ -433,9 +670,17 @@ impl Rfu {
                 if self.link == Link::Host {
                     return Err(1);
                 }
-                // The game named a host it saw in a broadcast. It cannot have
-                // seen one, so acknowledge and let ISCONNECTED report the
-                // failure, which is a path the game already handles.
+                // The game names a host it saw in a scan. Find whose broadcast
+                // carried that device id and ask them to let us in.
+                let want = self.buf[0] as u16;
+                if let Some(i) = (0..MAX_PEERS)
+                    .find(|&i| self.peers[i].valid && self.peers[i].device_id == want)
+                {
+                    self.link = Link::Connecting;
+                    self.send_cmd(i as u16, PKT_CONNECT_REQ, want as u32);
+                }
+                // An unknown id is still acknowledged: ISCONNECTED then
+                // reports the failure, which is a path the game handles.
                 Ok(0)
             }
 
@@ -446,7 +691,7 @@ impl Rfu {
                 self.buf[0] = match self.link {
                     Link::Connecting => CONN_INPROGRESS,
                     Link::Idle => CONN_FAILED,
-                    _ => 0,
+                    _ => self.client.devid as u32 | ((self.client.clnum as u32) << 16),
                 };
                 Ok(1)
             }
@@ -456,14 +701,96 @@ impl Rfu {
                     return Err(1);
                 }
                 // Games ask this even when no connection was attempted.
-                self.buf[0] = CONN_FAILED;
-                self.link = Link::Idle;
+                if self.link == Link::Client {
+                    self.buf[0] =
+                        self.client.devid as u32 | ((self.client.clnum as u32) << 16);
+                } else {
+                    self.buf[0] = CONN_FAILED;
+                    self.link = Link::Idle;
+                }
                 Ok(1)
             }
 
-            // Sending with nobody to send to. The payload is accepted and
-            // dropped, and the WAIT that follows reports the lack of a reply.
-            CMD_SEND_DATA | CMD_SEND_DATAW | CMD_WAIT | CMD_RTX_WAIT => Ok(0),
+            // The game hands us a block to put on the air. The first word
+            // is a length header whose encoding differs by role, and the rest
+            // is the payload.
+            CMD_SEND_DATA | CMD_SEND_DATAW | CMD_RTX_WAIT => {
+                if self.len == 0 {
+                    return Ok(0);
+                }
+                let header = self.buf[0];
+                let words = (self.len - 1) as usize;
+                let mut payload = Vec::with_capacity(words * 4);
+                for i in 0..words {
+                    put32(&mut payload, self.buf[1 + i]);
+                }
+                match self.link {
+                    Link::Host => {
+                        let blen = (header & 0x7F) as usize;
+                        if blen <= payload.len() {
+                            payload.truncate(blen);
+                            for i in 0..4 {
+                                let c = self.host.clients[i];
+                                if c.devid != 0 {
+                                    self.send_data(
+                                        c.client_id,
+                                        PKT_HOST_SEND,
+                                        blen as u32,
+                                        &payload,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Link::Client => {
+                        // A client encodes its length in a field whose offset
+                        // depends on which slot the host gave it.
+                        let shift = 8 + self.client.clnum as u32 * 5;
+                        let blen = ((header >> shift) & 0x1F) as usize;
+                        if blen <= payload.len() {
+                            payload.truncate(blen);
+                            let h = self.client.devid as u32
+                                | ((self.client.clnum as u32) << 16)
+                                | ((blen as u32) << 24);
+                            let host = self.client.host_id;
+                            self.send_data(host, PKT_CLIENT_SEND, h, &payload);
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(0)
+            }
+
+            CMD_WAIT => Ok(0),
+
+            // Collect one queued block. The game reads it as the response to
+            // this command, so an empty queue is a zero-word answer.
+            CMD_RECV_DATA => {
+                let block = match self.link {
+                    Link::Client => self.client.inbox.pop_front(),
+                    Link::Host => (0..4)
+                        .find(|&i| {
+                            self.host.clients[i].devid != 0 && !self.host.inbox[i].is_empty()
+                        })
+                        .and_then(|i| self.host.inbox[i].pop_front()),
+                    _ => None,
+                };
+                match block {
+                    Some(b) => {
+                        let words = (b.len() + 3) / 4;
+                        let words = words.min(MAX_RESP);
+                        for i in 0..words {
+                            let mut w = [0u8; 4];
+                            for k in 0..4 {
+                                w[k] = b.get(i * 4 + k).copied().unwrap_or(0);
+                            }
+                            self.buf[i] = u32::from_be_bytes(w);
+                        }
+                        Ok(words as u8)
+                    }
+                    None => Ok(0),
+                }
+            }
 
             // An unknown command is rejected rather than quietly acknowledged.
             // A game that gets an ack for something we did not do waits
@@ -472,8 +799,249 @@ impl Rfu {
         }
     }
 
-    /// A device id for hosting. Real adapters have one burned in; any non-zero
-    /// value will do, and peers compare the whole half-word.
+    // --- the air -------------------------------------------------------------
+
+    /// Drain the packets the frontend should put on the wire.
+    pub fn take_outbox(&mut self) -> Vec<OutPacket> {
+        std::mem::take(&mut self.outbox)
+    }
+
+    /// True when a session is worth keeping alive: hosting, attached, or
+    /// part way between the two.
+    pub fn in_session(&self) -> bool {
+        matches!(self.link, Link::Host | Link::Client | Link::Connecting)
+    }
+
+    fn send_cmd(&mut self, to: u16, ptype: u32, header: u32) {
+        let mut bytes = Vec::with_capacity(16);
+        put32(&mut bytes, NET_HEADER);
+        put32(&mut bytes, ptype);
+        put32(&mut bytes, header);
+        put32(&mut bytes, 0);
+        self.outbox.push(OutPacket { to, bytes });
+    }
+
+    fn send_data(&mut self, to: u16, ptype: u32, header: u32, payload: &[u8]) {
+        let mut bytes = Vec::with_capacity(12 + payload.len());
+        put32(&mut bytes, NET_HEADER);
+        put32(&mut bytes, ptype);
+        put32(&mut bytes, header);
+        bytes.extend_from_slice(payload);
+        self.outbox.push(OutPacket { to, bytes });
+    }
+
+    /// Once a frame: re-announce a hosted room, and age out anything we have
+    /// stopped hearing from.
+    pub fn frame_update(&mut self) {
+        if self.com == Com::Reset {
+            return;
+        }
+        for p in self.peers.iter_mut() {
+            if p.valid {
+                p.ttl = p.ttl.saturating_sub(1);
+                if p.ttl == 0 {
+                    p.valid = false;
+                }
+            }
+        }
+        if self.link == Link::Host {
+            self.host.tx_ttl = self.host.tx_ttl.saturating_add(1);
+            if self.host.tx_ttl >= ANNOUNCE_FRAMES {
+                self.host.tx_ttl = 0;
+                let (devid, bdata) = (self.host.devid, self.host.bdata);
+                let mut payload = Vec::with_capacity(24);
+                for w in bdata {
+                    put32(&mut payload, w);
+                }
+                self.send_data(BROADCAST_ID, PKT_BROADCAST, devid as u32, &payload);
+            }
+            for i in 0..4 {
+                if self.host.clients[i].devid != 0 {
+                    self.host.clients[i].ttl = self.host.clients[i].ttl.saturating_add(1);
+                    if self.host.clients[i].ttl >= CLIENT_TTL {
+                        self.host.clients[i] = HostClient::default();
+                        self.host.inbox[i].clear();
+                    }
+                }
+            }
+        } else if self.link == Link::Client {
+            self.client.host_ttl = self.client.host_ttl.saturating_add(1);
+            if self.client.host_ttl >= CLIENT_TTL {
+                self.link = Link::Idle;
+                self.client = ClientState::default();
+            }
+        }
+    }
+
+    /// A packet arrived from `from`, the frontend id for that peer.
+    pub fn net_receive(&mut self, buf: &[u8], from: u16) {
+        if buf.len() < 12 || get32(buf, 0) != NET_HEADER {
+            return;
+        }
+        let ptype = get32(buf, 4);
+        let hdata = get32(buf, 8);
+        let payload = &buf[12..];
+
+        // Anything at all from our host proves it is alive. A host announces
+        // twice a second even when idle, so this keeps a quiet session from
+        // timing out.
+        if self.link == Link::Client && from == self.client.host_id {
+            self.client.host_ttl = 0;
+        }
+
+        match ptype {
+            PKT_BROADCAST => {
+                if (from as usize) < MAX_PEERS && payload.len() >= 24 {
+                    if !self.peers[from as usize].valid {
+                        self.peers_seen += 1;
+                    }
+                    let slot = &mut self.peers[from as usize];
+                    slot.valid = true;
+                    slot.device_id = hdata as u16;
+                    slot.ttl = PEER_TTL;
+                    for j in 0..6 {
+                        slot.data[j] = get32(payload, j * 4);
+                    }
+                }
+            }
+
+            PKT_CONNECT_REQ => {
+                if self.link != Link::Host {
+                    self.send_cmd(from, PKT_CONNECT_NACK, 0);
+                    return;
+                }
+                // Already attached: ignore, rather than hand out a second slot
+                // to a peer that already has one.
+                if self
+                    .host
+                    .clients
+                    .iter()
+                    .any(|c| c.devid != 0 && c.client_id == from)
+                {
+                    return;
+                }
+                match self.host.clients.iter().position(|c| c.devid == 0) {
+                    Some(i) => {
+                        let newid = self.new_devid();
+                        self.host.clients[i] = HostClient {
+                            devid: newid,
+                            client_id: from,
+                            ttl: 0,
+                        };
+                        self.connections += 1;
+                        self.send_cmd(from, PKT_CONNECT_ACK, newid as u32 | ((i as u32) << 16));
+                    }
+                    None => self.send_cmd(from, PKT_CONNECT_NACK, 0),
+                }
+            }
+
+            PKT_CONNECT_ACK => {
+                if self.link == Link::Connecting {
+                    self.client = ClientState {
+                        devid: hdata as u16,
+                        clnum: (hdata >> 16) as u8,
+                        host_id: from,
+                        host_ttl: 0,
+                        inbox: Default::default(),
+                    };
+                    self.link = Link::Client;
+                    self.connections += 1;
+                }
+            }
+
+            PKT_CONNECT_NACK => {
+                if self.link == Link::Connecting {
+                    self.link = Link::Idle;
+                }
+            }
+
+            PKT_DISCONNECT => {
+                if self.link == Link::Client && from == self.client.host_id {
+                    self.link = Link::Idle;
+                    self.client = ClientState::default();
+                } else if self.link == Link::Host {
+                    if let Some(i) = self
+                        .host
+                        .clients
+                        .iter()
+                        .position(|c| c.client_id == from && c.devid != 0)
+                    {
+                        self.host.clients[i] = HostClient::default();
+                        self.host.inbox[i].clear();
+                    }
+                }
+            }
+
+            PKT_HOST_SEND => {
+                if self.link != Link::Client {
+                    return;
+                }
+                let blen = (hdata & 0x7F) as usize;
+                if payload.len() < blen {
+                    return;
+                }
+                // Acknowledge first, so the host knows we are still here even
+                // when our queue is full and the payload has to be dropped.
+                let ack = self.client.devid as u32 | ((self.client.clnum as u32) << 16);
+                self.send_cmd(from, PKT_CLIENT_ACK, ack);
+                if self.client.inbox.len() >= QUEUE_DEPTH {
+                    self.dropped += 1;
+                } else {
+                    self.client.inbox.push_back(payload[..blen].to_vec());
+                }
+            }
+
+            PKT_CLIENT_SEND => {
+                if self.link != Link::Host {
+                    return;
+                }
+                let cdevid = hdata as u16;
+                let slot = ((hdata >> 16) & 3) as usize;
+                let blen = (hdata >> 24) as usize;
+                // The slot is validated against the device id we handed out,
+                // so a stale or forged packet cannot write into the queue of a
+                // different client.
+                if cdevid == 0 || self.host.clients[slot].devid != cdevid {
+                    return;
+                }
+                if payload.len() < blen {
+                    return;
+                }
+                self.host.clients[slot].ttl = 0;
+                if self.host.inbox[slot].len() >= QUEUE_DEPTH {
+                    self.dropped += 1;
+                } else {
+                    self.host.inbox[slot].push_back(payload[..blen].to_vec());
+                }
+            }
+
+            PKT_CLIENT_ACK => {
+                if self.link == Link::Host {
+                    let devid = hdata as u16;
+                    let slot = ((hdata >> 16) & 3) as usize;
+                    if devid != 0 && self.host.clients[slot].devid == devid {
+                        self.host.clients[slot].ttl = 0;
+                    }
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    /// Is there anything from the air for the game to collect?
+    fn data_available(&self) -> bool {
+        match self.link {
+            Link::Client => !self.client.inbox.is_empty(),
+            Link::Host => {
+                (0..4).any(|i| self.host.clients[i].devid != 0 && !self.host.inbox[i].is_empty())
+            }
+            _ => false,
+        }
+    }
+
+    /// A device id for a host or a client slot. Real adapters have one burned
+    /// in; any non-zero value will do, and peers compare the whole half-word.
     fn new_devid(&self) -> u16 {
         // Derived from how much the game has already said to us, so a replay
         // of the same ROM is reproducible rather than random.
@@ -506,6 +1074,14 @@ impl Rfu {
                     self.buf[1] = 0xF; // every slot disconnected
                     self.buf[2] = IDLE;
                     self.len = 3;
+                    self.pos = 0;
+                    self.com = Com::WaitResp;
+                } else if self.data_available() {
+                    // Something arrived from the air. The game answers this by
+                    // issuing RECV_DATA to collect it.
+                    self.buf[0] = 0x9966_0000 | RESP_DATA as u32;
+                    self.buf[1] = IDLE;
+                    self.len = 2;
                     self.pos = 0;
                     self.com = Com::WaitResp;
                 } else if self.link == Link::Host && self.resp_cycles == 0 {
@@ -623,7 +1199,7 @@ mod tests {
         handshake(&mut rfu);
         rfu.transfer(0x9966_0019); // host start
         assert_eq!(rfu.state_name(), "hosting");
-        assert_ne!(rfu.devid, 0, "a host needs a device id");
+        assert_ne!(rfu.host.devid, 0, "a host needs a device id");
         rfu.transfer(0); // consume the ack
         rfu.transfer(0x9966_001B); // host stop; no clients, so back to idle
         assert_eq!(rfu.state_name(), "idle");
@@ -683,6 +1259,339 @@ mod tests {
         // And the handshake is required all over again.
         assert_eq!(rfu.transfer(0x9966_0012), 0, "commands ignored while powered down");
         assert_eq!(rfu.commands, seen, "and not counted either");
+    }
+
+    // --- two adapters, through a model of the frontend wire -----------------
+    //
+    // The frontend gives every peer a client id and delivers a packet either to
+    // one id or to everyone. That is the whole contract, so it models in a few
+    // lines, and it lets the session layer be tested end to end with no
+    // network, no device and no game.
+
+    /// Move whatever `from` has queued into `to`, the way the frontend would.
+    fn deliver(from: &mut Rfu, from_id: u16, to: &mut Rfu, to_id: u16) {
+        for pkt in from.take_outbox() {
+            if pkt.to == BROADCAST_ID || pkt.to == to_id {
+                to.net_receive(&pkt.bytes, from_id);
+            }
+        }
+    }
+
+    /// Issue one command the way a game does, and return its response words.
+    fn cmd(rfu: &mut Rfu, c: u8, payload: &[u32]) -> Vec<u32> {
+        rfu.transfer(0x9966_0000 | ((payload.len() as u32) << 8) | c as u32);
+        for &w in payload {
+            rfu.transfer(w);
+        }
+        let ack = rfu.transfer(0);
+        assert_eq!(
+            ack & 0xFFFF_00FF,
+            0x9966_0080 | c as u32,
+            "command {c:#04X} was not acknowledged"
+        );
+        let n = ((ack >> 8) & 0xFF) as usize;
+        (0..n).map(|_| rfu.transfer(0)).collect()
+    }
+
+    /// A host advertising, and a second adapter that scans and finds it.
+    fn hosted_pair() -> (Rfu, Rfu, u16) {
+        let mut host = Rfu::new();
+        let mut client = Rfu::new();
+        handshake(&mut host);
+        handshake(&mut client);
+        cmd(&mut host, CMD_BCST_DATA, &[11, 22, 33, 44, 55, 66]);
+        cmd(&mut host, CMD_HOST_START, &[]);
+        host.frame_update();
+        deliver(&mut host, 0, &mut client, 1);
+        let devid = host.host.devid;
+        (host, client, devid)
+    }
+
+    #[test]
+    fn a_scan_finds_a_hosted_room_and_its_advertisement() {
+        let (_host, mut client, devid) = hosted_pair();
+        let scan = cmd(&mut client, CMD_BCRD_FETCH, &[]);
+        assert_eq!(scan.len(), 7, "one peer: a device id and six words");
+        assert_eq!(scan[0], devid as u32);
+        assert_eq!(
+            &scan[1..7],
+            &[11, 22, 33, 44, 55, 66],
+            "the advertisement survives the wire, which is the trainer name"
+        );
+        assert_eq!(client.peers_seen, 1);
+    }
+
+    #[test]
+    fn a_scan_finds_nothing_before_anyone_is_hosting() {
+        let mut a = Rfu::new();
+        let mut b = Rfu::new();
+        handshake(&mut a);
+        handshake(&mut b);
+        a.frame_update();
+        deliver(&mut a, 0, &mut b, 1);
+        assert!(cmd(&mut b, CMD_BCRD_FETCH, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_client_joins_a_host_and_both_sides_agree() {
+        let (mut host, mut client, devid) = hosted_pair();
+        cmd(&mut client, CMD_BCRD_FETCH, &[]);
+        cmd(&mut client, CMD_CONNECT, &[devid as u32]);
+        assert_eq!(client.state_name(), "connecting");
+        deliver(&mut client, 1, &mut host, 0);
+        deliver(&mut host, 0, &mut client, 1);
+        assert_eq!(client.state_name(), "client");
+        assert_eq!(host.state_name(), "hosting");
+
+        // The host lists one attached client, in slot 0.
+        let slots = cmd(&mut host, CMD_SLOTSTAT, &[]);
+        assert_eq!(slots[0], 1, "one client attached");
+        assert_eq!(slots[1] >> 16, 0, "in slot 0");
+
+        // And both ends report the connection through their status command.
+        let st = cmd(&mut client, CMD_SYSSTAT, &[]);
+        assert_eq!(st[0] >> 24, 5, "a client reports status 5");
+        let st = cmd(&mut host, CMD_SYSSTAT, &[]);
+        assert_eq!(st[0] >> 24, 1, "a host reports status 1");
+    }
+
+    #[test]
+    fn connecting_to_an_id_nobody_advertised_fails_rather_than_hanging() {
+        let (_host, mut client, devid) = hosted_pair();
+        cmd(&mut client, CMD_BCRD_FETCH, &[]);
+        cmd(&mut client, CMD_CONNECT, &[devid as u32 ^ 0x5A5A]);
+        assert_eq!(client.state_name(), "idle", "no request went out");
+        let r = cmd(&mut client, CMD_ISCONNECTED, &[]);
+        assert_eq!(r[0], CONN_FAILED, "and the game is told so");
+    }
+
+    #[test]
+    fn an_adapter_that_is_not_hosting_rejects_a_connection_request() {
+        // An idle adapter must say no rather than ignore the request: a game
+        // waiting on a reply that never comes is the worst outcome.
+        let mut idle = Rfu::new();
+        handshake(&mut idle);
+        let mut req = Vec::new();
+        put32(&mut req, NET_HEADER);
+        put32(&mut req, PKT_CONNECT_REQ);
+        put32(&mut req, 0x1234);
+        put32(&mut req, 0);
+        idle.net_receive(&req, 0);
+        let out = idle.take_outbox();
+        assert_eq!(out.len(), 1, "exactly one reply");
+        assert_eq!(get32(&out[0].bytes, 4), PKT_CONNECT_NACK);
+
+        // A host with all four slots taken must also refuse.
+        let mut full = Rfu::new();
+        handshake(&mut full);
+        cmd(&mut full, CMD_HOST_START, &[]);
+        for peer in 1..=4u16 {
+            full.net_receive(&req, peer);
+        }
+        full.take_outbox();
+        full.net_receive(&req, 5);
+        let out = full.take_outbox();
+        assert_eq!(get32(&out[0].bytes, 4), PKT_CONNECT_NACK, "no slots left");
+    }
+
+    #[test]
+    fn a_host_accepts_four_clients_and_gives_each_its_own_slot() {
+        let mut host = Rfu::new();
+        handshake(&mut host);
+        cmd(&mut host, CMD_HOST_START, &[]);
+        let mut req = Vec::new();
+        put32(&mut req, NET_HEADER);
+        put32(&mut req, PKT_CONNECT_REQ);
+        put32(&mut req, 0x1234);
+        put32(&mut req, 0);
+        for peer in 1..=4u16 {
+            host.net_receive(&req, peer);
+        }
+        let slots = cmd(&mut host, CMD_SLOTSTAT, &[]);
+        assert_eq!(slots[0], 4, "four attached");
+        let assigned: Vec<u32> = slots[1..5].iter().map(|w| w >> 16).collect();
+        assert_eq!(assigned, vec![0, 1, 2, 3], "one slot each");
+        // And a repeat request from a peer already attached changes nothing.
+        host.net_receive(&req, 1);
+        assert_eq!(cmd(&mut host, CMD_SLOTSTAT, &[])[0], 4, "still four");
+    }
+
+    /// A joined pair, ready to exchange data.
+    fn joined_pair() -> (Rfu, Rfu) {
+        let (mut host, mut client, devid) = hosted_pair();
+        cmd(&mut client, CMD_BCRD_FETCH, &[]);
+        cmd(&mut client, CMD_CONNECT, &[devid as u32]);
+        deliver(&mut client, 1, &mut host, 0);
+        deliver(&mut host, 0, &mut client, 1);
+        (host, client)
+    }
+
+    #[test]
+    fn a_host_block_reaches_the_client() {
+        let (mut host, mut client) = joined_pair();
+        // Four bytes of payload: the header low 7 bits carry the byte count.
+        cmd(&mut host, CMD_SEND_DATA, &[4, 0xDEAD_BEEF]);
+        deliver(&mut host, 0, &mut client, 1);
+        let got = cmd(&mut client, CMD_RECV_DATA, &[]);
+        assert_eq!(got, vec![0xDEAD_BEEF], "the block arrives intact");
+        // And the client acknowledged it, which is how the host knows it lives.
+        assert!(client
+            .take_outbox()
+            .iter()
+            .any(|p| get32(&p.bytes, 4) == PKT_CLIENT_ACK));
+    }
+
+    #[test]
+    fn a_client_block_reaches_the_host() {
+        let (mut host, mut client) = joined_pair();
+        // A client encodes its length five bits up, offset by its slot number.
+        cmd(&mut client, CMD_SEND_DATA, &[4 << 8, 0x0BAD_F00D]);
+        deliver(&mut client, 1, &mut host, 0);
+        let got = cmd(&mut host, CMD_RECV_DATA, &[]);
+        assert_eq!(got, vec![0x0BAD_F00D]);
+    }
+
+    #[test]
+    fn a_client_in_a_later_slot_encodes_its_length_in_a_different_field() {
+        // Every other data test puts the client in slot 0, where the length
+        // field happens to sit at the same offset for everyone. Slot 1 is what
+        // actually exercises the per-slot shift, and a trade with three
+        // players would corrupt silently if it were wrong.
+        let mut host = Rfu::new();
+        let mut client = Rfu::new();
+        handshake(&mut host);
+        handshake(&mut client);
+        cmd(&mut host, CMD_HOST_START, &[]);
+
+        // Fill slot 0 with somebody else so our client lands in slot 1.
+        let mut req = Vec::new();
+        put32(&mut req, NET_HEADER);
+        put32(&mut req, PKT_CONNECT_REQ);
+        put32(&mut req, 0x1234);
+        put32(&mut req, 0);
+        host.net_receive(&req, 7);
+        host.take_outbox();
+
+        host.frame_update();
+        deliver(&mut host, 0, &mut client, 1);
+        cmd(&mut client, CMD_BCRD_FETCH, &[]);
+        let devid = host.host.devid;
+        cmd(&mut client, CMD_CONNECT, &[devid as u32]);
+        deliver(&mut client, 1, &mut host, 0);
+        deliver(&mut host, 0, &mut client, 1);
+        assert_eq!(client.client.clnum, 1, "second slot");
+
+        // Four bytes, with the count at 8 + 1*5 = bit 13.
+        cmd(&mut client, CMD_SEND_DATA, &[4 << 13, 0xFEED_FACE]);
+        deliver(&mut client, 1, &mut host, 0);
+        assert_eq!(
+            cmd(&mut host, CMD_RECV_DATA, &[]),
+            vec![0xFEED_FACE],
+            "a slot 1 client is understood by the host"
+        );
+    }
+
+    #[test]
+    fn arriving_data_is_what_wakes_a_waiting_game() {
+        let (mut host, mut client) = joined_pair();
+        // The client hands the clock over and waits for something to happen.
+        cmd(&mut client, CMD_WAIT, &[]);
+        assert!(client.is_master());
+        cmd(&mut host, CMD_SEND_DATA, &[4, 0x1234_5678]);
+        deliver(&mut host, 0, &mut client, 1);
+        // The adapter now reports data rather than a timeout or a disconnect.
+        let w = client.step(1, true, true, true).expect("an event");
+        assert_eq!(
+            w,
+            0x9966_0000 | RESP_DATA as u32,
+            "data available, not a timeout"
+        );
+    }
+
+    #[test]
+    fn a_forged_slot_cannot_write_into_another_clients_queue() {
+        let (mut host, _client) = joined_pair();
+        // Slot 0 is taken by a client with a known device id. A packet naming
+        // that slot with the wrong id must be discarded.
+        let mut v = Vec::new();
+        put32(&mut v, NET_HEADER);
+        put32(&mut v, PKT_CLIENT_SEND);
+        put32(&mut v, 0xDEAD | (0 << 16) | (4 << 24));
+        put32(&mut v, 0x4141_4141);
+        host.net_receive(&v, 9);
+        assert!(
+            cmd(&mut host, CMD_RECV_DATA, &[]).is_empty(),
+            "a packet with the wrong device id is dropped"
+        );
+    }
+
+    #[test]
+    fn a_host_that_power_cycles_tells_its_clients_rather_than_orphaning_them() {
+        let (mut host, mut client) = joined_pair();
+        host.take_outbox();
+        // The game pulls the adapter reset line mid-session.
+        host.reset();
+        deliver(&mut host, 0, &mut client, 1);
+        assert_eq!(
+            client.state_name(),
+            "idle",
+            "the client is told, instead of spinning on a wait that never ends"
+        );
+    }
+
+    #[test]
+    fn a_silent_host_eventually_times_out() {
+        let (_host, mut client) = joined_pair();
+        assert_eq!(client.state_name(), "client");
+        for _ in 0..CLIENT_TTL as u32 + 1 {
+            client.frame_update();
+        }
+        assert_eq!(client.state_name(), "idle", "a vanished host is given up on");
+    }
+
+    #[test]
+    fn a_peer_that_stops_advertising_drops_off_the_scan() {
+        let (_host, mut client, _devid) = hosted_pair();
+        assert_eq!(cmd(&mut client, CMD_BCRD_FETCH, &[]).len(), 7);
+        for _ in 0..PEER_TTL as u32 + 1 {
+            client.frame_update();
+        }
+        assert!(
+            cmd(&mut client, CMD_BCRD_FETCH, &[]).is_empty(),
+            "a room nobody is announcing any more stops being listed"
+        );
+    }
+
+    #[test]
+    fn packets_are_byte_compatible_with_the_reference_implementation() {
+        // The header is "RFU1" in big-endian, and a command packet is exactly
+        // four words. Asserted as literal bytes rather than against our own
+        // constants, because the point is agreeing with gpSP, not with
+        // ourselves.
+        let mut host = Rfu::new();
+        handshake(&mut host);
+        cmd(&mut host, CMD_HOST_START, &[]);
+        host.frame_update();
+        let out = host.take_outbox();
+        let pkt = &out[0];
+        assert_eq!(pkt.to, 0xFFFF, "a room announcement goes to everyone");
+        assert_eq!(&pkt.bytes[0..4], b"RFU1");
+        assert_eq!(&pkt.bytes[4..8], &[0, 0, 0, 0], "type 0 is a broadcast");
+        assert_eq!(pkt.bytes.len(), 36, "header, type, device id, six words");
+    }
+
+    #[test]
+    fn a_short_or_misheaded_packet_is_ignored() {
+        let mut rfu = Rfu::new();
+        handshake(&mut rfu);
+        rfu.net_receive(&[0u8; 8], 1); // too short to carry a header
+        let mut wrong = Vec::new();
+        put32(&mut wrong, 0x5246_5532); // RFU2, not ours
+        put32(&mut wrong, PKT_BROADCAST);
+        put32(&mut wrong, 0x99);
+        wrong.extend_from_slice(&[0u8; 24]);
+        rfu.net_receive(&wrong, 1);
+        assert_eq!(rfu.peers_seen, 0, "neither packet was believed");
     }
 
     #[test]
