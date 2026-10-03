@@ -39,6 +39,8 @@ pub struct Ppu {
     bg_ref: [[i32; 2]; 2], // [bg2, bg3][x, y]
     /// Profiling switch: force colour effects off (measures blend cost).
     pub no_blend: bool,
+    /// Per-phase render timing, off unless the front end asks for it.
+    pub prof: Option<PpuProf>,
     /// Debug switch: force window masking off (isolates window bugs).
     pub no_window: bool,
 }
@@ -73,6 +75,26 @@ fn sign_extend_28(v: u32) -> i32 {
 /// special effects (BLDCNT) can blend the top with the one directly below it.
 /// Layer ids match the BLDCNT target bits: BG0..BG3 = 0..3, OBJ = 4, backdrop
 /// = 5. Smaller key wins; OBJ uses rank 0 to beat a same-priority BG.
+/// Where a frame's rendering time actually goes, per phase.
+///
+/// Built because four separate guesses at the renderer's hot spot were each
+/// killed by measurement: the adapter path (twice), and `any_semi_obj`. An
+/// ablation tells you what a feature COSTS but not where the time SITS, and
+/// guessing from the shape of the code has a bad record here.
+///
+/// Timing is per scanline and `Instant::now` is not free, so this perturbs the
+/// result by a few percent. That is fine for attribution, which is all it is
+/// for: never quote a figure from a profiling build as the speed of the core.
+#[derive(Default, Clone, Copy)]
+pub struct PpuProf {
+    pub lines: u64,
+    pub window_ns: u64,
+    pub bg_ns: u64,
+    pub obj_ns: u64,
+    pub resolve_ns: u64,
+    pub semi_ns: u64,
+}
+
 struct Compositor {
     top_col: [u16; SCREEN_W],
     top_id: [u8; SCREEN_W],
@@ -200,6 +222,7 @@ impl Default for Ppu {
             framebuffer: vec![0; SCREEN_W * SCREEN_H].into_boxed_slice(),
             bg_ref: [[0; 2]; 2],
             no_blend: false,
+            prof: None,
             no_window: false,
         }
     }
@@ -457,12 +480,21 @@ impl Ppu {
         let blend_mode = if self.no_blend { 0 } else { (bldcnt >> 6) & 3 };
         // A semi-transparent sprite blends whatever BLDCNT says, so the layer
         // underneath has to be kept even when no colour effect is configured.
+        let t_semi = self.prof.map(|_| std::time::Instant::now());
         let semi_obj = !self.no_blend && dispcnt & 0x1000 != 0 && self.any_semi_obj();
+        if let (Some(p), Some(t)) = (self.prof.as_mut(), t_semi) {
+            p.semi_ns += t.elapsed().as_nanos() as u64;
+            p.lines += 1;
+        }
         let mut comp = Compositor::new(self.backdrop(), blend_mode != 0 || semi_obj);
 
         // Window layer/effect masking (DISPCNT bits 13/14/15 enable win0/1/obj).
+        let t_win = self.prof.map(|_| std::time::Instant::now());
         if dispcnt & 0xE000 != 0 && !self.no_window {
             self.build_window_mask(line, dispcnt, &mut comp.win_mask);
+        }
+        if let (Some(p), Some(t)) = (self.prof.as_mut(), t_win) {
+            p.window_ns += t.elapsed().as_nanos() as u64;
         }
 
         // Gather the enabled BGs and render them front-to-back (by priority,
@@ -490,6 +522,7 @@ impl Ppu {
             }
         }
         layers[..n].sort_unstable_by_key(|&(p, bg, _)| ((p as u16) << 8) | bg as u16);
+        let t_bg = self.prof.map(|_| std::time::Instant::now());
         for &(_, bg, affine) in &layers[..n] {
             if affine {
                 self.affine_bg_line(bg, &mut comp);
@@ -497,12 +530,23 @@ impl Ppu {
                 self.text_bg_line(bg, line, &mut comp);
             }
         }
+        if let (Some(p), Some(t)) = (self.prof.as_mut(), t_bg) {
+            p.bg_ns += t.elapsed().as_nanos() as u64;
+        }
 
+        let t_obj = self.prof.map(|_| std::time::Instant::now());
         if dispcnt & 0x1000 != 0 {
             self.sprite_line(line, dispcnt, &mut comp);
         }
+        if let (Some(p), Some(t)) = (self.prof.as_mut(), t_obj) {
+            p.obj_ns += t.elapsed().as_nanos() as u64;
+        }
 
+        let t_res = self.prof.map(|_| std::time::Instant::now());
         self.resolve_line(line, &comp, blend_mode, semi_obj);
+        if let (Some(p), Some(t)) = (self.prof.as_mut(), t_res) {
+            p.resolve_ns += t.elapsed().as_nanos() as u64;
+        }
     }
 
     /// Resolve the composited scanline into the framebuffer, applying BLDCNT.

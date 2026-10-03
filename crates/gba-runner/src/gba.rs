@@ -449,6 +449,73 @@ fn main() {
         let (a,b) = v.split_once(':').unwrap_or((v.as_str(), v.as_str()));
         (a.parse().unwrap_or(0), b.parse().unwrap_or(0))
     });
+    // GBA_BENCH=<warmup>: time ONLY the emulation loop and print frames per
+    // second, then exit.
+    //
+    // The ordinary loop copies the framebuffer out with `.to_vec()` every
+    // frame, which is 76 KB per frame and about 70 MB/s at the speeds this
+    // core reaches, plus per-frame analysis. Timing that loop measures the
+    // runner as much as the core, and the first attempt at a benchmark here had
+    // a 7% spread between runs, which cannot resolve anything worth optimising.
+    //
+    // The warmup argument matters: the first frames of a GBA game are BIOS and
+    // decompression, not steady-state play, so a short run flatters or
+    // punishes depending on where it stops. Warmup frames are run and timed
+    // separately, and only the remainder counts.
+    // GBA_PPUPROF: attribute render time per phase. Perturbs by a few percent.
+    if std::env::var_os("GBA_PPUPROF").is_some() {
+        gba.bus.ppu.prof = Some(Default::default());
+    }
+    if let Ok(w) = std::env::var("GBA_BENCH") {
+        let warmup: u32 = w.parse().unwrap_or(0);
+        let press = |g: &mut gba_core::Gba, f: u32| {
+            if autoinput {
+                let p = f % 24 < 4;
+                g.set_button(gba_core::Button::A, p);
+                g.set_button(gba_core::Button::Start, p);
+            }
+        };
+        let t0 = std::time::Instant::now();
+        for f in 0..warmup {
+            press(&mut gba, f);
+            gba.run_frame();
+        }
+        let warm = t0.elapsed();
+        // Discard whatever the warmup accumulated. Without this the profile
+        // counts warmup frames and is divided by measured frames, inflating
+        // every absolute figure; `lines/frame` reading 192 instead of 160 is
+        // what exposed it. A profiler with a known-value field can check itself.
+        if gba.bus.ppu.prof.is_some() {
+            gba.bus.ppu.prof = Some(Default::default());
+        }
+        let measured = frames.saturating_sub(warmup);
+        let t1 = std::time::Instant::now();
+        for f in 0..measured {
+            press(&mut gba, warmup + f);
+            gba.run_frame();
+        }
+        let el = t1.elapsed();
+        let secs = el.as_secs_f64();
+        println!(
+            "BENCH warmup={warmup} frames={measured} {:.3}s {:.1} fps {:.0} us/frame (warmup {:.3}s)",
+            secs,
+            measured as f64 / secs,
+            secs * 1e6 / measured.max(1) as f64,
+            warm.as_secs_f64()
+        );
+        println!("BENCH steps={} (~{} instr/frame)", gba.steps, gba.steps / measured.max(1) as u64);
+        if let Some(p) = gba.bus.ppu.prof {
+            let f = measured.max(1) as f64;
+            let tot = (p.semi_ns + p.window_ns + p.bg_ns + p.obj_ns + p.resolve_ns) as f64;
+            println!("PPUPROF lines/frame={:.0}  measured phases total {:.0} us/frame", p.lines as f64 / f, tot / f / 1000.0);
+            for (name, ns) in [("semi_obj", p.semi_ns), ("window", p.window_ns), ("backgrounds", p.bg_ns), ("sprites", p.obj_ns), ("resolve", p.resolve_ns)] {
+                println!("  {:<12} {:>8.0} us/frame  {:>5.1}% of measured",
+                    name, ns as f64 / f / 1000.0, if tot > 0.0 { 100.0 * ns as f64 / tot } else { 0.0 });
+            }
+        }
+        return;
+    }
+
     for f in 0..frames {
         if let Some((a,b)) = linepc {
             gba.linepc = f >= a && f <= b;
