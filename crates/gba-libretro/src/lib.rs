@@ -246,6 +246,13 @@ struct State {
     /// something actually changes rather than sixty times a second.
     rfu_last: Option<(u64, u64, u64, u64, &'static str, u64, u64)>,
     flash_last: Option<(u64, u64, u64, u64, u32, u8)>,
+    /// Frames run, for a heartbeat line. Two emulators on two phones do NOT
+    /// share a clock the way two GBAs do, so if one runs below full speed it
+    /// under-drains its receive queue while the peer keeps sending at its own
+    /// rate. That shows up as a queue pinned at its ceiling, and it is cured by
+    /// speed rather than by a bigger buffer, so the frame rate has to be
+    /// measurable on the device itself.
+    frames: u64,
 }
 
 impl State {
@@ -267,6 +274,7 @@ impl State {
             log: None,
             rfu_last: None,
             flash_last: None,
+            frames: 0,
         }
     }
 }
@@ -844,6 +852,13 @@ pub extern "C" fn retro_run() {
                     );
                 }
             }
+        }
+        // Heartbeat, once a second of emulated time. The logcat timestamp on
+        // consecutive lines gives the real elapsed time, so 60 emulated frames
+        // taking longer than a second is visible by subtraction.
+        s.frames += 1;
+        if s.frames % 60 == 0 {
+            log_line(s.log, &format!("[perf] emulated_frames={}", s.frames));
         }
         if let Some(video) = s.video {
             unsafe {
