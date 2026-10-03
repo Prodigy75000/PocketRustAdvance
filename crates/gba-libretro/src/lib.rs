@@ -767,9 +767,11 @@ pub extern "C" fn retro_run() {
                 let cs = gba.rfu_connect_stats().unwrap_or((0, 0, 0, 0, 0, 0));
                 let ws = gba.rfu_wait_stats().unwrap_or((0, 0, 0, 0, 0));
                 let cl = gba.rfu_client_life().unwrap_or((0, 0, 0, 0, 0, 0));
+                let tx = gba.rfu_tx_stats().unwrap_or((0, 0, 0));
                 let now = (
                     cs.0 + cs.1 + cs.2 + cs.3 + cs.4 + cs.5 + ws.1 + ws.2 + ws.3 + ws.4
-                        + cl.0 as u64 + cl.2 + cl.3 + cl.4 + cl.5,
+                        + cl.0 as u64 + cl.2 + cl.3 + cl.4 + cl.5
+                        + tx.0 + tx.1 + tx.2,
                     peers, conns, dropped, state, seen, unknown,
                 );
                 if s.rfu_last != Some(now) {
@@ -777,10 +779,11 @@ pub extern "C" fn retro_run() {
                     log_line(
                         s.log,
                         &format!(
-                            "[rfu] state={state} self_id={} commands={cmds} peers_seen={peers} connections={conns} dropped={dropped} cmds_seen={seen:016X} unknown={unknown:016X} connect(asked={} nopeer={} sent={} nacked={}) incoming(got={} refused={}) wait(timeout={} data={} disc={}) blocks(out={} in={}) NOW(clients={} peers={}) left(added={} timeout={} told={} wiped={})",
+                            "[rfu] state={state} self_id={} commands={cmds} peers_seen={peers} connections={conns} dropped={dropped} cmds_seen={seen:016X} unknown={unknown:016X} connect(asked={} nopeer={} sent={} nacked={}) incoming(got={} refused={}) wait(timeout={} data={} disc={}) blocks(out={} in={}) tx(rtx={} noclient={} toolong={}) NOW(clients={} peers={}) left(added={} timeout={} told={} wiped={})",
                             netpacket::self_id(),
                             cs.0, cs.1, cs.2, cs.3, cs.4, cs.5,
                             ws.0, ws.1, ws.2, ws.3, ws.4,
+                            tx.0, tx.1, tx.2,
                             cl.0, cl.1, cl.2, cl.3, cl.4, cl.5
                         ),
                     );

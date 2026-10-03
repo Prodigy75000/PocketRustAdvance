@@ -468,6 +468,15 @@ impl Gba {
         })
     }
 
+    /// Retransmits performed, and blocks the game asked to send that did not
+    /// go out: no client attached, or a length past what the medium carries.
+    pub fn rfu_tx_stats(&self) -> Option<(u64, u64, u64)> {
+        self.bus
+            .rfu
+            .as_ref()
+            .map(|r| (r.tx_rtx, r.tx_no_client, r.tx_too_long))
+    }
+
     pub fn rfu_connect_stats(&self) -> Option<(u64, u64, u64, u64, u64, u64)> {
         self.bus.rfu.as_ref().map(|r| {
             (

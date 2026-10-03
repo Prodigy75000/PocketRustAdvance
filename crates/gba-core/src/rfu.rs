@@ -73,6 +73,28 @@ const FIRMWARE_VERSION: u32 = 0x0083_0117;
 /// which is what a broadcast-read fetch returns when the air is full.
 const MAX_RESP: usize = 4 * 7;
 
+/// Longest command payload the game can hand us. The length field in a command
+/// header is eight bits, so this is what the protocol can express rather than
+/// what any game is expected to use. It was sized at `MAX_RESP` (28 words),
+/// which silently discarded every word past the 28th of a longer command.
+const MAX_CMD: usize = 255;
+
+/// The transmit buffer, which **persists between commands**: 23 words, the
+/// largest block the medium carries. SEND_DATA and SEND_DATAW load it, and
+/// RTX_WAIT retransmits whatever it still holds without being handed a payload
+/// again.
+const TX_WORDS: usize = 23;
+
+/// How many bytes one block may carry, by role: a host has the whole frame, a
+/// client has a slot in it.
+///
+/// These bound the length the GAME ASKS FOR. That is deliberately not the same
+/// as bounding it by how many words the command happened to carry, which is
+/// what this used to do: a game may legitimately ask to send more than it just
+/// handed over, because the adapter is still holding the rest.
+const TX_MAX_HOST: usize = 90;
+const TX_MAX_CLIENT: usize = 16;
+
 /// One adapter frame, in system cycles: a sixtieth of a second.
 const FRAME_CYCLES: u32 = 16_777_216 / 60;
 
@@ -278,7 +300,12 @@ pub struct Rfu {
     pos: u8,
     /// Payload in, response out. The adapter reuses one buffer for both, which
     /// is why a response is built over the request that produced it.
-    buf: [u32; MAX_RESP],
+    buf: [u32; MAX_CMD],
+    /// The block waiting to go on the air, and how much of it the game asked
+    /// to send. **Both persist across commands**, because RTX_WAIT means
+    /// retransmit: it names no payload and sends this one again.
+    tx_buf: [u32; TX_WORDS],
+    tx_blen: u8,
     /// Previous word, which the handshake echoes back inverted.
     prev: u32,
     /// Slave timeout and retransmit count, in adapter frames, as configured by
@@ -333,6 +360,13 @@ pub struct Rfu {
     /// Blocks actually handed over the air, and collected from it.
     pub blocks_out: u64,
     pub blocks_in: u64,
+    /// Why a block the game asked us to send did not go out, and how often one
+    /// went out as a retransmit. `blocks_out` staying at zero while the game is
+    /// plainly sending has several causes that need opposite fixes, and none of
+    /// them report anything anywhere.
+    pub tx_rtx: u64,
+    pub tx_no_client: u64,
+    pub tx_too_long: u64,
     pub conn_asked: u64,
     pub conn_no_peer: u64,
     pub conn_sent: u64,
@@ -364,7 +398,9 @@ impl Default for Rfu {
             cmd: 0,
             len: 0,
             pos: 0,
-            buf: [0; MAX_RESP],
+            buf: [0; MAX_CMD],
+            tx_buf: [0; TX_WORDS],
+            tx_blen: 0,
             prev: 0,
             timeout: DEF_TIMEOUT_FRAMES,
             rtx_max: DEF_RTX_MAX,
@@ -389,6 +425,9 @@ impl Default for Rfu {
             resp_disc: 0,
             blocks_out: 0,
             blocks_in: 0,
+            tx_rtx: 0,
+            tx_no_client: 0,
+            tx_too_long: 0,
             conn_asked: 0,
             conn_no_peer: 0,
             conn_sent: 0,
@@ -433,6 +472,7 @@ impl Rfu {
             self.blocks_out,
             self.blocks_in,
         );
+        let tx_dbg = (self.tx_rtx, self.tx_no_client, self.tx_too_long);
         let conns_dbg = (
             self.conn_asked,
             self.conn_no_peer,
@@ -456,6 +496,9 @@ impl Rfu {
         self.resp_disc = resp_dbg.2;
         self.blocks_out = resp_dbg.3;
         self.blocks_in = resp_dbg.4;
+        self.tx_rtx = tx_dbg.0;
+        self.tx_no_client = tx_dbg.1;
+        self.tx_too_long = tx_dbg.2;
         self.conn_asked = conns_dbg.0;
         self.conn_no_peer = conns_dbg.1;
         self.conn_sent = conns_dbg.2;
@@ -548,7 +591,7 @@ impl Rfu {
                 reply
             }
             Com::RespDat => {
-                let reply = self.buf[self.pos as usize % MAX_RESP];
+                let reply = self.buf[(self.pos as usize).min(MAX_CMD - 1)];
                 self.pos += 1;
                 if self.pos >= self.len {
                     self.com = Com::WaitCmd;
@@ -835,54 +878,83 @@ impl Rfu {
                 Ok(1)
             }
 
-            // The game hands us a block to put on the air. The first word
-            // is a length header whose encoding differs by role, and the rest
-            // is the payload.
+            // The game hands us a block to put on the air.
+            //
+            // **These are three commands, not three names for one.** SEND_DATA
+            // and SEND_DATAW carry a length header and a payload, which they
+            // load into the transmit buffer before sending it. RTX_WAIT is a
+            // RETRANSMIT: it carries nothing and sends the buffer again. In the
+            // reference they are one switch case entered by fallthrough, which
+            // reads as if all three were handed a payload; they are not, and
+            // re-deriving the block from an absent payload sends nothing at
+            // all, silently. A trade that is waiting on an answer loops on
+            // exactly this command.
             CMD_SEND_DATA | CMD_SEND_DATAW | CMD_RTX_WAIT => {
-                if self.len == 0 {
-                    return Ok(0);
+                if self.cmd == CMD_RTX_WAIT {
+                    self.tx_rtx += 1;
+                } else {
+                    if self.len == 0 {
+                        return Ok(0);
+                    }
+                    // The length header encoding differs by role: a host owns
+                    // the low seven bits, a client gets five bits at an offset
+                    // set by the slot the host gave it.
+                    self.tx_blen = match self.link {
+                        Link::Host => (self.buf[0] & 0x7F) as u8,
+                        Link::Client => {
+                            let shift = 8 + self.client.clnum as u32 * 5;
+                            ((self.buf[0] >> shift) & 0x1F) as u8
+                        }
+                        // Nowhere to send it. The reference reports this as an
+                        // error rather than accepting the block and dropping
+                        // it, and a game told its block went out will wait for
+                        // an answer forever.
+                        _ => return Err(1),
+                    };
+                    let words = ((self.len - 1) as usize).min(TX_WORDS);
+                    self.tx_buf = [0; TX_WORDS];
+                    self.tx_buf[..words].copy_from_slice(&self.buf[1..1 + words]);
                 }
-                let header = self.buf[0];
-                let words = (self.len - 1) as usize;
-                let mut payload = Vec::with_capacity(words * 4);
-                for i in 0..words {
-                    put32(&mut payload, self.buf[1 + i]);
+
+                let blen = self.tx_blen as usize;
+                let mut payload = Vec::with_capacity(TX_WORDS * 4);
+                for i in 0..TX_WORDS {
+                    put32(&mut payload, self.tx_buf[i]);
                 }
                 match self.link {
                     Link::Host => {
-                        let blen = (header & 0x7F) as usize;
-                        if blen <= payload.len() {
-                            payload.truncate(blen);
-                            for i in 0..4 {
-                                let c = self.host.clients[i];
-                                if c.devid != 0 {
-                                    self.blocks_out += 1;
-                                    self.send_data(
-                                        c.client_id,
-                                        PKT_HOST_SEND,
-                                        blen as u32,
-                                        &payload,
-                                    );
-                                }
+                        if blen > TX_MAX_HOST {
+                            self.tx_too_long += 1;
+                            return Ok(0);
+                        }
+                        payload.truncate(blen);
+                        let mut any = false;
+                        for i in 0..4 {
+                            let c = self.host.clients[i];
+                            if c.devid != 0 {
+                                any = true;
+                                self.blocks_out += 1;
+                                self.send_data(c.client_id, PKT_HOST_SEND, blen as u32, &payload);
                             }
+                        }
+                        if !any {
+                            self.tx_no_client += 1;
                         }
                     }
                     Link::Client => {
-                        // A client encodes its length in a field whose offset
-                        // depends on which slot the host gave it.
-                        let shift = 8 + self.client.clnum as u32 * 5;
-                        let blen = ((header >> shift) & 0x1F) as usize;
-                        if blen <= payload.len() {
-                            payload.truncate(blen);
-                            let h = self.client.devid as u32
-                                | ((self.client.clnum as u32) << 16)
-                                | ((blen as u32) << 24);
-                            let host = self.client.host_id;
-                            self.blocks_out += 1;
-                            self.send_data(host, PKT_CLIENT_SEND, h, &payload);
+                        if blen > TX_MAX_CLIENT {
+                            self.tx_too_long += 1;
+                            return Ok(0);
                         }
+                        payload.truncate(blen);
+                        let h = self.client.devid as u32
+                            | ((self.client.clnum as u32) << 16)
+                            | ((blen as u32) << 24);
+                        let host = self.client.host_id;
+                        self.blocks_out += 1;
+                        self.send_data(host, PKT_CLIENT_SEND, h, &payload);
                     }
-                    _ => {}
+                    _ => return Err(1),
                 }
                 Ok(0)
             }
@@ -1285,7 +1357,7 @@ impl Rfu {
         }
 
         if self.com == Com::WaitResp && so_si_clear && armed {
-            let word = self.buf[self.pos as usize % MAX_RESP];
+            let word = self.buf[(self.pos as usize).min(MAX_CMD - 1)];
             self.pos += 1;
             if self.pos >= self.len {
                 self.com = Com::WaitCmd;
@@ -1726,6 +1798,108 @@ mod tests {
         deliver(&mut client, 1, &mut host, 0);
         let got = cmd(&mut host, CMD_RECV_DATA, &[]);
         assert_eq!(got, vec![0x0BAD_F00D]);
+    }
+
+    #[test]
+    fn a_bare_retransmit_sends_the_last_block_again() {
+        let (mut host, mut client) = joined_pair();
+        cmd(&mut host, CMD_SEND_DATA, &[4, 0xDEAD_BEEF]);
+        assert_eq!(host.blocks_out, 1, "the first send goes out");
+        host.take_outbox();
+
+        // RTX_WAIT carries no payload at all. It means RETRANSMIT: the adapter
+        // is still holding the block and puts it on the air again. Deriving the
+        // block from this command instead sends nothing, silently, and a game
+        // waiting on an answer loops on exactly this command.
+        host.transfer(0x9966_0000 | CMD_RTX_WAIT as u32);
+        let ack = host.transfer(0);
+        assert_eq!(ack & 0xFFFF_00FF, 0x9966_0080 | CMD_RTX_WAIT as u32);
+        assert_eq!(host.blocks_out, 2, "the retransmit went out too");
+        assert_eq!(host.tx_rtx, 1);
+
+        // And it lands, rather than merely leaving.
+        let out = host.take_outbox();
+        assert_eq!(out.len(), 1, "one packet, to the one attached client");
+        assert_eq!(get32(&out[0].bytes, 4), PKT_HOST_SEND);
+        client.net_receive(&out[0].bytes, 0);
+        assert_eq!(cmd(&mut client, CMD_RECV_DATA, &[]), vec![0xDEAD_BEEF]);
+    }
+
+    #[test]
+    fn a_host_may_ask_to_send_more_than_it_just_handed_over() {
+        let (mut host, mut client) = joined_pair();
+        // Eight bytes asked for, one word handed over. The adapter holds a
+        // 23-word buffer and transmits from that, so the length the game asks
+        // for is bounded by what the air carries and NOT by how long this one
+        // command happened to be. Refusing the block on that basis is a silent
+        // drop, and it is the whole reason a host could report nothing sent.
+        cmd(&mut host, CMD_SEND_DATA, &[8, 0x1122_3344]);
+        assert_eq!(host.blocks_out, 1, "the block goes out");
+        assert_eq!(host.tx_too_long, 0, "and is not mistaken for an overlong one");
+        deliver(&mut host, 0, &mut client, 1);
+        assert_eq!(
+            cmd(&mut client, CMD_RECV_DATA, &[]),
+            vec![0x1122_3344, 0],
+            "eight bytes arrive, the tail zero filled rather than stale"
+        );
+    }
+
+    #[test]
+    fn a_block_past_what_the_medium_carries_is_refused_and_counted() {
+        let (mut host, _client) = joined_pair();
+        // The length field can express 0x7F; the air carries 90 bytes. The gap
+        // has to be refused rather than truncated, and counted rather than
+        // dropped where nobody can see it.
+        cmd(&mut host, CMD_SEND_DATA, &[0x7F, 0]);
+        assert_eq!(host.blocks_out, 0, "nothing goes out");
+        assert_eq!(host.tx_too_long, 1, "and the reason is recorded");
+    }
+
+    #[test]
+    fn a_client_block_past_its_slot_is_refused_and_counted() {
+        let (mut host, mut client) = joined_pair();
+        // A client gets five bits of length, so it can ask for up to 31 bytes,
+        // but its slot in the frame only carries 16. The two limits are
+        // different numbers and the gap between them has to be refused: the
+        // host would otherwise read a block longer than the slot it arrived in
+        // and shift every later byte of a trade.
+        cmd(&mut client, CMD_SEND_DATA, &[0x1F << 8, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(client.blocks_out, 0, "nothing goes out");
+        assert_eq!(client.tx_too_long, 1, "and the reason is recorded");
+        // Sixteen is still accepted, so the bound is the slot size and not
+        // merely some number below 31.
+        cmd(&mut client, CMD_SEND_DATA, &[16 << 8, 1, 2, 3, 4]);
+        assert_eq!(client.blocks_out, 1, "a full slot is fine");
+        deliver(&mut client, 1, &mut host, 0);
+        assert_eq!(cmd(&mut host, CMD_RECV_DATA, &[]), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_host_sending_into_an_empty_room_is_counted_not_lost() {
+        let mut host = Rfu::new();
+        handshake(&mut host);
+        cmd(&mut host, CMD_HOST_START, &[]);
+        cmd(&mut host, CMD_SEND_DATA, &[4, 0xABCD_1234]);
+        assert_eq!(host.blocks_out, 0);
+        // This is the one cause of a silent zero that is not a bug, so it needs
+        // its own counter: otherwise "the host sent nothing" cannot be told
+        // apart from "the host had nobody to send to".
+        assert_eq!(host.tx_no_client, 1);
+    }
+
+    #[test]
+    fn sending_while_neither_hosting_nor_attached_is_an_error() {
+        let mut rfu = Rfu::new();
+        handshake(&mut rfu);
+        // Idle. There is nowhere for the block to go, and the game has to be
+        // told, rather than left waiting for a reply to a block that never
+        // left. Unknown commands are acknowledged; this one is refused, and
+        // the reference draws the line in the same place.
+        rfu.transfer(0x9966_0000 | (2 << 8) | CMD_SEND_DATA as u32);
+        rfu.transfer(4);
+        rfu.transfer(0xDEAD);
+        assert_eq!(rfu.transfer(0), 0x9966_01EE, "an error, not an ack");
+        assert_eq!(rfu.blocks_out, 0);
     }
 
     #[test]
