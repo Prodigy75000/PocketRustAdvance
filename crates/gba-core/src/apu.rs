@@ -29,6 +29,27 @@ const SUB_CYCLES: u64 = CYCLES_PER_SAMPLE / OVERSAMPLE;
 /// System cycles per 512 Hz frame-sequencer tick (16_777_216 / 512).
 const FS_PERIOD: u32 = 32_768;
 
+/// DAC steps to i16: the GBA's mixer output is 10 bits (0x400 steps, centred by
+/// SOUNDBIAS), so 0x8000 / 0x200 = 64 maps one DAC step to 64 of i16 and makes
+/// the hardware's full scale exactly i16's full scale.
+///
+/// **This is not a volume knob, it is the only non-arbitrary value.** It used to
+/// be 24, which put our output 8.5 dB under gpSP for the same emulated mixer
+/// state, and that is what the owner heard as "not as loud as gpSP". Measured
+/// against both reference cores on an isolated PSG tone: gpSP uses 64, mGBA uses
+/// 48 (it scales by a user volume of 0x100 * 3 >> 4). Anything below 64 throws
+/// away output range the hardware was using.
+const DAC_TO_I16: i32 = 64;
+
+/// SOUNDBIAS reset value. Bits 0-9 are the bias level that shifts the signed mix
+/// into the DAC's unsigned 10-bit window, and 0x200 centres it.
+///
+/// It has to be non-zero at reset or direct boot is silent-ish: with bias 0 the
+/// clip in [`Apu::dac`] takes every negative sample to zero. Real hardware resets
+/// this register to 0x200 and the BIOS writes it again; we direct-boot most of
+/// the corpus, so nothing else would set it.
+const SOUNDBIAS_RESET: u16 = 0x0200;
+
 const DUTY: [u8; 4] = [0b0000_0001, 0b1000_0001, 0b1000_0111, 0b0111_1110];
 
 /// A tone/envelope generator shared by the two square channels and (minus the
@@ -385,8 +406,10 @@ pub struct Apu {
 
 impl Default for Apu {
     fn default() -> Self {
+        let mut reg = [0u8; 0x48];
+        reg[0x88 - 0x60..0x8A - 0x60].copy_from_slice(&SOUNDBIAS_RESET.to_le_bytes());
         Apu {
-            reg: [0; 0x48],
+            reg,
             wave_ram: [0; 32],
             master_enable: false,
             fs_cycle: 0,
@@ -749,16 +772,23 @@ impl Apu {
                 psg_r += d;
             }
         }
-        psg_l *= left_vol + 1;
-        psg_r *= right_vol + 1;
-        // PSG master ratio: bits 0-1 of SOUNDCNT_H (00=25%,01=50%,10=100%).
+        // One channel DAC step is worth 8 steps of the GBA's DAC before the
+        // master volume (1..8) and the PSG ratio are applied, so four channels at
+        // full volume and 100% reach 4 * 15 * 8 * 8 >> 2 = 960 of the DAC's 1024
+        // steps: the same range one Direct Sound channel covers. That is the
+        // relationship to keep, and it fixes the second half of the loudness gap:
+        // the net weight per step is 16 at 100%, and ours was 8, which measured
+        // exactly 6 dB under gpSP and mGBA on an isolated tone.
+        //
+        // PSG ratio is bits 0-1 of SOUNDCNT_H (00=25%, 01=50%, 10=100%); 11 is
+        // prohibited and is treated as 100%, which is what we did before.
         let shift = match cnt_h & 3 {
-            0 => 2,
-            1 => 1,
-            _ => 0,
+            0 => 4,
+            1 => 3,
+            _ => 2,
         };
-        psg_l >>= shift;
-        psg_r >>= shift;
+        psg_l = (psg_l * 8 * (left_vol + 1)) >> shift;
+        psg_r = (psg_r * 8 * (right_vol + 1)) >> shift;
 
         // Direct Sound: 8-bit signed, 100% or 50% volume (bits 2/3).
         let a = self.ds_a as i32 * if cnt_h & 0x04 != 0 { 4 } else { 2 };
@@ -777,7 +807,20 @@ impl Apu {
         if cnt_h & 0x1000 != 0 {
             r += b;
         }
-        (l * 24, r * 24)
+        (self.dac(l), self.dac(r))
+    }
+
+    /// The output stage: SOUNDBIAS, then the DAC's 10 bits, then i16.
+    ///
+    /// Hardware offsets the signed mix by the bias level, truncates it to the
+    /// DAC's unsigned 10-bit range, and that clip is where a loud game's mix
+    /// actually distorts. We had no clip at this point at all, only the final i16
+    /// one, so we clipped roughly 2.7x later than the console did and every game
+    /// paid for that headroom in volume. Clipping here, per sub-sample before the
+    /// oversample average, is also where the console does it.
+    fn dac(&self, mix: i32) -> i32 {
+        let bias = (self.r16(0x88) & 0x3FF) as i32;
+        ((mix + bias).clamp(0, 0x3FF) - bias) * DAC_TO_I16
     }
 
     // --- Save-state -----------------------------------------------------------
@@ -820,6 +863,14 @@ impl Apu {
     pub fn deserialize(&mut self, r: &mut Reader) {
         let mut reg = [0u8; 0x48];
         r.bytes_into(&mut reg);
+        // A version-1 state was captured when SOUNDBIAS was stored but never
+        // read, and no game writes it (it relies on the hardware reset value),
+        // so that copy is a zero. Honouring it would clip the whole negative half
+        // of the mix to silence: measured max 12226 / min -176 on a LeafGreen
+        // battle state before this migration existed.
+        if r.version < 2 {
+            reg[0x88 - 0x60..0x8A - 0x60].copy_from_slice(&SOUNDBIAS_RESET.to_le_bytes());
+        }
         self.reg = reg;
         let mut wr = [0u8; 32];
         r.bytes_into(&mut wr);
@@ -870,8 +921,25 @@ mod tests {
         a.write8(off + 1, (v >> 8) as u8);
     }
 
+    fn peak(a: &Apu) -> u16 {
+        a.out.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0)
+    }
+
+    /// Absolute output LEVEL, not just "it swings".
+    ///
+    /// This test replaces a `peak > 1000` assertion that passed both before and
+    /// after the output stage was 2.7x too quiet, which is how a core that was
+    /// 10 dB under gpSP kept a green suite. The band comes from the hardware and
+    /// not from our own constants: one PSG channel at full volume and 100% ratio
+    /// swings 15 of the GBA DAC's 1024 steps times the x16 step weight, so 240
+    /// of 2048 peak-to-peak, which is 23.4% of i16 peak-to-peak. The peak lands
+    /// between 7680 (once the DC blocker has centred the asymmetric +7/-8 swing)
+    /// and 8192 (before it has).
+    ///
+    /// A 24x output stage reads 1446 here and a 48x one reads 5760, so both the
+    /// old value and mGBA's are outside the band.
     #[test]
-    fn square_channel_produces_a_waveform() {
+    fn one_psg_channel_at_full_volume_is_a_quarter_of_full_scale() {
         let mut a = Apu::new();
         a.write8(0x84, 0x80); // master enable
         w16(&mut a, 0x80, 0x7777); // full L/R volume, all channels both sides
@@ -881,8 +949,34 @@ mod tests {
         w16(&mut a, 0x6C, 0x8400); // freq 0x400, length disabled, trigger
         assert!(a.ch2.enabled, "channel 2 should be on after trigger");
         a.generate([None, None], 200_000);
-        let peak = a.out.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-        assert!(peak > 1000, "square wave should swing, peak was {peak}");
+        let p = peak(&a);
+        assert!((7000..=8400).contains(&p), "one PSG channel should peak near 8192, got {p}");
+    }
+
+    /// Halving the PSG ratio has to halve the output, because that is the only
+    /// thing the ratio field does. Catches a ratio table that is off by a shift,
+    /// which is a mistake the absolute test above cannot see on its own.
+    #[test]
+    fn the_psg_ratio_field_halves_the_level_each_step_down() {
+        let level = |ratio: u16| {
+            let mut a = Apu::new();
+            a.write8(0x84, 0x80);
+            w16(&mut a, 0x80, 0x7777);
+            w16(&mut a, 0x82, ratio);
+            w16(&mut a, 0x68, 0xF080);
+            w16(&mut a, 0x6C, 0x8400);
+            a.generate([None, None], 200_000);
+            peak(&a) as i32
+        };
+        let (full, half, quarter) = (level(2), level(1), level(0));
+        assert!(
+            (full - half * 2).abs() <= full / 16,
+            "50% should be half of 100%: {half} vs {full}"
+        );
+        assert!(
+            (full - quarter * 4).abs() <= full / 16,
+            "25% should be a quarter of 100%: {quarter} vs {full}"
+        );
     }
 
     #[test]
@@ -902,8 +996,85 @@ mod tests {
         // Timer 0 overflows every 512 cycles => one pop per output sample.
         a.generate([Some(512), None], 512 * 40);
         assert!(a.fifo_a_len() < 32, "FIFO should have drained");
-        let peak = a.out.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-        assert!(peak > 1000, "Direct Sound should be audible, peak {peak}");
+        let p = peak(&a);
+        assert!(p > 1000, "Direct Sound should be audible, peak {p}");
+    }
+
+    /// One Direct Sound channel at 100% covers the WHOLE DAC range, so a FIFO
+    /// carrying full-amplitude PCM has to reach i16's full scale. This is the
+    /// level that matters in practice: the GBA sound driver mixes a game's music
+    /// and samples in software and pushes the result through Direct Sound, so
+    /// almost every commercial GBA game is this path and nothing else.
+    ///
+    /// A 24x output stage reads 12192 here, which is the 8.5 dB the owner heard.
+    #[test]
+    fn one_direct_sound_channel_at_full_amplitude_reaches_full_scale() {
+        let mut a = Apu::new();
+        a.write8(0x84, 0x80);
+        w16(&mut a, 0x82, 0x0304); // DS A at 100%, both sides, timer 0
+        // A 1 kHz square at full 8-bit amplitude: 16 pops high, 16 pops low, one
+        // pop per output sample. Alternating per sample instead would be at the
+        // output Nyquist and the mixer's smoothing would legitimately null it.
+        for _ in 0..8 {
+            for _ in 0..16 {
+                a.write8(0xA0, 127);
+            }
+            for _ in 0..16 {
+                a.write8(0xA0, (-128i8) as u8);
+            }
+            a.generate([Some(512), None], a.cycle + 512 * 32);
+        }
+        let p = peak(&a);
+        assert!(p > 30_000, "full-amplitude Direct Sound should reach full scale, got {p}");
+    }
+
+    /// SOUNDBIAS has to come up centred. With a bias of zero the clip in
+    /// `dac` takes every negative sample to silence, and since most of the corpus
+    /// direct-boots there is no BIOS write to rescue it.
+    #[test]
+    fn soundbias_resets_to_the_centred_value() {
+        let a = Apu::new();
+        let v = a.read8(0x88) as u16 | (a.read8(0x89) as u16) << 8;
+        assert_eq!(v, 0x0200, "SOUNDBIAS must reset centred, not to zero");
+    }
+
+    /// The clip is at the DAC, where SOUNDBIAS put it, not at i16.
+    ///
+    /// Moving the bias down to 0x100 moves the floor from -0x200 to -0x100, so
+    /// the same signal keeps its positive peak and loses half its negative one.
+    /// Without the bias clip both runs would be identical, which is what makes
+    /// this falsifiable rather than decorative.
+    #[test]
+    fn the_bias_level_decides_where_the_negative_half_clips() {
+        let run = |bias: u16| {
+            let mut a = Apu::new();
+            a.write8(0x84, 0x80);
+            w16(&mut a, 0x88, bias);
+            w16(&mut a, 0x82, 0x0304); // DS A at 100%, both sides, timer 0
+            for _ in 0..16 {
+                a.write8(0xA0, 127);
+            }
+            for _ in 0..16 {
+                a.write8(0xA0, (-128i8) as u8);
+            }
+            // Short window: the DC blocker has a 4096-sample time constant, so
+            // over 32 samples it cannot disguise the asymmetry under test.
+            a.generate([Some(512), None], 512 * 32);
+            let hi = a.out.iter().copied().max().unwrap_or(0) as i32;
+            let lo = a.out.iter().copied().min().unwrap_or(0) as i32;
+            (hi, lo)
+        };
+        let (hi_centred, lo_centred) = run(0x0200);
+        let (hi_low, lo_low) = run(0x0100);
+        assert!(lo_centred < -30_000, "centred bias should reach the floor, got {lo_centred}");
+        assert!(
+            lo_low > -20_000,
+            "a bias of 0x100 should clip the negative half at about -16384, got {lo_low}"
+        );
+        assert!(
+            (hi_centred - hi_low).abs() < hi_centred / 8,
+            "lowering the bias must not change the positive peak: {hi_centred} vs {hi_low}"
+        );
     }
 
     #[test]

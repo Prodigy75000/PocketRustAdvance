@@ -186,9 +186,18 @@ impl Gba {
     /// Returns false if the blob is not a valid state for this build.
     pub fn load_state(&mut self, data: &[u8]) -> bool {
         let mut r = state::Reader::new(data);
-        if r.u32() != state::MAGIC || r.u8() != state::VERSION {
+        let version = {
+            if r.u32() != state::MAGIC {
+                return false;
+            }
+            r.u8()
+        };
+        if !(state::OLDEST_VERSION..=state::VERSION).contains(&version) {
             return false;
         }
+        // Components read this to migrate a field that gained meaning after the
+        // state was written, rather than trusting a byte nothing ever set.
+        r.version = version;
         self.cpu.deserialize(&mut r);
         self.bus.deserialize(&mut r);
         // The loaded state may be anywhere, and an armed loop head carried over
@@ -980,6 +989,42 @@ mod tests {
 
         // A garbage blob is rejected, not panicked on.
         assert!(!b.load_state(&[1, 2, 3]));
+    }
+
+    /// A state written before SOUNDBIAS was modelled carries a zero nobody wrote,
+    /// and honouring it clips the whole negative half of the audio to silence.
+    /// The version byte is what separates "nobody wrote it" from "the game chose
+    /// it", so both readings are pinned here.
+    #[test]
+    fn an_old_state_gets_the_soundbias_reset_value_and_a_new_one_keeps_its_own() {
+        use crate::bus::{Access, Bus};
+        let rom = vec![0u8; 0x2000];
+        let mut a = Gba::new(rom.clone(), Vec::new());
+        a.run_frame();
+        // Deliberately park a zero in SOUNDBIAS, which is what an old state holds.
+        a.bus.write16(0x0400_0088, 0, Access::Seq);
+        assert_eq!(a.bus.read16(0x0400_0088, Access::Seq), 0, "the write landed");
+        let current = a.save_state();
+        assert_eq!(current[4], state::VERSION, "the header carries the version");
+
+        let mut old = current.clone();
+        old[4] = 1;
+
+        let mut b = Gba::new(rom.clone(), Vec::new());
+        assert!(b.load_state(&old), "a version-1 state must still load");
+        assert_eq!(
+            b.bus.read16(0x0400_0088, Access::Seq),
+            0x0200,
+            "an old state's SOUNDBIAS must be replaced with the reset value"
+        );
+
+        let mut c = Gba::new(rom, Vec::new());
+        assert!(c.load_state(&current));
+        assert_eq!(
+            c.bus.read16(0x0400_0088, Access::Seq),
+            0,
+            "a current state's SOUNDBIAS is the game's own choice and must survive"
+        );
     }
 
     /// The CPU must be able to see DISPSTAT's H-blank flag (bit 1) go high and

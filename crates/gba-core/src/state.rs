@@ -7,7 +7,18 @@
 //! the reader's `failed` flag instead of panicking, so `load_state` can reject.
 
 pub const MAGIC: u32 = 0x5052_4153; // "PRAS"
-pub const VERSION: u8 = 1;
+
+/// Current format version, written into every new state.
+///
+/// 1: shipped format.
+/// 2: SOUNDBIAS is modelled, so a version-1 state's copy of that register is a
+///    zero that nothing ever wrote. See [`OLDEST_VERSION`].
+pub const VERSION: u8 = 2;
+
+/// Oldest version `load_state` still accepts. Bumping [`VERSION`] must not throw
+/// away a player's states, so old ones load and the components that gained
+/// meaning in between migrate themselves off [`Reader::version`].
+pub const OLDEST_VERSION: u8 = 1;
 
 #[derive(Default)]
 pub struct Writer {
@@ -47,11 +58,15 @@ pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
     pub failed: bool,
+    /// Format version of the blob being read, so a component can tell a field it
+    /// wrote from one that predates it. Set by the caller after reading the
+    /// header; 0 until then.
+    pub version: u8,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Reader { buf, pos: 0, failed: false }
+        Reader { buf, pos: 0, failed: false, version: 0 }
     }
     /// Bytes not yet consumed. Used to make newly-appended state blocks (e.g. the
     /// APU, added after the format shipped) optional, so older states still load.

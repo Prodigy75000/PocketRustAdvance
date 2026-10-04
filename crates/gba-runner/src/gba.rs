@@ -775,9 +775,16 @@ fn main() {
         } else {
             0.0
         };
+        // Samples sitting on an i16 rail. The output stage maps the GBA DAC's
+        // full scale onto i16's full scale exactly, so a railed sample means the
+        // emulated mixer really did saturate its own DAC, which hardware would
+        // have clipped too. A few are normal in a loud game; a large share is the
+        // signature of an output stage scaled too hot.
+        let railed = audio.iter().filter(|&&s| s == i16::MAX || s == i16::MIN).count();
         println!(
-            "  audio: {frames_out} stereo samples ({:.1}/frame), peak {peak}, rms {rms:.1}, {nonzero} non-zero",
-            frames_out as f64 / frames.max(1) as f64
+            "  audio: {frames_out} stereo samples ({:.1}/frame), peak {peak}, rms {rms:.1}, {nonzero} non-zero, {railed} railed ({:.3}%)",
+            frames_out as f64 / frames.max(1) as f64,
+            railed as f64 * 100.0 / audio.len().max(1) as f64
         );
         if let Some(path) = std::env::var_os("GBA_WAV") {
             match write_wav(&path, &audio, gba_core::Gba::SAMPLE_RATE) {
