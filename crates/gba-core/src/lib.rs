@@ -12,6 +12,7 @@ pub mod apu;
 pub mod bus;
 pub mod cpu;
 pub mod memory;
+pub mod jit;
 pub mod ppu;
 pub mod rfu;
 pub mod rtc;
