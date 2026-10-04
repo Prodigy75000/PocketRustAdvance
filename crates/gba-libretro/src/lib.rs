@@ -111,6 +111,11 @@ const RETRO_ENVIRONMENT_GET_LOG_INTERFACE: u32 = 27;
 /// experimental bit. A front end that does not implement it leaves our bool
 /// untouched, which is why it is initialised to false before every call.
 const RETRO_ENVIRONMENT_GET_FASTFORWARDING: u32 = 65;
+
+/// Shortest gap between two DRAWN frames. Must stay BELOW a 60 Hz frame
+/// (16_667 us) or ordinary front-end pacing jitter drops a real frame; a test
+/// pins that relationship, because a timing test cannot catch it reliably.
+const FRAME_DRAW_MIN_US: u128 = 14_000;
 const RETRO_LOG_INFO: u32 = 1;
 
 /// libretro's logger is printf-shaped, so this is a variadic pointer and every
@@ -787,19 +792,26 @@ pub extern "C" fn retro_run() {
         // so it self-tunes: the picture updates about 60 times a second whether
         // the core is running at 4x or 10x, instead of a fixed divisor that
         // either wastes work at low speeds or stutters at high ones.
-        let mut ff = false;
-        if let Some(env) = s.env {
-            unsafe {
-                env(
-                    RETRO_ENVIRONMENT_GET_FASTFORWARDING,
-                    &mut ff as *mut bool as *mut c_void,
-                );
-            }
-        }
+        // Driven ENTIRELY by elapsed real time, and deliberately NOT by asking
+        // the front end whether it is fast-forwarding.
+        //
+        // This first shipped gated on RETRO_ENVIRONMENT_GET_FASTFORWARDING and
+        // did nothing at all, because this host does not implement that command:
+        // the device log says `Unhandled env cmd=65` for us and for
+        // GenesisPlusGX, melonDS DS and Beetle PCE alike. An unanswered env
+        // query leaves our bool false, which is indistinguishable from "running
+        // at normal speed", so the feature was inert and the measured speed did
+        // not move.
+        //
+        // The clock needs no cooperation and subsumes the query anyway: at 60 Hz
+        // every frame arrives more than 14 ms after the last drawn one and so is
+        // drawn, and at 6x nearly all of them arrive sooner and are skipped. The
+        // threshold sits below 16.67 ms on purpose, so ordinary frame-pacing
+        // jitter at normal speed can never drop a frame.
         let now = std::time::Instant::now();
-        let draw = !ff
-            || s.last_drawn
-                .map_or(true, |t| now.duration_since(t).as_micros() >= 16_000);
+        let draw = s
+            .last_drawn
+            .map_or(true, |t| now.duration_since(t).as_micros() >= FRAME_DRAW_MIN_US);
         if draw {
             s.last_drawn = Some(now);
         }
@@ -1203,17 +1215,19 @@ mod tests {
         }
     }
 
-    /// Fast forward must stop compositing frames nobody sees.
+    /// Running faster than real time must stop compositing frames nobody sees,
+    /// and running at normal speed must never drop one.
     ///
-    /// The core always had `render_enabled` and nothing outside the offline
-    /// runner ever set it, so fast forward rendered all 160 lines and converted
-    /// 38400 pixels for every frame, roughly nine in ten of which are discarded.
-    /// Rendering is 279 us of a 901 us frame on the owner's save state.
+    /// The cadence is driven by the CLOCK, not by asking the front end whether
+    /// it is fast-forwarding. The first version did ask, and did nothing at
+    /// all: this host answers `Unhandled env cmd=65`, which leaves the bool
+    /// false, which is indistinguishable from normal speed. The measured speed
+    /// on device did not move and the feature looked implemented.
     ///
     /// Pinned from BOTH directions, because the dangerous failure is not a slow
-    /// core, it is a core that stops drawing when it should be drawing.
+    /// core, it is one that stops drawing when it should be drawing.
     #[test]
-    fn fast_forward_skips_frames_and_normal_speed_never_does() {
+    fn frames_are_skipped_only_when_running_ahead_of_real_time() {
         let _core = CORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             retro_unload_game();
@@ -1227,38 +1241,49 @@ mod tests {
             };
             assert!(retro_load_game(&info));
 
-            // Not fast-forwarding: every frame is drawn, no matter how fast
-            // they are run back to back.
-            FAKE_FF = false;
-            for _ in 0..8 {
+            // Asserted against the LITERAL 60 Hz frame time, not a symbol, and
+            // checked directly rather than through timing: a threshold at or
+            // above a frame interval drops real frames on device, and the
+            // 17 ms sleep below has too little margin to catch it once an
+            // unoptimised retro_run is added to the gap.
+            assert!(
+                FRAME_DRAW_MIN_US < 16_667,
+                "the draw interval must sit below a 60 Hz frame, is {FRAME_DRAW_MIN_US} us"
+            );
+
+            let drawn = || with_state(|s| s.gba.as_ref().map_or(false, |g| g.render_enabled));
+
+            // Spaced like a 60 Hz front end: every frame must be drawn. A
+            // threshold at or above 16.67 ms would make this flaky and cost a
+            // real dropped frame on device, which is why it sits at 14.
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(17));
                 retro_run();
-                assert!(
-                    with_state(|s| s.gba.as_ref().map_or(false, |g| g.render_enabled)),
-                    "normal speed must draw every frame"
-                );
+                assert!(drawn(), "a frame arriving 17 ms after the last must be drawn");
             }
 
-            // Fast-forwarding: frames run back to back inside one 16 ms window
-            // must stop being drawn after the first.
-            FAKE_FF = true;
+            // Back to back, far faster than real time.
+            //
+            // Asserted as the INVARIANT the rule actually promises, at most one
+            // draw per 14 ms, with the elapsed time measured rather than
+            // assumed. A fixed skip ratio would be testing how fast this
+            // machine runs frames: an unoptimised build takes milliseconds per
+            // frame and legitimately draws more of them. Two earlier versions of
+            // this assertion failed for exactly that reason.
             retro_run();
-            let mut skipped = 0;
-            for _ in 0..8 {
+            let t0 = std::time::Instant::now();
+            let mut draws = 0u128;
+            for _ in 0..20 {
                 retro_run();
-                if !with_state(|s| s.gba.as_ref().map_or(true, |g| g.render_enabled)) {
-                    skipped += 1;
+                if drawn() {
+                    draws += 1;
                 }
             }
-            // Deliberately a weak threshold. The cadence is driven by REAL
-            // elapsed time, so how many frames get skipped depends on how fast
-            // frames run, and an unoptimised test build can take longer than
-            // 16 ms per frame, in which case drawing more of them is CORRECT.
-            // Asserting a ratio here would be a test of the machine. What has
-            // to hold is the mechanism: fast forward skips, normal speed never
-            // does, and that pair still fails if the feature is removed.
+            let budget = t0.elapsed().as_millis() / 14 + 2;
             assert!(
-                skipped >= 1,
-                "fast forward must skip at least one of 8 back-to-back frames, skipped {skipped}"
+                draws <= budget,
+                "at most one draw per 14 ms: {draws} draws in {} ms (budget {budget})",
+                t0.elapsed().as_millis()
             );
             retro_unload_game();
         }
