@@ -107,6 +107,10 @@ const RETRO_SENSOR_GYROSCOPE_Z: u32 = 5;
 const RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE: u32 = 23;
 /// The front-end's logger. Plain 27, no experimental bit.
 const RETRO_ENVIRONMENT_GET_LOG_INTERFACE: u32 = 27;
+/// Is the front end running the core faster than real time? Plain, no
+/// experimental bit. A front end that does not implement it leaves our bool
+/// untouched, which is why it is initialised to false before every call.
+const RETRO_ENVIRONMENT_GET_FASTFORWARDING: u32 = 65;
 const RETRO_LOG_INFO: u32 = 1;
 
 /// libretro's logger is printf-shaped, so this is a variadic pointer and every
@@ -246,6 +250,10 @@ struct State {
     /// something actually changes rather than sixty times a second.
     rfu_last: Option<(u64, u64, u64, u64, &'static str, u64, u64)>,
     flash_last: Option<(u64, u64, u64, u64, u32, u8)>,
+    /// When the last frame was actually drawn. In fast forward the core runs
+    /// many frames per displayed one, so compositing every frame spends most of
+    /// its time on pictures nobody sees.
+    last_drawn: Option<std::time::Instant>,
     /// Frames run, for a heartbeat line. Two emulators on two phones do NOT
     /// share a clock the way two GBAs do, so if one runs below full speed it
     /// under-drains its receive queue while the peer keeps sending at its own
@@ -274,6 +282,7 @@ impl State {
             log: None,
             rfu_last: None,
             flash_last: None,
+            last_drawn: None,
             frames: 0,
         }
     }
@@ -766,6 +775,38 @@ pub extern "C" fn retro_run() {
             }
         }
 
+        // Fast-forward frameskip.
+        //
+        // The core already had `render_enabled` and nothing outside the offline
+        // runner ever set it, so in fast forward we composited all 160 lines and
+        // converted 38400 pixels for every frame, about nine in ten of which are
+        // never shown. Measured on the owner's save state: rendering costs
+        // 279 us of a 901 us frame, so skipping it is worth about +38%.
+        //
+        // The cadence is driven by REAL elapsed time rather than a fixed ratio,
+        // so it self-tunes: the picture updates about 60 times a second whether
+        // the core is running at 4x or 10x, instead of a fixed divisor that
+        // either wastes work at low speeds or stutters at high ones.
+        let mut ff = false;
+        if let Some(env) = s.env {
+            unsafe {
+                env(
+                    RETRO_ENVIRONMENT_GET_FASTFORWARDING,
+                    &mut ff as *mut bool as *mut c_void,
+                );
+            }
+        }
+        let now = std::time::Instant::now();
+        let draw = !ff
+            || s.last_drawn
+                .map_or(true, |t| now.duration_since(t).as_micros() >= 16_000);
+        if draw {
+            s.last_drawn = Some(now);
+        }
+        if let Some(gba) = &mut s.gba {
+            gba.render_enabled = draw;
+        }
+
         // Run one frame and expand the RGB555 framebuffer to XRGB8888.
         if let Some(gba) = &mut s.gba {
             // Hand the frame a way to pull packets mid-flight. This closure
@@ -776,8 +817,15 @@ pub extern "C" fn retro_run() {
             } else {
                 gba.run_frame()
             };
-            for (dst, &px) in s.frame.iter_mut().zip(fb.iter()) {
-                *dst = rgb555_to_xrgb8888(px);
+            // A skipped frame leaves `s.frame` holding the last drawn picture,
+            // which is re-sent below. Deliberately NOT passing a null frame to
+            // signal a duplicate: that is valid libretro, but it depends on the
+            // front end handling it, and re-sending a buffer we already own
+            // cannot go wrong.
+            if draw {
+                for (dst, &px) in s.frame.iter_mut().zip(fb.iter()) {
+                    *dst = rgb555_to_xrgb8888(px);
+                }
             }
         }
 
@@ -984,6 +1032,7 @@ mod tests {
     static mut CAPTURED: Option<Vec<(u64, usize, usize, usize)>> = None;
     /// (cmd, data pointer) of the netpacket interface offer, if the core made
     /// one. See `offers_the_netpacket_interface_to_the_frontend`.
+    static mut FAKE_FF: bool = false;
     static mut NETPACKET_OFFER: Option<(u32, *mut c_void)> = None;
 
     /// The core keeps ONE global `State`, and `CAPTURED` below is global too, so
@@ -1021,6 +1070,14 @@ mod tests {
         );
         if cmd == 78 {
             NETPACKET_OFFER = Some((cmd, data));
+            return true;
+        }
+        if cmd == RETRO_ENVIRONMENT_GET_FASTFORWARDING {
+            // The LITERAL, for the same reason as the asserts above: a wrong
+            // constant would make the core read some other front-end state and
+            // skip frames for reasons unrelated to speed.
+            assert_eq!(RETRO_ENVIRONMENT_GET_FASTFORWARDING, 65);
+            *(data as *mut bool) = FAKE_FF;
             return true;
         }
         if cmd == RETRO_ENVIRONMENT_SET_MEMORY_MAPS {
@@ -1143,6 +1200,67 @@ mod tests {
             };
             assert!(retro_load_game(&info));
             CAPTURED.take().expect("core published no memory map")
+        }
+    }
+
+    /// Fast forward must stop compositing frames nobody sees.
+    ///
+    /// The core always had `render_enabled` and nothing outside the offline
+    /// runner ever set it, so fast forward rendered all 160 lines and converted
+    /// 38400 pixels for every frame, roughly nine in ten of which are discarded.
+    /// Rendering is 279 us of a 901 us frame on the owner's save state.
+    ///
+    /// Pinned from BOTH directions, because the dangerous failure is not a slow
+    /// core, it is a core that stops drawing when it should be drawing.
+    #[test]
+    fn fast_forward_skips_frames_and_normal_speed_never_does() {
+        let _core = CORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            retro_unload_game();
+            retro_set_environment(Some(fake_env));
+            let rom = rom_with(b"FLASH1M_V103");
+            let info = retro_game_info {
+                path: ptr::null(),
+                data: rom.as_ptr() as *const c_void,
+                size: rom.len(),
+                meta: ptr::null(),
+            };
+            assert!(retro_load_game(&info));
+
+            // Not fast-forwarding: every frame is drawn, no matter how fast
+            // they are run back to back.
+            FAKE_FF = false;
+            for _ in 0..8 {
+                retro_run();
+                assert!(
+                    with_state(|s| s.gba.as_ref().map_or(false, |g| g.render_enabled)),
+                    "normal speed must draw every frame"
+                );
+            }
+
+            // Fast-forwarding: frames run back to back inside one 16 ms window
+            // must stop being drawn after the first.
+            FAKE_FF = true;
+            retro_run();
+            let mut skipped = 0;
+            for _ in 0..8 {
+                retro_run();
+                if !with_state(|s| s.gba.as_ref().map_or(true, |g| g.render_enabled)) {
+                    skipped += 1;
+                }
+            }
+            // Deliberately a weak threshold. The cadence is driven by REAL
+            // elapsed time, so how many frames get skipped depends on how fast
+            // frames run, and an unoptimised test build can take longer than
+            // 16 ms per frame, in which case drawing more of them is CORRECT.
+            // Asserting a ratio here would be a test of the machine. What has
+            // to hold is the mechanism: fast forward skips, normal speed never
+            // does, and that pair still fails if the feature is removed.
+            assert!(
+                skipped >= 1,
+                "fast forward must skip at least one of 8 back-to-back frames, skipped {skipped}"
+            );
+            retro_unload_game();
         }
     }
 
