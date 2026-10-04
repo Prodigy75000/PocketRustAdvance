@@ -39,6 +39,15 @@ const FS_PERIOD: u32 = 32_768;
 /// against both reference cores on an isolated PSG tone: gpSP uses 64, mGBA uses
 /// 48 (it scales by a user volume of 0x100 * 3 >> 4). Anything below 64 throws
 /// away output range the hardware was using.
+///
+/// **Do not reduce this to buy headroom for the DC blocker.** That was measured:
+/// across eleven commercial titles the only one whose pre-clamp peak exceeds the
+/// i16 rail is Metroid Zero Mission, at 1.05x, and it is also the only one that
+/// clips the emulated DAC at all (172,094 times, where the other ten clip zero).
+/// It saturates the console's own mixer, which is why gpSP rails on it too. Going
+/// to 48 would cost every other game 2.5 dB to soften one game that distorts on
+/// hardware, and quiet output is the complaint this constant exists to fix.
+/// `dbg_peak` and `dbg_dac_clips` are the two counters that tell those apart.
 const DAC_TO_I16: i32 = 64;
 
 /// SOUNDBIAS reset value. Bits 0-9 are the bias level that shifts the signed mix
@@ -116,12 +125,29 @@ impl Square {
             self.phase = (self.phase + 1) & 7;
         }
     }
+    /// Channel output in EIGHTHS of a DAC step, with no DC component.
+    ///
+    /// The obvious form, `(if high { vol } else { 0 }) - 8`, is the DMG DAC taken
+    /// literally: digital zero sits on the bottom rail. It is also why this core
+    /// sounded saturated once the output stage was scaled correctly. A channel
+    /// enabled at volume 0 held a full -8, three of them stepped the mix by 384
+    /// of the DAC's 512 negative steps, and the DC blocker then spent 125 ms
+    /// bleeding it off with the whole signal riding near the rail. Measured worst
+    /// standing offset 60% of full scale, against 12% for gpSP and mGBA.
+    ///
+    /// Subtracting the waveform's own mean (`k` high slots out of 8, times the
+    /// volume) removes the offset at the source and leaves peak-to-peak exactly
+    /// as it was, so volume 0 is silent and an envelope sweep no longer sweeps a
+    /// DC level. That is also the shape gpSP produces, by scaling a bipolar
+    /// pattern by the envelope instead.
     fn dac(&self) -> i32 {
         if !self.enabled || !self.dac_on {
             return 0;
         }
-        let high = DUTY[self.duty as usize] & (1 << self.phase) != 0;
-        (if high { self.env.vol } else { 0 }) as i32 - 8
+        let pat = DUTY[self.duty as usize];
+        let high = pat & (1 << self.phase) != 0;
+        let vol = self.env.vol as i32;
+        (if high { vol * 8 } else { 0 }) - pat.count_ones() as i32 * vol
     }
     fn clock_length(&mut self) {
         if self.length_enable && self.length > 0 {
@@ -221,12 +247,17 @@ impl Wave {
         };
         let byte = ram[(idx / 2) & 31];
         let nib = if idx & 1 == 0 { byte >> 4 } else { byte & 0xF };
-        let level = if self.force75 {
-            (nib as u32 * 3 / 4) as u8
+        // Eighths of a DAC step, like the other channels. The volume has to scale
+        // the CENTRED sample, not the raw nibble: shifting the nibble first drags
+        // the whole waveform toward the bottom rail, so a perfectly centred wave
+        // at 50% volume carried a DC of about -4.5 steps for no reason. 75% is a
+        // GBA-only forced level and applies the same way.
+        let centred = (nib as i32 - 8) * 8;
+        if self.force75 {
+            centred * 3 / 4
         } else {
-            nib >> (self.volume - 1)
-        };
-        level as i32 - 8
+            centred >> (self.volume - 1)
+        }
     }
     fn clock_length(&mut self) {
         if self.length_enable && self.length > 0 {
@@ -304,8 +335,11 @@ impl Noise {
         if !self.enabled || !self.dac_on {
             return 0;
         }
+        // Eighths of a DAC step, DC-free: see the comment on Square::dac. The LFSR
+        // sits high about half the time, so the mean is half the volume.
         let high = self.lfsr & 1 == 0;
-        (if high { self.env.vol } else { 0 }) as i32 - 8
+        let vol = self.env.vol as i32;
+        (if high { vol * 8 } else { 0 }) - 4 * vol
     }
     fn clock_length(&mut self) {
         if self.length_enable && self.length > 0 {
@@ -402,6 +436,16 @@ pub struct Apu {
     // the FIFO empty (underruns), summed across both Direct Sound channels.
     pub dbg_pops: u64,
     pub dbg_underruns: u64,
+    /// Largest sample magnitude seen BEFORE the i16 clamp.
+    ///
+    /// The mixer's own ceiling is 511 DAC steps, so anything above 32704 here was
+    /// put there by the DC blocker, not by the emulated hardware. That is the
+    /// headroom the output stage has to leave: see the note on [`DAC_TO_I16`].
+    pub dbg_peak: i32,
+    /// Times the emulated DAC's own clip bit. This is the one the console would
+    /// have done too, so it separates a game that really does saturate its mixer
+    /// from our own post-mixer processing overshooting.
+    pub dbg_dac_clips: u64,
 }
 
 impl Default for Apu {
@@ -434,6 +478,8 @@ impl Default for Apu {
             out: Vec::new(),
             dbg_pops: 0,
             dbg_underruns: 0,
+            dbg_peak: 0,
+            dbg_dac_clips: 0,
         }
     }
 }
@@ -665,6 +711,7 @@ impl Apu {
             let out_r = (r + self.ma_r) / 2;
             self.ma_l = l;
             self.ma_r = r;
+            self.dbg_peak = self.dbg_peak.max(out_l.abs()).max(out_r.abs());
             self.out.push(out_l.clamp(-32768, 32767) as i16);
             self.out.push(out_r.clamp(-32768, 32767) as i16);
         }
@@ -753,7 +800,7 @@ impl Apu {
         }
     }
 
-    fn mix_raw(&self) -> (i32, i32) {
+    fn mix_raw(&mut self) -> (i32, i32) {
         if !self.master_enable {
             return (0, 0);
         }
@@ -772,13 +819,12 @@ impl Apu {
                 psg_r += d;
             }
         }
-        // One channel DAC step is worth 8 steps of the GBA's DAC before the
-        // master volume (1..8) and the PSG ratio are applied, so four channels at
-        // full volume and 100% reach 4 * 15 * 8 * 8 >> 2 = 960 of the DAC's 1024
-        // steps: the same range one Direct Sound channel covers. That is the
-        // relationship to keep, and it fixes the second half of the loudness gap:
-        // the net weight per step is 16 at 100%, and ours was 8, which measured
-        // exactly 6 dB under gpSP and mGBA on an isolated tone.
+        // The channel DACs hand back eighths of a GBA DAC step, so one channel at
+        // full volume spans 120 eighths and this scaling takes it to 240 DAC
+        // steps. Four channels at full volume and 100% then reach 960 of the
+        // DAC's 1024 steps: the same range one Direct Sound channel covers, which
+        // is the relationship to keep. The net weight used to be half that, which
+        // measured exactly 6 dB under gpSP and mGBA on an isolated tone.
         //
         // PSG ratio is bits 0-1 of SOUNDCNT_H (00=25%, 01=50%, 10=100%); 11 is
         // prohibited and is treated as 100%, which is what we did before.
@@ -787,8 +833,8 @@ impl Apu {
             1 => 3,
             _ => 2,
         };
-        psg_l = (psg_l * 8 * (left_vol + 1)) >> shift;
-        psg_r = (psg_r * 8 * (right_vol + 1)) >> shift;
+        psg_l = (psg_l * (left_vol + 1)) >> shift;
+        psg_r = (psg_r * (right_vol + 1)) >> shift;
 
         // Direct Sound: 8-bit signed, 100% or 50% volume (bits 2/3).
         let a = self.ds_a as i32 * if cnt_h & 0x04 != 0 { 4 } else { 2 };
@@ -818,9 +864,14 @@ impl Apu {
     /// one, so we clipped roughly 2.7x later than the console did and every game
     /// paid for that headroom in volume. Clipping here, per sub-sample before the
     /// oversample average, is also where the console does it.
-    fn dac(&self, mix: i32) -> i32 {
+    fn dac(&mut self, mix: i32) -> i32 {
         let bias = (self.r16(0x88) & 0x3FF) as i32;
-        ((mix + bias).clamp(0, 0x3FF) - bias) * DAC_TO_I16
+        let biased = mix + bias;
+        let clipped = biased.clamp(0, 0x3FF);
+        if clipped != biased {
+            self.dbg_dac_clips += 1;
+        }
+        (clipped - bias) * DAC_TO_I16
     }
 
     // --- Save-state -----------------------------------------------------------
@@ -1026,6 +1077,99 @@ mod tests {
         }
         let p = peak(&a);
         assert!(p > 30_000, "full-amplitude Direct Sound should reach full scale, got {p}");
+    }
+
+    /// A channel that is enabled but silent must contribute NOTHING.
+    ///
+    /// This is the defect the owner heard as saturation once the output stage was
+    /// scaled correctly: an enabled channel at volume 0 used to hold -8 DAC steps,
+    /// three of them stepped the mix by 384 of the 512 available negative steps,
+    /// and the DC blocker then spent 125 ms bleeding it off with the whole signal
+    /// riding the rail. Checked on the mixer directly, because the DC blocker
+    /// hides a STEADY offset and a test on the output stream would pass either
+    /// way.
+    #[test]
+    fn an_enabled_psg_channel_at_volume_zero_adds_nothing_to_the_mix() {
+        let mut a = Apu::new();
+        a.write8(0x84, 0x80);
+        w16(&mut a, 0x80, 0x7777);
+        w16(&mut a, 0x82, 0x0002);
+        // Volume 0, envelope direction up, period 0: the DAC is on (bit 11 set)
+        // and the envelope never moves, so the channel is enabled and silent.
+        w16(&mut a, 0x68, 0x0880);
+        w16(&mut a, 0x6C, 0x8400);
+        assert!(a.ch2.enabled && a.ch2.dac_on, "the channel must be enabled with its DAC on");
+        assert_eq!(a.ch2.env.vol, 0, "and silent");
+        assert_eq!(a.mix_raw(), (0, 0), "a silent channel must not offset the mix");
+    }
+
+    /// No duty cycle may shift the mix off centre. The 12.5% duty is the worst
+    /// case and the one that proves it: seven of its eight slots are low, so the
+    /// old bottom-anchored form left a standing -6.1 steps per channel at full
+    /// volume, before any master volume multiplied it up.
+    #[test]
+    fn no_square_duty_leaves_a_standing_offset() {
+        for duty in 0..4u8 {
+            let mut a = Apu::new();
+            a.write8(0x84, 0x80);
+            w16(&mut a, 0x80, 0x7777);
+            w16(&mut a, 0x82, 0x0002);
+            w16(&mut a, 0x68, 0xF000 | (duty as u16) << 6);
+            w16(&mut a, 0x6C, 0x8400);
+            let sum: i32 = (0..8)
+                .map(|p| {
+                    a.ch2.phase = p;
+                    a.mix_raw().0
+                })
+                .sum();
+            let peak = (0..8)
+                .map(|p| {
+                    a.ch2.phase = p;
+                    a.mix_raw().0.abs()
+                })
+                .max()
+                .unwrap();
+            assert!(peak > 1000, "duty {duty} should still produce a waveform, peak {peak}");
+            assert_eq!(sum, 0, "duty {duty} left a standing offset over one period");
+        }
+    }
+
+    /// The wave channel's volume has to scale the CENTRED sample. Shifting the raw
+    /// nibble first drags the waveform toward the bottom rail, so a wave whose own
+    /// mean is dead centre picked up a DC of about -4.5 steps at 50% volume purely
+    /// from the volume control.
+    #[test]
+    fn the_wave_channel_volume_does_not_drag_the_waveform_off_centre() {
+        for volume in 1..4u16 {
+            let mut a = Apu::new();
+            a.write8(0x84, 0x80);
+            w16(&mut a, 0x80, 0x7777);
+            w16(&mut a, 0x82, 0x0002);
+            // Nibbles alternating 1 and 15, so the waveform's own mean is exactly
+            // the centre value 8 and any offset found is the volume control's.
+            for i in 0..16 {
+                a.write8(0x90 + i, 0x1F);
+            }
+            w16(&mut a, 0x70, 0x0080); // NR30: DAC on, 32-sample mode, bank 0
+            w16(&mut a, 0x72, volume << 13); // NR32: volume select
+            w16(&mut a, 0x74, 0x8400); // trigger
+            assert!(a.ch3.enabled && a.ch3.dac_on, "wave channel enabled at volume {volume}");
+            let sum: i32 = (0..32)
+                .map(|p| {
+                    a.ch3.pos = p;
+                    a.mix_raw().0
+                })
+                .sum();
+            let peak = (0..32)
+                .map(|p| {
+                    a.ch3.pos = p;
+                    a.mix_raw().0.abs()
+                })
+                .max()
+                .unwrap();
+            assert!(peak > 500, "volume {volume} should produce a waveform, peak {peak}");
+            assert_eq!(sum, 0, "volume {volume} dragged a centred waveform off centre");
+        }
     }
 
     /// SOUNDBIAS has to come up centred. With a bias of zero the clip in

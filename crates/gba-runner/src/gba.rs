@@ -781,6 +781,13 @@ fn main() {
         // have clipped too. A few are normal in a loud game; a large share is the
         // signature of an output stage scaled too hot.
         let railed = audio.iter().filter(|&&s| s == i16::MAX || s == i16::MIN).count();
+        // How far past the i16 rail the mixer plus the DC blocker actually went.
+        // 32704 is the mixer's own ceiling (511 DAC steps), so anything above it
+        // is headroom the output stage owes the DC blocker.
+        println!("  audio headroom: pre-clamp peak {} ({:.2}x the i16 rail, mixer ceiling is 32704)",
+            gba.bus.apu.dbg_peak, gba.bus.apu.dbg_peak as f64 / 32768.0);
+        println!("  audio: the emulated DAC clipped {} times (the console would have too)",
+            gba.bus.apu.dbg_dac_clips);
         println!(
             "  audio: {frames_out} stereo samples ({:.1}/frame), peak {peak}, rms {rms:.1}, {nonzero} non-zero, {railed} railed ({:.3}%)",
             frames_out as f64 / frames.max(1) as f64,
