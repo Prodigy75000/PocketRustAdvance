@@ -85,6 +85,12 @@ pub struct Gba {
     /// unused address space (>= 0x10000000 = definitely a crashed/runaway PC),
     /// printing the branch that jumped there. Off by default (one cheap compare
     /// per instruction when enabled, nothing otherwise).
+    /// Idle-loop skipping: see [`jit::idle`]. Costs one compare per instruction
+    /// while off, and saves 47% of the instructions in Pokemon.
+    pub idle: jit::idle::Watch,
+    /// Set false to disable idle-loop skipping outright, for A/B measurement and
+    /// for bisecting a game that misbehaves.
+    pub idle_skip: bool,
     pub trap_unused: bool,
     /// Debug: print the executing PC at the top of every scanline this frame.
     pub linepc: bool,
@@ -150,6 +156,8 @@ impl Gba {
             linepc: false,
             trap_prev: 0,
             trap_from: 0,
+            idle: jit::idle::Watch::default(),
+            idle_skip: true,
             trapped: false,
             trap_ring: Vec::new(),
         }
@@ -183,6 +191,10 @@ impl Gba {
         }
         self.cpu.deserialize(&mut r);
         self.bus.deserialize(&mut r);
+        // The loaded state may be anywhere, and an armed loop head carried over
+        // from before it would skip code the new state does not spin at. The
+        // watch costs one scanline to rebuild.
+        self.idle.forget();
         // Align the fixed audio clock to the APU's restored position (its own
         // clock domain, independent of bus.cycles) so audio resumes seamlessly
         // and deterministically. A pre-APU state leaves the APU at 0, which is
@@ -233,6 +245,20 @@ impl Gba {
                 let back = if self.cpu.thumb() { 4 } else { 8 };
                 eprintln!("LINEPC L{line:<3} pc={:08X} m{:X} halted={}",
                     self.cpu.r[15].wrapping_sub(back), self.cpu.cpsr & 0xF, self.bus.halted as u8);
+            }
+            // Look for a wait loop once per scanline. Per instruction would
+            // cost more than it saves; a loop that runs thousands of times a
+            // frame is found within a line or two either way.
+            // A target that is paying sticks. Once a frame, drop one that is
+            // not, which lets the sampler follow a game that changes its wait
+            // loop without ever re-pointing away from a good target.
+            if self.idle_skip {
+                if line == 0 {
+                    self.idle.retire_if_idle_target_is_dead();
+                }
+                if !self.idle.watching() {
+                    self.idle_sample();
+                }
             }
             self.bus.raise_ppu_irqs(line as u16);
             self.bus.step_timers();
@@ -289,6 +315,12 @@ impl Gba {
                         // (the next scanline may raise the IRQ that wakes us).
                         self.halt_cycles += target.saturating_sub(self.bus.cycles);
                         self.bus.cycles = target;
+                        break;
+                    }
+                    // The game may be spinning on a flag only an interrupt
+                    // handler sets. One compare against a cached R15; see
+                    // `idle_hit` for what has to be true before it can fire.
+                    if self.cpu.r[15] == self.idle.probe_r15 && self.idle_hit(target) {
                         break;
                     }
                     // One compare on the hot path, with the pipeline offset folded
@@ -351,6 +383,50 @@ impl Gba {
             let back = if self.cpu.thumb() { 4 } else { 8 };
             self.bus.cur_pc = self.cpu.r[15].wrapping_sub(back);
             self.bus.cur_mode = self.cpu.cpsr & 0xF;
+        }
+    }
+
+    /// An arrival at the watched loop head.
+    ///
+    /// Armed, this abandons the rest of the scanline phase: the clock still
+    /// advances to exactly where it would have, so the emulated time is
+    /// unchanged and only the pointless spinning is skipped. Returns true to
+    /// break the caller's loop.
+    ///
+    /// The skip reaches the end of the PHASE and no further, then the loop is
+    /// re-entered and re-tested. That bound is what makes this safe rather than
+    /// lucky: it cannot deadlock, it cannot run past an interrupt, and a loop
+    /// polling something that changes with time still resolves, at scanline
+    /// granularity.
+    ///
+    /// Not yet armed, this is where the no-progress proof is collected.
+    #[inline(never)]
+    fn idle_hit(&mut self, target: u64) -> bool {
+        if !self.idle.consider(self.steps, &self.cpu.r, self.cpu.cpsr) {
+            return false;
+        }
+        self.idle.skipped(target.saturating_sub(self.bus.cycles));
+        self.bus.cycles = target;
+        true
+    }
+
+    /// Look for a wait loop around wherever the CPU currently is.
+    ///
+    /// Thumb only. Every idle loop measured so far is Thumb, and the ARM case
+    /// costs a second decoder for no evidence of benefit yet.
+    fn idle_sample(&mut self) {
+        if !self.cpu.thumb() {
+            return;
+        }
+        let exec = self.cpu.r[15].wrapping_sub(4);
+        // Borrow the bus immutably for the scan, then let it go before touching
+        // the watch state.
+        let bus = &self.bus;
+        let found = jit::idle::find_loop(exec, |a| bus.code_peek16(a));
+        if let Some(l) = found {
+            // R15 reads two halfwords ahead of the instruction executing, so
+            // this is what the hot compare will see at the loop head.
+            self.idle.watch(l.head.wrapping_add(4), l.len() as u64);
         }
     }
 

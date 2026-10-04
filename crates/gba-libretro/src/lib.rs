@@ -918,7 +918,23 @@ pub extern "C" fn retro_run() {
         // taking longer than a second is visible by subtraction.
         s.frames += 1;
         if s.frames % 60 == 0 {
-            log_line(s.log, &format!("[perf] emulated_frames={}", s.frames));
+            // Idle-loop skipping reported alongside, because on device the only
+            // question that matters is whether it found the game's wait loop.
+            // Zero skips with a watched address is a different fault from never
+            // finding one, and from outside the two look the same.
+            let idle = s
+                .gba
+                .as_ref()
+                .map(|g| {
+                    format!(
+                        " idle_pc={:08X} skips={} skipped_cycles={}",
+                        g.idle.probe_r15.wrapping_sub(4),
+                        g.idle.skips,
+                        g.idle.skipped_cycles
+                    )
+                })
+                .unwrap_or_default();
+            log_line(s.log, &format!("[perf] emulated_frames={}{idle}", s.frames));
         }
         if let Some(video) = s.video {
             unsafe {

@@ -355,6 +355,11 @@ fn main() {
     let mut best_distinct = 0usize;
     let mut best_frame = 0u32;
     let trace = std::env::var("GBA_TRACE").is_ok();
+    // GBA_NOIDLE=1 turns off idle-loop skipping, which is how its effect gets
+    // measured and how a misbehaving game gets bisected.
+    if std::env::var_os("GBA_NOIDLE").is_some() {
+        gba.idle_skip = false;
+    }
     if std::env::var_os("GBA_TRAP").is_some() {
         gba.trap_unused = true;
     }
@@ -530,6 +535,21 @@ fn main() {
             run_steps / measured.max(1) as u64,
             280896.0 * measured.max(1) as f64 / run_steps.max(1) as f64
         );
+        if gba.idle.skips > 0 || gba.idle.misses > 0 {
+            // Per frame against the 280896 cycles a frame actually has. NOT
+            // against bus.cycles: that is an absolute counter and a loaded save
+            // state arrives with billions already on it, which made this read
+            // 0.6% when the true figure was 85%.
+            let f = frames.max(1) as f64;
+            println!(
+                "IDLE at r15={:08X} skips={:.0}/frame mean={:.0} cycles ({:.1}% of a frame)",
+                gba.idle.probe_r15,
+                gba.idle.skips as f64 / f,
+                gba.idle.skipped_cycles as f64 / gba.idle.skips.max(1) as f64,
+                100.0 * gba.idle.skipped_cycles as f64 / f / 280_896.0
+            );
+            println!("IDLE misses={:.0}/frame", gba.idle.misses as f64 / f);
+        }
         if let Some(p) = gba.bus.ppu.prof {
             let f = measured.max(1) as f64;
             let tot = (p.semi_ns + p.window_ns + p.bg_ns + p.obj_ns + p.resolve_ns) as f64;

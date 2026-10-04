@@ -1178,6 +1178,20 @@ impl GbaBus {
         }
         u16::from_le_bytes([self.read8_raw(addr), self.read8_raw(addr + 1)])
     }
+    /// Side-effect-free halfword read, for code the emulator wants to INSPECT
+    /// rather than execute. No cycle charge and no EEPROM/GPIO handling, so it
+    /// must never stand in for a real access.
+    ///
+    /// Returns `None` outside the regions code can run from, which is what lets
+    /// the idle-loop analysis stop at the edge of a region instead of walking
+    /// into open bus and reading the last fetch back as an opcode.
+    pub fn code_peek16(&self, addr: u32) -> Option<u16> {
+        match (addr >> 24) & 0xF {
+            0x0 | 0x2 | 0x3 | 0x8..=0xD => Some(self.read16_raw(addr)),
+            _ => None,
+        }
+    }
+
     /// Debug-only word read (no cycle cost, no side effects).
     pub fn read32_dbg(&self, addr: u32) -> u32 {
         self.read32_raw(addr)

@@ -3,10 +3,10 @@
 
 //! The recompiler.
 //!
-//! **Status: scaffolding. No code is generated yet and nothing in the emulator
-//! calls into this module, so the interpreter is still the only execution
-//! engine.** That is deliberate: the two pieces here are the ones that decide
-//! whether the approach is viable at all, and both are testable on their own.
+//! **Status: no code is generated yet, so the interpreter is still the only
+//! execution engine.** What is here is the groundwork plus one thing that pays
+//! already: [`idle`], which spots the loop a game spins in while it waits for an
+//! interrupt and is worth 1.33x on a Pokemon battle and 2.98x while waiting.
 //!
 //! ## Why a recompiler, in numbers
 //!
@@ -50,3 +50,4 @@ pub static mut BP_ARM: u64 = 0;
 
 pub mod block;
 pub mod code;
+pub mod idle;
