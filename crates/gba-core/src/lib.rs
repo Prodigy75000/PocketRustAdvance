@@ -631,6 +631,95 @@ impl Gba {
 mod tests {
     use super::*;
 
+    /// A cart with a GPIO port keeps the first 0x100 bytes of its ROM window
+    /// off the linear fast path, because the port lives at 0x080000C4 and those
+    /// halfwords are not ROM reads. The fetch window therefore starts past the
+    /// header, and it has to point at a correspondingly shifted slice: moving
+    /// the start without moving the slice reads 0x100 bytes too early.
+    ///
+    /// That was a real bug and only a framebuffer hash over 80 ROMs caught it,
+    /// on the single solar cart that happened to be in the sample. This makes
+    /// it a unit test so the next person does not need the same luck.
+    ///
+    /// The same program is run on a cart WITHOUT a port, so the assertion is
+    /// that the two paths agree rather than that one of them returns 7.
+    #[test]
+    fn a_gpio_cart_fetches_rom_from_the_right_offset() {
+        fn run(code: &[u8; 4]) -> (u32, bool) {
+            let mut rom = vec![0u8; 0x4000];
+            rom[0xAC..0xB0].copy_from_slice(code);
+            // MOV R0, #7 ; B .   at 0x08001000, well past the header.
+            rom[0x1000..0x1004].copy_from_slice(&0xE3A0_0007u32.to_le_bytes());
+            rom[0x1004..0x1008].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+            let mut gba = Gba::new(rom, Vec::new());
+            gba.render_enabled = false;
+            let gpio = gba.cart_sensor() == crate::sensor::CartSensor::Gyro;
+            gba.cpu.r[0] = 0;
+            gba.cpu.r[15] = 0x0800_1000;
+            gba.cpu.reload_pipeline(&mut gba.bus);
+            for _ in 0..4 {
+                gba.cpu.step(&mut gba.bus);
+            }
+            (gba.cpu.r[0], gpio)
+        }
+
+        let (plain, plain_gpio) = run(b"AAAA");
+        let (gyro, gyro_gpio) = run(b"RAAA");
+        assert!(!plain_gpio, "the control cart must have no GPIO port");
+        assert!(gyro_gpio, "a game code starting R is a gyro cart, which has one");
+        assert_eq!(plain, 7, "plain cart: ROM fetch at 0x08001000");
+        assert_eq!(gyro, plain, "a GPIO cart must fetch the same instruction");
+    }
+
+    /// The instruction fetch has its own path on the bus now, with a window
+    /// that skips the region decode. The window holds an address RANGE and a
+    /// slice selector, never a copy of the code, and that is the whole reason
+    /// self-modifying code needs no invalidation. Games copy routines into
+    /// IWRAM and rewrite them, so prove it: run an instruction, overwrite it in
+    /// place, run it again, and the second result must differ.
+    ///
+    /// A fetch cache that copied opcodes would pass the first half and fail the
+    /// second, which is exactly the regression a translation cache can
+    /// introduce later.
+    #[test]
+    fn code_rewritten_in_iwram_executes_the_new_opcode() {
+        use crate::bus::{Access, Bus};
+
+        fn run_from(gba: &mut Gba, at: u32) -> u32 {
+            gba.cpu.r[0] = 0;
+            gba.cpu.r[15] = at;
+            gba.cpu.reload_pipeline(&mut gba.bus);
+            for _ in 0..4 {
+                gba.cpu.step(&mut gba.bus);
+            }
+            gba.cpu.r[0]
+        }
+
+        let mut gba = Gba::new(vec![0u8; 0x200], Vec::new());
+        gba.render_enabled = false;
+        // MOV R0, #1 ; B .
+        gba.bus.write32(0x0300_0000, 0xE3A0_0001, Access::NonSeq);
+        gba.bus.write32(0x0300_0004, 0xEAFF_FFFE, Access::NonSeq);
+        assert_eq!(run_from(&mut gba, 0x0300_0000), 1);
+
+        // Overwrite the instruction where it sits.
+        gba.bus.write32(0x0300_0000, 0xE3A0_0002, Access::NonSeq);
+        assert_eq!(
+            run_from(&mut gba, 0x0300_0000),
+            2,
+            "the fetch must see the rewritten instruction, not a cached copy"
+        );
+
+        // IWRAM is 32 KB mirrored across its 16 MB region, so the same code has
+        // to execute from a mirror. This catches a window installed with the
+        // wrong base, which a correct-looking in-range test cannot.
+        assert_eq!(
+            run_from(&mut gba, 0x0300_8000),
+            2,
+            "an IWRAM mirror must fetch the same bytes"
+        );
+    }
+
     /// The per-step debug bookkeeping moved behind a single flag computed once
     /// per scanline instead of two compares per instruction, which is worth
     /// about 6% of CPU time. That makes the arming itself the thing that can

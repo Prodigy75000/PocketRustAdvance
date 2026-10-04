@@ -320,9 +320,9 @@ impl Arm7tdmi {
         // region is readable and what a protected read of it returns.
         bus.set_fetch_pc(fetch_addr, thumb);
         let (fetched, width) = if thumb {
-            (bus.read16(fetch_addr, Access::Seq) as u32, 2)
+            (bus.fetch16(fetch_addr, Access::Seq) as u32, 2)
         } else {
-            (bus.read32(fetch_addr, Access::Seq), 4)
+            (bus.fetch32(fetch_addr, Access::Seq), 4)
         };
 
         let branched = if thumb {
@@ -390,13 +390,13 @@ impl Arm7tdmi {
         bus.set_fetch_pc(target, self.thumb());
         if self.thumb() {
             let aligned = target & !1;
-            self.pipeline[0] = bus.read16(aligned, Access::NonSeq) as u32;
-            self.pipeline[1] = bus.read16(aligned.wrapping_add(2), Access::Seq) as u32;
+            self.pipeline[0] = bus.fetch16(aligned, Access::NonSeq) as u32;
+            self.pipeline[1] = bus.fetch16(aligned.wrapping_add(2), Access::Seq) as u32;
             self.r[15] = target.wrapping_add(4);
         } else {
             let aligned = target & !3;
-            self.pipeline[0] = bus.read32(aligned, Access::NonSeq);
-            self.pipeline[1] = bus.read32(aligned.wrapping_add(4), Access::Seq);
+            self.pipeline[0] = bus.fetch32(aligned, Access::NonSeq);
+            self.pipeline[1] = bus.fetch32(aligned.wrapping_add(4), Access::Seq);
             self.r[15] = target.wrapping_add(8);
         }
     }
