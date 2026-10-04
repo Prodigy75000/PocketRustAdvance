@@ -257,6 +257,9 @@ impl Gba {
             // all 1232 cycles in one go left bit 1 reading 0 always, and any
             // game that waits on H-blank by polling DISPSTAT spun there forever.
             let line_start = self.bus.cycles;
+            // One branch in the loop body instead of three. These are armed from
+            // the front-end before a run, so per scanline is often enough.
+            let dbg = self.trap_unused || self.bus.watch_addr != 0;
             for phase in 0..2 {
                 let target = line_start
                     + if phase == 0 { ppu::HDRAW_CYCLES as u64 } else { ppu::CYCLES_PER_LINE as u64 };
@@ -267,54 +270,10 @@ impl Gba {
                     // Take a pending IRQ at the instruction boundary; taking one also
                     // wakes the CPU from a HLE Halt / IntrWait.
                     if self.bus.irq_pending() && self.cpu.irq_ready() {
-                        let pend = self.bus.ie & self.bus.if_;
-                        for b in 0..16 {
-                            if pend & (1 << b) != 0 {
-                                self.bus.dbg_irq_src[b] += 1;
-                            }
-                        }
-                        if self.linepc {
-                            eprintln!("IRQTAKE L{line} cyc_in_line={} pend={:04X} from={:08X}",
-                                self.bus.cycles - self.bus.line_cycle_base, pend,
-                                self.cpu.r[15].wrapping_sub(if self.cpu.thumb() {4} else {8}));
-                        }
-                        self.cpu.take_irq(&mut self.bus);
-                        self.bus.halted = false;
-                        self.irqs_taken += 1;
+                        self.take_irq_now(line);
                     }
-                    if self.trap_unused && !self.trapped {
-                        let back = if self.cpu.thumb() { 4 } else { 8 };
-                        let exec = self.cpu.r[15].wrapping_sub(back);
-                        let width = if self.cpu.thumb() { 2 } else { 4 };
-                        if exec >= 0x1000_0000 {
-                            eprintln!(
-                                "TRAP: PC jumped into unused space: {:08X} -> {exec:08X} (prev branch from {:08X}, irqs={})",
-                                self.trap_prev, self.trap_from, self.irqs_taken
-                            );
-                            let r = &self.cpu.r;
-                            eprintln!(
-                                "TRAP: r0-r7  {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
-                                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]
-                            );
-                            eprintln!(
-                                "TRAP: r8-r15 {:08X} {:08X} {:08X} {:08X} {:08X} sp={:08X} lr={:08X} pc={:08X}",
-                                r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]
-                            );
-                            eprintln!("TRAP: the {} branches that led there:", self.trap_ring.len());
-                            for (from, to) in self.trap_ring.iter() {
-                                eprintln!("TRAP:   {from:08X} -> {to:08X}");
-                            }
-                            self.trapped = true;
-                        } else {
-                            if self.trap_prev != 0 && exec != self.trap_prev.wrapping_add(width) {
-                                self.trap_from = self.trap_prev; // last in-range branch source
-                                self.trap_ring.push((self.trap_prev, exec));
-                                if self.trap_ring.len() > 64 {
-                                    self.trap_ring.remove(0);
-                                }
-                            }
-                            self.trap_prev = exec;
-                        }
+                    if dbg {
+                        self.debug_step();
                     }
                     // Leaving Halt is NOT the same condition as taking an
                     // interrupt: hardware wakes on any enabled-and-requested
@@ -330,13 +289,6 @@ impl Gba {
                         self.halt_cycles += target.saturating_sub(self.bus.cycles);
                         self.bus.cycles = target;
                         break;
-                    }
-                    // Debug watchpoint bookkeeping (zero-cost unless a watch is set):
-                    // the executing instruction sits two fetches behind R15.
-                    if self.bus.watch_addr != 0 {
-                        let back = if self.cpu.thumb() { 4 } else { 8 };
-                        self.bus.cur_pc = self.cpu.r[15].wrapping_sub(back);
-                        self.bus.cur_mode = self.cpu.cpsr & 0xF;
                     }
                     // One compare on the hot path, with the pipeline offset folded
                     // into the bound: R15 runs 8 bytes (ARM) or 4 (Thumb) ahead of
@@ -364,6 +316,102 @@ impl Gba {
         }
 
         &self.bus.ppu.framebuffer
+    }
+
+    /// The per-step bookkeeping that only an armed debug feature needs: the
+    /// runaway-PC trap ring (`GBA_TRAP`) and the watchpoint's PC/mode capture
+    /// (`GBA_WATCHW`). Reached through a single flag tested once per step.
+    ///
+    /// This used to be two separate `if`s inside the loop, which looks free:
+    /// each is one compare against a flag that is normally off. It is not the
+    /// branches that cost, it is the code. Measured on a LeafGreen battle scene
+    /// (`out/lg-battle.state`) over interleaved A/B pairs with identical
+    /// instructions per frame, this shape is worth **6.3%** of CPU time, 628 to
+    /// 589 us/frame, against an 8.8% ceiling from deleting the checks outright.
+    /// Taken one at a time none of them measures as expensive and one measures
+    /// as negative, because what actually moves is the size of the loop body.
+    ///
+    /// A two-loop split (one fast, one with the bookkeeping, chosen per phase)
+    /// was tried first and came out **29% SLOWER**, so the gain is not simply
+    /// "fewer instructions in the loop" and the shape has to be measured rather
+    /// than reasoned about.
+    ///
+    /// Note the ordering changed with the merge: the watchpoint capture now runs
+    /// before the halt check rather than after it, so a halted step updates
+    /// `cur_pc`. Nothing observes that, because a halted CPU makes no bus access
+    /// and the capture exists only to label one.
+    #[inline(never)]
+    fn debug_step(&mut self) {
+        if self.trap_unused && !self.trapped {
+            self.trap_check();
+        }
+        // The executing instruction sits two fetches behind R15.
+        if self.bus.watch_addr != 0 {
+            let back = if self.cpu.thumb() { 4 } else { 8 };
+            self.bus.cur_pc = self.cpu.r[15].wrapping_sub(back);
+            self.bus.cur_mode = self.cpu.cpsr & 0xF;
+        }
+    }
+
+    /// Take a pending IRQ. Out of line on purpose: an IRQ fires a handful of
+    /// times per frame, so the source histogram and the optional trace are pure
+    /// code size sitting in a loop that runs 83,000 times per frame, and the
+    /// size of that loop body is worth measurable throughput.
+    #[inline(never)]
+    fn take_irq_now(&mut self, line: u32) {
+        let pend = self.bus.ie & self.bus.if_;
+        for b in 0..16 {
+            if pend & (1 << b) != 0 {
+                self.bus.dbg_irq_src[b] += 1;
+            }
+        }
+        if self.linepc {
+            eprintln!("IRQTAKE L{line} cyc_in_line={} pend={:04X} from={:08X}",
+                self.bus.cycles - self.bus.line_cycle_base, pend,
+                self.cpu.r[15].wrapping_sub(if self.cpu.thumb() {4} else {8}));
+        }
+        self.cpu.take_irq(&mut self.bus);
+        self.bus.halted = false;
+        self.irqs_taken += 1;
+    }
+
+    /// `GBA_TRAP`: watch for the PC running away into unmapped space, keeping a
+    /// ring of the branches that led there. Out of line for the same reason
+    /// [`Gba::take_irq_now`] is.
+    #[inline(never)]
+    fn trap_check(&mut self) {
+                    let back = if self.cpu.thumb() { 4 } else { 8 };
+                    let exec = self.cpu.r[15].wrapping_sub(back);
+                    let width = if self.cpu.thumb() { 2 } else { 4 };
+                    if exec >= 0x1000_0000 {
+                        eprintln!(
+                            "TRAP: PC jumped into unused space: {:08X} -> {exec:08X} (prev branch from {:08X}, irqs={})",
+                            self.trap_prev, self.trap_from, self.irqs_taken
+                        );
+                        let r = &self.cpu.r;
+                        eprintln!(
+                            "TRAP: r0-r7  {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                            r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]
+                        );
+                        eprintln!(
+                            "TRAP: r8-r15 {:08X} {:08X} {:08X} {:08X} {:08X} sp={:08X} lr={:08X} pc={:08X}",
+                            r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]
+                        );
+                        eprintln!("TRAP: the {} branches that led there:", self.trap_ring.len());
+                        for (from, to) in self.trap_ring.iter() {
+                            eprintln!("TRAP:   {from:08X} -> {to:08X}");
+                        }
+                        self.trapped = true;
+                    } else {
+                        if self.trap_prev != 0 && exec != self.trap_prev.wrapping_add(width) {
+                            self.trap_from = self.trap_prev; // last in-range branch source
+                            self.trap_ring.push((self.trap_prev, exec));
+                            if self.trap_ring.len() > 64 {
+                                self.trap_ring.remove(0);
+                            }
+                        }
+                        self.trap_prev = exec;
+                    }
     }
 
     /// Which motion sensor the cartridge carries, if any. The front-end asks
@@ -582,6 +630,60 @@ impl Gba {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-step debug bookkeeping moved behind a single flag computed once
+    /// per scanline instead of two compares per instruction, which is worth
+    /// about 6% of CPU time. That makes the arming itself the thing that can
+    /// silently break: a flag that never turns on leaves every debug feature
+    /// looking present and doing nothing.
+    ///
+    /// Two runs of the same ROM, which branches into unmapped space. Unarmed it
+    /// must NOT trap, so this cannot pass by the trap firing unconditionally.
+    #[test]
+    fn an_armed_trap_still_catches_a_runaway_pc() {
+        // MOV R0, #0x1000_0000 ; BX R0
+        let mut rom = vec![0u8; 0x200];
+        rom[0..4].copy_from_slice(&0xE3A0_0201u32.to_le_bytes());
+        rom[4..8].copy_from_slice(&0xE12F_FF10u32.to_le_bytes());
+
+        let mut off = Gba::new(rom.clone(), Vec::new());
+        off.render_enabled = false;
+        off.run_frame();
+        assert!(!off.trapped, "the trap is opt-in; it must stay quiet unarmed");
+
+        let mut on = Gba::new(rom, Vec::new());
+        on.trap_unused = true;
+        on.render_enabled = false;
+        on.run_frame();
+        assert!(on.trapped, "an armed trap must still catch a PC in unmapped space");
+    }
+
+    /// Same risk for the watchpoint half of that flag: it labels a write with
+    /// the PC that made it, and a flag that never arms would report nothing
+    /// while looking armed.
+    ///
+    /// The ROM is one instruction branching to itself, so the executing PC is
+    /// 0x08000000 for the whole frame and the expected value is exact rather
+    /// than "wherever the frame happened to end".
+    #[test]
+    fn an_armed_watchpoint_still_learns_the_pc() {
+        let mut rom = vec![0u8; 0x200];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes()); // B .
+
+        let mut off = Gba::new(rom.clone(), Vec::new());
+        off.render_enabled = false;
+        off.run_frame();
+        assert_eq!(off.bus.cur_pc, 0, "no watch set, so nothing to label");
+
+        let mut on = Gba::new(rom, Vec::new());
+        on.bus.watch_addr = 0x0300_0000;
+        on.render_enabled = false;
+        on.run_frame();
+        assert_eq!(
+            on.bus.cur_pc, 0x0800_0000,
+            "an armed watchpoint must still track the executing PC"
+        );
+    }
 
     /// Every single-register load spends one internal cycle moving the loaded
     /// value into the register file (LDR = 1S+1N+1I on the ARM7TDMI). Run the
