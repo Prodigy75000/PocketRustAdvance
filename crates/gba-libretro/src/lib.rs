@@ -930,11 +930,19 @@ pub extern "C" fn retro_run() {
                 .gba
                 .as_ref()
                 .map(|g| {
+                    // Audio FIFO health rides along because on a device that
+                    // cannot keep up, audio starves before the frame rate visibly
+                    // drops, and an underrun holds a stale PCM sample. Without it,
+                    // "it sounded rough on the tablet" cannot be told apart from a
+                    // bug in the mixer. Both counters are cumulative, like the
+                    // skip counts, so consecutive heartbeats give the rate.
                     format!(
-                        " idle_pc={:08X} skips={} skipped_cycles={}",
+                        " idle_pc={:08X} skips={} skipped_cycles={} ds_pops={} ds_underruns={}",
                         g.idle.probe_r15.wrapping_sub(4),
                         g.idle.skips,
-                        g.idle.skipped_cycles
+                        g.idle.skipped_cycles,
+                        g.bus.apu.dbg_pops,
+                        g.bus.apu.dbg_underruns
                     )
                 })
                 .unwrap_or_default();
