@@ -973,6 +973,173 @@ mod tests {
     /// CHILD, it does not change what this layer answers when asked while
     /// parked. A protocol that could answer correctly here would need to know
     /// what the game has not yet told it.
+    /// A parent crawling at the round trip, a child that would run at 60, and the
+    /// child ends up at the parent's pace with nothing stale.
+    ///
+    /// This is the whole design in one test. The parent emulates only while it is
+    /// not waiting on a reply, which is what `NetCable::parent_result` really does
+    /// over a socket: nine blocking round trips a frame is where the 14 fps comes
+    /// from. The child would happily run a scanline per tick. What has to come out
+    /// is that the child tracks the parent instead of running nine protocol frames
+    /// into the future, and that every clock is answered with a word the child's
+    /// game armed for it.
+    ///
+    /// **It is a model of the transport, not the transport.** Time is ticks, the
+    /// delay is fixed, and nothing here is a socket or a thread. What it does
+    /// cover is the arithmetic the two reverted attempts got wrong: who is paced,
+    /// by what signal, and whether the stale-word precondition ever occurs.
+    #[test]
+    fn a_child_tracks_a_parent_that_is_crawling_at_the_round_trip() {
+        // A tick is the WALL time it takes to emulate one scanline: 16.7 ms over
+        // 228 lines is about 73 us at 60 fps. The measured round trip between the
+        // owner's two devices is 8.1 ms, which is therefore about 110 scanlines
+        // of wall time, 55 each way. Getting this wrong is what makes a model
+        // reassuring and useless: at a few ticks each way the parent is barely
+        // slower than the child and the pacing never engages, which is a
+        // statement about the model rather than about the cable.
+        const ONE_WAY_TICKS: u32 = 55;
+        const CLOCK_GAP: u32 = 28672; // the protocol's own spacing
+
+        struct Delayed {
+            proto: [CableProto; 2],
+            /// (arrive_at_tick, to_side, packet)
+            flight: Vec<(u32, usize, [u8; PACKET_LEN])>,
+            tick: u32,
+        }
+        impl Delayed {
+            fn send_all(&mut self, from: usize) {
+                let at = self.tick + ONE_WAY_TICKS;
+                for pkt in self.proto[from].take_outbox() {
+                    self.flight.push((at, 1 - from, pkt));
+                }
+            }
+            fn deliver_due(&mut self) {
+                let now = self.tick;
+                let mut still = Vec::new();
+                for (at, to, pkt) in std::mem::take(&mut self.flight) {
+                    if at <= now {
+                        self.proto[to].on_packet(&pkt);
+                    } else {
+                        still.push((at, to, pkt));
+                    }
+                }
+                self.flight = still;
+            }
+        }
+
+        let mut w = Delayed { proto: [CableProto::new(), CableProto::new()], flight: Vec::new(), tick: 0 };
+
+        // The games' words. The child's handler arms the first before anything.
+        let parent_words: [u16; 9] =
+            [0xA55A, 0x8FFF, 0x0102, 0x0304, 0x0506, 0x0708, 0x090A, 0x0B0C, 0x0D0E];
+        let child_words: [u16; 9] =
+            [0x5AA5, 0xB9A0, 0x1112, 0x1314, 0x1516, 0x1718, 0x191A, 0x1B1C, 0x1D1E];
+        w.proto[1].set_output(child_words[0]);
+
+        let (mut issued, mut collected) = (0usize, 0usize);
+        let mut awaiting: Option<u8> = None;
+        let mut parent_since_clock = 0u32;
+        let (mut parent_lines, mut child_lines) = (0u32, 0u32);
+        // The two counters share no epoch, which is the same reason the wire
+        // carries differences rather than positions: the child runs freely until
+        // the parent's first packet reaches it, so only the skew ACCUMULATED
+        // after pacing engaged is bounded by the horizon.
+        let mut skew_at_engagement: Option<i32> = None;
+        let mut read_back: Vec<(u16, u16)> = Vec::new();
+
+        for tick in 0..20_000u32 {
+            w.tick = tick;
+            w.deliver_due();
+
+            // ---- the parent. It emulates only while it is not waiting. ----
+            if let Some(seq) = awaiting {
+                if let Some(word) = w.proto[0].take_reply(seq) {
+                    read_back.push((parent_words[issued - 1], word));
+                    awaiting = None;
+                    parent_since_clock = 0;
+                }
+            } else {
+                w.proto[0].advance(1232);
+                parent_lines += 1;
+                parent_since_clock += 1232;
+                w.proto[0].maybe_tick();
+                if issued < 9 && parent_since_clock >= CLOCK_GAP {
+                    let seq = w.proto[0].begin_exchange(parent_words[issued]);
+                    awaiting = Some(seq);
+                    issued += 1;
+                }
+            }
+            w.send_all(0);
+
+            // ---- the child. It would run flat out; the cable decides. ----
+            if skew_at_engagement.is_none() && w.proto[1].pacing() {
+                skew_at_engagement =
+                    Some(w.proto[1].local_cycles().wrapping_sub(w.proto[0].local_cycles()) as i32);
+            }
+            if !w.proto[1].hold() {
+                w.proto[1].advance(1232);
+                child_lines += 1;
+                // Its serial engine collects one transfer per scanline, and its
+                // handler arms the next word, exactly as the register model does.
+                if let Some((_parent_word, _answered)) = w.proto[1].child_clock() {
+                    collected += 1;
+                    if collected < 9 {
+                        w.proto[1].set_output(child_words[collected]);
+                    }
+                }
+            }
+            w.send_all(1);
+
+            // The trade is over once the ninth transfer is collected and its
+            // reply is home. Running on past that would only measure two
+            // unthrottled cores, since a parent that has stopped clocking feeds
+            // the child a tick a frame and the child is free by design.
+            if collected == 9 && awaiting.is_none() && read_back.len() == 9 {
+                break;
+            }
+        }
+
+        assert_eq!(issued, 9, "the parent got all nine transfers out");
+        assert_eq!(collected, 9, "and the child collected every one of them");
+        assert_eq!(
+            read_back.len(),
+            9,
+            "the parent read a reply for each: none timed out in this model"
+        );
+        for (i, (sent, got)) in read_back.iter().enumerate() {
+            assert_eq!(*sent, parent_words[i], "transfer {i} carried the wrong word out");
+            assert_eq!(
+                *got, child_words[i],
+                "transfer {i}: the parent must read the word the child's handler armed for it"
+            );
+        }
+        assert_eq!(
+            w.proto[1].stale_risk, 0,
+            "no clock was ever answered while a transfer sat uncollected"
+        );
+        assert_eq!(w.proto[1].starved, 0, "and the child never gave up on the parent");
+        assert!(w.proto[1].holds > 0, "a child that never waited was not being paced");
+
+        // The point of the whole design: the child did NOT run nine times further
+        // than the parent. Within one frame, which is the horizon.
+        let skew = w.proto[1].local_cycles().wrapping_sub(w.proto[0].local_cycles()) as i32;
+        let base = skew_at_engagement.expect("the pacing never engaged");
+        assert!(
+            skew - base <= 280_896,
+            "the child gained {} cycles on the parent after pacing engaged, past the              one-frame horizon",
+            skew - base
+        );
+        // What the throttle actually did, in this model's own units: the child
+        // spent more of the trade waiting than emulating. Unpaced it would have
+        // run a scanline every tick, roughly six times the parent's progress,
+        // which is the ratio the first device run measured.
+        assert!(
+            w.proto[1].holds > child_lines as u64,
+            "the child emulated {child_lines} scanlines and waited {} times, so it was              hardly throttled (the parent managed {parent_lines})",
+            w.proto[1].holds
+        );
+    }
+
     /// Build a parent packet the way the wire carries one.
     fn parent_pkt(tag: u8, seq: u8, word: u16, time: u32) -> [u8; PACKET_LEN] {
         let mut pkt = [0u8; PACKET_LEN];
