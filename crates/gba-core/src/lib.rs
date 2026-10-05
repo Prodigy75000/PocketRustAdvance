@@ -1119,6 +1119,63 @@ mod tests {
         assert_eq!(child.cable_stats(), (9, 0));
     }
 
+    /// A child that reaches the link menu late must not inherit the transfers
+    /// its peer sent while it was still elsewhere.
+    ///
+    /// Both players press A seconds apart, so a parent clocks handshake attempts
+    /// for a while before the other game is listening. Delivering those once the
+    /// child arrives would hand it interrupts for a protocol it has not started
+    /// and make it report a backlog that looks like a device falling behind.
+    /// Selecting Multi-Player mode is the port being set up, so that is where
+    /// they go.
+    #[test]
+    fn selecting_multi_player_mode_drops_what_was_in_flight_before_it() {
+        use crate::bus::{Access::NonSeq as N, Bus};
+
+        let mut rom = vec![0u8; 0x200];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        let (parent_end, child_end) = crate::cable::local_pair();
+        let mut parent = Gba::new(rom.clone(), Vec::new());
+        let mut child = Gba::new(rom, Vec::new());
+        parent.connect_cable(Box::new(parent_end));
+        child.connect_cable(Box::new(child_end));
+        parent.render_enabled = false;
+        child.render_enabled = false;
+
+        const MULTI: u16 = 0x2000 | 0x4000 | 3;
+        parent.bus.write16(0x0400_0134, 0x0000, N);
+        parent.bus.write16(0x0400_0128, MULTI, N);
+
+        // Three clocks while the child is still in its own menus, not linking.
+        for w in [0xB9A0u16, 0xB9A0, 0xB9A0] {
+            parent.bus.write16(0x0400_012A, w, N);
+            parent.bus.write16(0x0400_0128, MULTI | 0x0080, N);
+            parent.run_frame();
+        }
+        assert_eq!(parent.cable_stats().0, 3, "the parent really did clock three times");
+
+        // Now the child arrives and selects Multi-Player mode.
+        child.bus.write16(0x0400_0134, 0x0000, N);
+        child.bus.write16(0x0400_0128, MULTI, N);
+        child.bus.if_ = 0;
+        child.run_frame();
+        assert_eq!(
+            child.cable_stats(),
+            (0, 0),
+            "none of the three may land: they belong to a protocol this game had not begun"
+        );
+        assert_eq!(child.bus.if_ & 0x80, 0, "and no interrupt for a transfer it never took part in");
+
+        // A transfer clocked after it arrived does land.
+        parent.bus.write16(0x0400_012A, 0x8FFF, N);
+        child.bus.write16(0x0400_012A, 0x1234, N);
+        parent.bus.write16(0x0400_0128, MULTI | 0x0080, N);
+        parent.run_frame();
+        child.run_frame();
+        assert_eq!(child.cable_stats(), (1, 0), "the cable is not broken, only drained");
+        assert_eq!(child.bus.read16(0x0400_0120, N), 0x8FFF);
+    }
+
     /// A child cannot clock the bus. The start bit is read-only for it on
     /// hardware, and a game that writes it anyway must not be left polling a
     /// busy bit that nothing is ever going to clear.

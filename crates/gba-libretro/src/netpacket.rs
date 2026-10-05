@@ -189,7 +189,7 @@ impl Net {
     /// 2 and 3 carry nothing, which is worse than a session that plainly only
     /// links two. `cable_extra_peers` counts the ones left out.
     fn cable_units(&self) -> u8 {
-        if self.active {
+        if self.active && !self.cable.refusing() {
             2
         } else {
             1
@@ -254,7 +254,11 @@ unsafe extern "C" fn np_receive(buf: *const c_void, len: usize, client_id: u16) 
 /// Is this one of the cable's packets rather than the adapter's? Both ride the
 /// same session and each keys on its own four-byte magic.
 fn is_cable_packet(bytes: &[u8]) -> bool {
-    bytes.len() >= PACKET_LEN && bytes[..4] == gba_core::cable::MAGIC.to_be_bytes()
+    // The FAMILY, not the whole magic. A peer on a different cable version has
+    // to be recognised as ours so the mismatch can be named; matching the whole
+    // magic would make it look like no peer at all and the session would
+    // silently do nothing.
+    bytes.len() >= PACKET_LEN && bytes[..3] == gba_core::cable::FAMILY
 }
 
 /// Put everything the cable has queued on the wire.
@@ -335,8 +339,15 @@ pub fn send(to: u16, bytes: &[u8]) {
 /// could not carry. All three because a silent cable and a broken one look
 /// identical from outside, which is exactly how two adapter bugs stayed
 /// invisible for a whole device session.
-pub fn cable_stats() -> (u64, u64, usize) {
-    with_net(|n| (n.cable_done, n.cable_lost, n.cable_extra_peers()))
+pub fn cable_stats() -> (u64, u64, usize, u64) {
+    with_net(|n| {
+        (
+            n.cable_done,
+            n.cable_lost,
+            n.cable_extra_peers(),
+            n.cable.version_mismatch,
+        )
+    })
 }
 
 /// The cable the serial engine drives. Holds nothing: all state is in the NET
@@ -441,6 +452,13 @@ impl LinkCable for NetCable {
         });
         flush_cable_outbox(); // abandon only queues the give-up
         None
+    }
+
+    fn flush(&mut self) {
+        with_net(|n| {
+            n.cable.flush_pending();
+            n.cable_failures = 0;
+        });
     }
 
     fn child_clock(&mut self) -> Option<(u16, u16)> {

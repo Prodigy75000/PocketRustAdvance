@@ -1472,6 +1472,14 @@ impl GbaBus {
         // whatever the game wrote, which with a cable attached would let it
         // declare itself parent and both units would then drive the clock.
         if touches_siocnt && self.cable.is_some() && self.multi_mode() {
+            // Selecting Multi-Player mode is the port being set up, so anything
+            // in flight from before belongs to no protocol this game is running.
+            if prev_siocnt & 0x3000 != 0x2000 {
+                self.cable.as_mut().unwrap().flush();
+                self.cable_words = None;
+                self.cable_busy = false;
+                self.serial_pending = 0;
+            }
             let written = self.io_u16(0x128);
             // Bit 7 is Start on a parent and a read-only Busy on a child, so a
             // child's write to it is dropped along with the status bits.

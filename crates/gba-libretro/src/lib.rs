@@ -968,8 +968,10 @@ pub extern "C" fn retro_run() {
                     // apart. `lost` is give-ups and `extra` is peers this cable
                     // cannot carry.
                     let cable = if g.cable_attached() {
-                        let (done, lost, extra) = netpacket::cable_stats();
-                        format!(" cable_done={done} cable_lost={lost} cable_extra={extra}")
+                        let (done, lost, extra, badver) = netpacket::cable_stats();
+                        format!(
+                            " cable_done={done} cable_lost={lost} cable_extra={extra} cable_badver={badver}"
+                        )
                     } else {
                         String::new()
                     };

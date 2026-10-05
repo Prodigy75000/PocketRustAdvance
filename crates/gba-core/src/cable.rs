@@ -120,13 +120,41 @@ pub trait LinkCable {
     /// with, not whatever SIOMLT_SEND holds by the time its emulation catches
     /// up.
     fn child_clock(&mut self) -> Option<(u16, u16)>;
+    /// Throw away transfers in flight, because the game just selected
+    /// Multi-Player mode and anything from before that is not addressed to the
+    /// protocol it is about to run.
+    ///
+    /// Both players reach the link menu seconds apart, so a parent clocks for a
+    /// while before its peer is listening. Without this the child inherits a
+    /// queue of handshake attempts from before it was ready, delivers them with
+    /// their interrupts, and reports a backlog that makes it look far behind
+    /// when it has simply not started.
+    fn flush(&mut self);
 }
 
-/// Wire-format magic, "CBL1".
+/// Wire-format family, "CBL".
 ///
-/// Four bytes rather than a tag byte so a cable packet can never be mistaken
+/// Three bytes rather than a tag byte so a cable packet can never be mistaken
 /// for a wireless adapter one: both ride the same netplay session, and
 /// `rfu::net_receive` keys on its own "RFU1" magic for the same reason.
+///
+/// **The family and the version are separate on purpose.** A packet whose whole
+/// magic failed to match would be indistinguishable from the adapter's, so a
+/// peer running a different cable version would look like no peer at all and the
+/// session would quietly do nothing. Splitting them means a mismatch is a thing
+/// this core can SEE, name, and refuse.
+pub const FAMILY: [u8; 3] = *b"CBL";
+
+/// The cable wire version this build speaks, byte 3 of every packet.
+///
+/// The ASCII digit rather than the number, so a packet dump reads "CBL1" and
+/// the family and version are one readable token on the wire. Bump it to `b'2'`
+/// whenever the layout or the meaning of a field changes. There is no
+/// negotiation and there should not be: two devices come off the same APK, so a
+/// mismatch is a mis-install rather than a case to support.
+pub const WIRE_VERSION: u8 = b'1';
+
+/// The full four-byte header of a packet this build will act on, "CBL1".
 pub const MAGIC: u32 = 0x4342_4C31;
 
 /// `[magic, 1, seq, word, 0]`: "I am clocking `word` into you as exchange
@@ -202,6 +230,13 @@ pub struct CableProto {
     child_input: VecDeque<(u16, u16)>,
     /// Transfers dropped because the serial engine never collected them.
     pub dropped: u64,
+    /// Packets from a peer speaking a cable version this build does not.
+    ///
+    /// Non-zero means the two devices are on different builds, and it latches:
+    /// the cable refuses to carry anything from then on rather than guessing at
+    /// a layout it does not know. A link that degrades into corrupt gameplay is
+    /// far harder to attribute than one that plainly will not start.
+    pub version_mismatch: u64,
     /// The backlog the peer reported in its most recent reply.
     peer_lag: u8,
     /// The peer told us it gave up waiting on one of our replies.
@@ -229,6 +264,7 @@ impl CableProto {
             reply: None,
             child_input: VecDeque::new(),
             dropped: 0,
+            version_mismatch: 0,
             peer_lag: LAG_HEALTHY,
             peer_gave_up: false,
             outbox: VecDeque::new(),
@@ -247,6 +283,7 @@ impl CableProto {
         self.reply = None;
         self.child_input.clear();
         self.dropped = 0;
+        self.version_mismatch = 0;
         self.peer_lag = LAG_HEALTHY;
         self.peer_gave_up = false;
         self.outbox.clear();
@@ -343,6 +380,22 @@ impl CableProto {
         }
     }
 
+    /// Has a peer on a different cable build been heard from? The cable refuses
+    /// to carry anything once one has.
+    pub fn refusing(&self) -> bool {
+        self.version_mismatch > 0
+    }
+
+    /// Drop transfers in flight without forgetting the sequence numbers.
+    ///
+    /// Narrower than [`CableProto::reset`] on purpose: clearing `seen` would make
+    /// a retransmitted clock look new and queue the same transfer twice.
+    pub fn flush_pending(&mut self) {
+        self.child_input.clear();
+        self.awaiting = None;
+        self.reply = None;
+    }
+
     /// Take the oldest transfer a parent clocked into us.
     pub fn child_clock(&mut self) -> Option<(u16, u16)> {
         self.child_input.pop_front()
@@ -360,8 +413,18 @@ impl CableProto {
     /// continuously, so making the peer wait for our emulation to come round
     /// would stall it for a frame.
     pub fn on_packet(&mut self, pkt: &[u8]) {
-        if pkt.len() < PACKET_LEN || u32::from_be_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]) != MAGIC {
+        if pkt.len() < PACKET_LEN || pkt[..3] != FAMILY {
             return;
+        }
+        if pkt[3] != WIRE_VERSION {
+            // A peer on a different cable build. Count it and carry nothing:
+            // the fields past here may not mean what this build thinks, and a
+            // trade that corrupts is worse than a trade that will not start.
+            self.version_mismatch += 1;
+            return;
+        }
+        if self.version_mismatch > 0 {
+            return; // latched: this pair is not going to link
         }
         let (tag, seq) = (pkt[4], pkt[5]);
         let word = u16::from_be_bytes([pkt[6], pkt[7]]);
@@ -466,6 +529,12 @@ impl LinkCable for LocalCable {
 
     fn child_clock(&mut self) -> Option<(u16, u16)> {
         self.wire.borrow_mut().to_child.pop_front()
+    }
+
+    fn flush(&mut self) {
+        let mut w = self.wire.borrow_mut();
+        w.to_child.clear();
+        w.pending = None;
     }
 }
 
@@ -672,6 +741,39 @@ mod tests {
             w.proto[0].take_reply(seq),
             None,
             "an abandoned exchange must stay abandoned, or the register model completes twice"
+        );
+    }
+
+    #[test]
+    fn a_peer_on_a_different_cable_version_is_refused_rather_than_guessed_at() {
+        // The frontend is handed a protocol string so two peers can refuse each
+        // other when they disagree, and Trophy Hub's host throws it away: it
+        // prints the string once and never compares it. So a mismatched pair
+        // connects. Without this the fields past the header would be read as if
+        // they meant what this build thinks, and the failure would surface as
+        // corrupt gameplay rather than as a link that will not start.
+        let mut p = CableProto::new();
+        p.set_output(0xB9A0);
+        let mut future = [0u8; PACKET_LEN];
+        future[..3].copy_from_slice(&FAMILY);
+        future[3] = b'9'; // a cable version this build does not speak
+        future[4] = TAG_CLOCK;
+        future[6..8].copy_from_slice(&0x8FFFu16.to_be_bytes());
+        p.on_packet(&future);
+        assert_eq!(p.version_mismatch, 1);
+        assert!(p.refusing(), "the cable has to say it will not carry this");
+        assert_eq!(p.child_clock(), None, "and carry nothing");
+        assert!(p.take_outbox().is_empty(), "answering would be claiming to understand it");
+
+        // It LATCHES: a peer that also sends well-formed packets does not get a
+        // half-working cable out of it.
+        let mut ok = [0u8; PACKET_LEN];
+        put(&mut ok, TAG_CLOCK, 0, 0x8FFF, 0);
+        p.on_packet(&ok);
+        assert_eq!(
+            p.child_clock(),
+            None,
+            "once the pair is known to disagree, nothing more is carried"
         );
     }
 
