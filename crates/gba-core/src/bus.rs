@@ -27,7 +27,7 @@ pub enum Width {
     Word,
 }
 
-/// Whether an instruction/data fetch is Sequential or Non-sequential — the S/N
+/// Whether an instruction/data fetch is Sequential or Non-sequential - the S/N
 /// cycle distinction the GBA's wait-state model is built on. The CPU knows this
 /// from its access pattern; the bus turns it into a cycle count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

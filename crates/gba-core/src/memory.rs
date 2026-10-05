@@ -1249,7 +1249,7 @@ impl GbaBus {
     fn write(&mut self, addr: u32, val: u32, width: u32) {
         // 0x10000000-0xFFFFFFFF is unused address space (the upper region-decode
         // nibble is not mapped): writes there are ignored on hardware. Bailing
-        // here is essential — otherwise a wild/uninitialised pointer store (which
+        // here is essential - otherwise a wild/uninitialised pointer store (which
         // real hardware harmlessly drops) would alias down into a real region and
         // corrupt it. Motocross Maniacs et al. store to such a scratch pointer and
         // would otherwise clobber their own copied IRQ handler in IWRAM.
@@ -1257,7 +1257,7 @@ impl GbaBus {
             return;
         }
         // ARM7TDMI force-aligns store addresses to the access width: STR writes at
-        // addr & ~3, STRH at addr & ~1 (unlike LDR, a store does NOT rotate — the
+        // addr & ~3, STRH at addr & ~1 (unlike LDR, a store does NOT rotate - the
         // register value just lands at the aligned address). Without this, a word
         // store to an unaligned address splits across the aligned slot's neighbour
         // and corrupts it. DBZ Legacy of Goku registers a DMA2 IRQ handler with an

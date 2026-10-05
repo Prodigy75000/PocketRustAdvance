@@ -90,7 +90,7 @@ impl Flags {
     }
 
     /// Evaluate a condition code against the current flags. This is pure and
-    /// fully unit-testable on its own — the first green test in the suite.
+    /// fully unit-testable on its own - the first green test in the suite.
     pub fn eval(&self, cond: Cond) -> bool {
         use Cond::*;
         match cond {

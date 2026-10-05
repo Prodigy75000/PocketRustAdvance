@@ -8,7 +8,7 @@
 //!   - [`psr`]    : CPSR/SPSR, modes, condition-code evaluation.
 //!   - [`barrel`] : the barrel shifter (carry-out semantics shared by ARM+Thumb).
 //!   - [`arm`]    : 32-bit ARM decode+execute (data-processing online; rest TODO).
-//!   - `thumb`    : 16-bit Thumb decode+execute (19 formats) — TODO
+//!   - `thumb`    : 16-bit Thumb decode+execute (19 formats) - TODO
 //!
 //! Everything reaches memory through [`crate::bus::Bus`], never a concrete map,
 //! so the whole CPU runs under the TomHarte harness before the rest of the GBA
@@ -20,7 +20,7 @@
 //! TomHarte vectors expose as `pipeline[0]` (the instruction to execute now) and
 //! `pipeline[1]` (the next, already fetched). `r[15]` holds the address of the
 //! word to be fetched next, which is why a reading instruction sees R15 as
-//! `PC + 8` (ARM) — the executing instruction sits two words behind the fetch.
+//! `PC + 8` (ARM) - the executing instruction sits two words behind the fetch.
 //!
 //! Each [`step`](Arm7tdmi::step):
 //!   1. executes `pipeline[0]`;
@@ -395,7 +395,7 @@ impl Arm7tdmi {
     /// whichever instruction width the current state selects.
     ///
     /// The prefetches are aligned to the instruction width, but the ARM7TDMI
-    /// leaves the target's sub-word low bits in R15 itself — the final register
+    /// leaves the target's sub-word low bits in R15 itself - the final register
     /// is `target + step`, not `(target & align) + step`.
     fn refill<B: Bus>(&mut self, bus: &mut B) {
         let target = self.r[15];

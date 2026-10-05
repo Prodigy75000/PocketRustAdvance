@@ -434,7 +434,7 @@ fn main() {
     // did to the sound registers / DISPCNT around a screen transition.
     let apulog = std::env::var_os("GBA_APULOG").is_some();
     // GBA_BGLOG: per-frame background register snapshot (DISPCNT, BGxCNT, scrolls,
-    // BG2 affine matrix) — printed only when it changes, to find how a scene sets
+    // BG2 affine matrix) - printed only when it changes, to find how a scene sets
     // up its backgrounds. Used to diagnose torn/mis-scaled background rendering.
     let bglog = std::env::var_os("GBA_BGLOG").is_some();
     // Per-frame interrupt accounting: how many V-blank requests the PPU raised

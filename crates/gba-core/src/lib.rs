@@ -115,7 +115,7 @@ impl Gba {
 
         if has_bios && std::env::var_os("GBA_FULLBOOT").is_some() {
             // Full BIOS boot (reset vector, Supervisor, IRQ/FIQ masked): runs the
-            // whole BIOS boot sequence + logo. Opt-in via GBA_FULLBOOT — a few
+            // whole BIOS boot sequence + logo. Opt-in via GBA_FULLBOOT - a few
             // titles depend on the boot-time state it sets up (Pitfall Mayan
             // Adventure, Super Robot Taisen A, ...) that fast-boot skips.
             cpu.load_full(0x13 | (1 << 7) | (1 << 6), [0; 16], [0; 7], [0; 2], [0; 2], [0; 2], [0; 2], [0; 5]);
@@ -123,7 +123,7 @@ impl Gba {
             // Fast/direct boot WITH the BIOS still loaded (DEFAULT): jump straight
             // to the cartridge with post-BIOS register state, skipping the BIOS
             // boot animation, but leave the BIOS image in place so SWIs run the
-            // BIOS's own code and BIOS-ROM reads work. gpSP-style — no ~2 s boot
+            // BIOS's own code and BIOS-ROM reads work. gpSP-style - no ~2 s boot
             // logo, and it rescues more games than full-boot (incl. titles that
             // loop the boot). hle_bios stays false.
             let mut r = [0u32; 16];

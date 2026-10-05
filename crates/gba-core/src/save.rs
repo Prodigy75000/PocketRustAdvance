@@ -6,7 +6,7 @@
 //! The type is detected from the ID string every commercial ROM embeds
 //! ("SRAM_Vnnn", "FLASH_Vnnn"/"FLASH512_Vnnn", "FLASH1M_Vnnn", "EEPROM_Vnnn").
 //! SRAM is a plain byte array. Flash speaks a small command protocol (unlock
-//! sequence + autoselect ID) which games probe at boot — returning nothing is
+//! sequence + autoselect ID) which games probe at boot - returning nothing is
 //! what white-screens Pokémon. EEPROM is a bit-serial protocol the game drives
 //! over DMA; we key its address width off the DMA length.
 

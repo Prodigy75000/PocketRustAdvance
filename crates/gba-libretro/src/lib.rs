@@ -193,7 +193,7 @@ struct retro_memory_map {
     num_descriptors: c_uint,
 }
 
-/// Bundled open-source GBA BIOS (Normmatt's clean-room reimplementation — the
+/// Bundled open-source GBA BIOS (Normmatt's clean-room reimplementation - the
 /// same freely-redistributable image gpSP ships). We boot through it by default
 /// so no BIOS install is needed and behaviour matches gpSP. It cannot serve
 /// titles that read the *real* BIOS ROM's bytes directly (a reimplementation has
@@ -295,20 +295,20 @@ impl State {
 
 /// Trophy Hub's libretro host registers callbacks (env, video, audio, input) on
 /// its main thread but runs frames on a dedicated emulation thread. So the state
-/// must be a single process-global, not thread-local — otherwise `retro_run`
+/// must be a single process-global, not thread-local - otherwise `retro_run`
 /// sees a fresh empty state with null callbacks (black screen, no audio). This
 /// mirrors how C libretro cores keep their state in plain `static`s.
 struct GlobalState(UnsafeCell<State>);
 
-// SAFETY: libretro serializes every call into the core — `retro_run`, the
-// `retro_set_*` registrations and load/unload never overlap — so there is never
+// SAFETY: libretro serializes every call into the core - `retro_run`, the
+// `retro_set_*` registrations and load/unload never overlap - so there is never
 // concurrent access to the single STATE instance.
 unsafe impl Sync for GlobalState {}
 
 static STATE: GlobalState = GlobalState(UnsafeCell::new(State::new()));
 
 fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
-    // SAFETY: see `GlobalState` — accesses are serialized by the frontend.
+    // SAFETY: see `GlobalState` - accesses are serialized by the frontend.
     unsafe { f(&mut *STATE.0.get()) }
 }
 

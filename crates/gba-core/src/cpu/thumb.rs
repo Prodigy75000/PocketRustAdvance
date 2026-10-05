@@ -562,7 +562,7 @@ fn long_branch_link(cpu: &mut Arm7tdmi, op: u32) -> bool {
     }
 }
 
-/// Format 17: Thumb SWI — identical exception entry to ARM SWI.
+/// Format 17: Thumb SWI - identical exception entry to ARM SWI.
 fn software_interrupt<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool {
     let num = (op & 0xFF) as u8;
     super::swilog(num, cpu.r[15].wrapping_sub(4), &cpu.r);

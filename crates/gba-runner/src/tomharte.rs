@@ -11,7 +11,7 @@
 //! ship an initial memory image, they ship the exact ordered list of bus
 //! transactions the step must produce. Each CPU read is answered from the next
 //! transaction's data; each write is checked against it. This is why the
-//! [`gba_core::bus::Bus`] trait tags every access — the same tags let a later
+//! [`gba_core::bus::Bus`] trait tags every access - the same tags let a later
 //! mode also assert cycle/access exactness.
 //!
 //! Usage: `tomharte [path-to.json.bin]`
@@ -50,7 +50,7 @@ impl TxBus {
     }
 
     // Note: a transaction's `kind` is code-fetch (0) vs data-access (1), NOT
-    // read vs write — the direction is implied by the instruction. So we verify
+    // read vs write - the direction is implied by the instruction. So we verify
     // address (and data, for writes) but not kind.
     fn do_read(&mut self, addr: u32, _size: u32) -> u32 {
         match self.next() {

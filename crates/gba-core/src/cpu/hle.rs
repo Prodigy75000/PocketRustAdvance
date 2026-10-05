@@ -5,7 +5,7 @@
 //!
 //! On direct boot (no real BIOS image) the CPU has nothing at the SWI vector to
 //! run, so instead of vectoring to 0x08 we emulate the documented BIOS calls
-//! here. Behavior follows GBATEK's "BIOS Functions" chapter — the register I/O
+//! here. Behavior follows GBATEK's "BIOS Functions" chapter - the register I/O
 //! contract, the decompression formats, and the arithmetic helpers. This is a
 //! clean-room reimplementation from that specification, not a port of any BIOS.
 //!
@@ -96,7 +96,7 @@ fn register_ram_reset<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B) {
 }
 
 /// SWI 04h/05h IntrWait: park the CPU until an interrupt in the r1 mask fires.
-/// Modeled as: force IME on, then halt — the frame loop wakes us on the IRQ.
+/// Modeled as: force IME on, then halt - the frame loop wakes us on the IRQ.
 /// The BIOS Interrupt Flags halfword, at 0x03007FF8 (GBATEK). Not the IF
 /// register: this is a separate copy in IWRAM that the GAME's interrupt handler
 /// is required to maintain, by ORing into it whatever it writes to IF.

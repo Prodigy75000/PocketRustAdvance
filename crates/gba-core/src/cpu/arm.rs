@@ -174,7 +174,7 @@ fn single_data_transfer<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> boo
     wrote_pc
 }
 
-/// SWI: software interrupt — the canonical exception entry. Enters Supervisor
+/// SWI: software interrupt - the canonical exception entry. Enters Supervisor
 /// mode with the return address in LR_svc, the old CPSR in SPSR_svc, IRQs
 /// disabled and ARM state forced, then vectors to 0x08.
 fn software_interrupt<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool {
@@ -599,7 +599,7 @@ fn halfword_signed_transfer<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) ->
 ///
 /// Registers are always visited low-to-high at ascending addresses; the P/U
 /// bits only choose the lowest address and the writeback value. The S bit
-/// selects the User-bank ("^") forms, or — on an LDM that loads R15 — a CPSR
+/// selects the User-bank ("^") forms, or - on an LDM that loads R15 - a CPSR
 /// restore from SPSR.
 fn block_data_transfer<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool {
     let pre = (op >> 24) & 1 == 1;
@@ -752,8 +752,8 @@ fn operand2(cpu: &Arm7tdmi, op: u32, read_reg: impl Fn(&Arm7tdmi, usize) -> u32)
     }
 }
 
-/// `S`-with-Rd=15: restore CPSR from the current mode's SPSR, or — in a mode
-/// with no SPSR (User/System) — fall back to a plain flag update.
+/// `S`-with-Rd=15: restore CPSR from the current mode's SPSR, or - in a mode
+/// with no SPSR (User/System) - fall back to a plain flag update.
 fn restore_or_set_flags(cpu: &mut Arm7tdmi, result: u32, carry: bool, overflow: bool, logical: bool) {
     if cpu.has_spsr() {
         // Restore CPSR from SPSR, banking r8..r14 if the mode changes.
