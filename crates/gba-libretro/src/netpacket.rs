@@ -618,7 +618,7 @@ mod tests {
     fn the_protocol_string_refuses_a_build_that_predates_the_cable() {
         // An older build answers no cable clock at all, which to a player is a
         // trade that hangs rather than a session that will not start.
-        assert_ne!(PROTOCOL, b"pocketrustadvance-rfu-1 ");
+        assert_ne!(PROTOCOL, b"pocketrustadvance-rfu-1\0");
     }
 
     #[test]

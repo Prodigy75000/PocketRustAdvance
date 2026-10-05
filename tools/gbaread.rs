@@ -347,7 +347,7 @@ fn main() {
             // regions libretro does not expose (GBA EWRAM) can be mined offline.
             if let Some(path) = args.iter().position(|a| a == "--serialize").and_then(|i| args.get(i + 1)) {
                 let ser: extern "C" fn(*mut c_void, usize) -> bool =
-                    std::mem::transmute(sym(lib, b"retro_serialize "));
+                    std::mem::transmute(sym(lib, b"retro_serialize\0"));
                 let sz = ser_size();
                 let mut buf = vec![0u8; sz];
                 if ser(buf.as_mut_ptr() as *mut c_void, sz) {
