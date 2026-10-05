@@ -125,7 +125,8 @@ impl Square {
             self.phase = (self.phase + 1) & 7;
         }
     }
-    /// Channel output in EIGHTHS of a DAC step, with no DC component.
+    /// Channel output with no DC component, scaled by 8 so that subtracting the
+    /// waveform's mean stays exact in integers. The mixer converts to DAC steps.
     ///
     /// The obvious form, `(if high { vol } else { 0 }) - 8`, is the DMG DAC taken
     /// literally: digital zero sits on the bottom rail. It is also why this core
@@ -247,8 +248,8 @@ impl Wave {
         };
         let byte = ram[(idx / 2) & 31];
         let nib = if idx & 1 == 0 { byte >> 4 } else { byte & 0xF };
-        // Eighths of a DAC step, like the other channels. The volume has to scale
-        // the CENTRED sample, not the raw nibble: shifting the nibble first drags
+        // Scaled by 8, like the other channels. The volume has to scale the
+        // CENTRED sample, not the raw nibble: shifting the nibble first drags
         // the whole waveform toward the bottom rail, so a perfectly centred wave
         // at 50% volume carried a DC of about -4.5 steps for no reason. 75% is a
         // GBA-only forced level and applies the same way.
@@ -335,8 +336,8 @@ impl Noise {
         if !self.enabled || !self.dac_on {
             return 0;
         }
-        // Eighths of a DAC step, DC-free: see the comment on Square::dac. The LFSR
-        // sits high about half the time, so the mean is half the volume.
+        // DC-free and scaled by 8, as in Square::dac. The LFSR sits high about half
+        // the time, so the mean is half the volume.
         let high = self.lfsr & 1 == 0;
         let vol = self.env.vol as i32;
         (if high { vol * 8 } else { 0 }) - 4 * vol
@@ -387,6 +388,11 @@ impl Fifo {
         self.len -= 1;
         Some(v)
     }
+    /// The sample the next pop will return, without consuming it. Direct Sound
+    /// reconstruction needs to see one sample ahead to interpolate towards it.
+    fn peek(&self) -> Option<i8> {
+        if self.len == 0 { None } else { Some(self.buf[self.head]) }
+    }
     fn clear(&mut self) {
         self.head = 0;
         self.len = 0;
@@ -414,6 +420,17 @@ pub struct Apu {
     ds_b: i8,
     a_next: u64,
     b_next: u64,
+    /// Cycles between Direct Sound pops, as of the last pop, so the mixer can
+    /// work out how far it is between two PCM samples. Re-derived on every pop, so
+    /// it is deliberately NOT part of the save state.
+    a_period: u32,
+    b_period: u32,
+    /// `(1 << 24) / period`, so the mixer can find its position between two PCM
+    /// samples with a multiply instead of a divide. The mixer runs four times per
+    /// output sample per channel, and a divide there was the only measurable cost
+    /// of interpolating at all.
+    a_recip: u32,
+    b_recip: u32,
 
     // DC-blocking high-pass state (integer one-pole, corner ~1.3 Hz), per side.
     // The `y` state is kept in Q12 fixed point (i64) so the feedback term never
@@ -468,6 +485,10 @@ impl Default for Apu {
             ds_b: 0,
             a_next: 0,
             b_next: 0,
+            a_period: 0,
+            b_period: 0,
+            a_recip: 0,
+            b_recip: 0,
             hp_xl: 0,
             hp_yl: 0,
             hp_xr: 0,
@@ -754,8 +775,21 @@ impl Apu {
     fn pop_ds(&mut self, is_b: bool, period: Option<u32>, start: u64, end: u64) {
         let period = match period {
             Some(p) if p > 0 => p as u64,
-            _ => return,
+            _ => {
+                // Timer stopped: no pops, and no interpolation either, or the
+                // mixer would ramp towards a sample that is never going to arrive.
+                if is_b { self.b_period = 0 } else { self.a_period = 0 }
+                return;
+            }
         };
+        let recip = ((1u64 << 24) / period) as u32;
+        if is_b {
+            self.b_period = period as u32;
+            self.b_recip = recip;
+        } else {
+            self.a_period = period as u32;
+            self.a_recip = recip;
+        }
         let mut next = if is_b { self.b_next } else { self.a_next };
         if next < start {
             next = start; // (re)synchronise; never burst-catch-up a stale schedule
@@ -819,26 +853,27 @@ impl Apu {
                 psg_r += d;
             }
         }
-        // The channel DACs hand back eighths of a GBA DAC step, so one channel at
-        // full volume spans 120 eighths and this scaling takes it to 240 DAC
-        // steps. Four channels at full volume and 100% then reach 960 of the
-        // DAC's 1024 steps: the same range one Direct Sound channel covers, which
-        // is the relationship to keep. The net weight used to be half that, which
-        // measured exactly 6 dB under gpSP and mGBA on an isolated tone.
+        // The channel DACs hand back the waveform scaled by 8, and this converts
+        // to the mixer's unit of an eighth of a DAC step: one channel at full
+        // volume ends up spanning 240 DAC steps, so four of them at 100% reach 960
+        // of the DAC's 1024 steps. That is the same range one Direct Sound channel
+        // covers and it is the relationship to keep. The net weight used to be half
+        // that, which measured exactly 6 dB under gpSP and mGBA on an isolated
+        // tone.
         //
         // PSG ratio is bits 0-1 of SOUNDCNT_H (00=25%, 01=50%, 10=100%); 11 is
         // prohibited and is treated as 100%, which is what we did before.
         let shift = match cnt_h & 3 {
-            0 => 4,
-            1 => 3,
-            _ => 2,
+            0 => 3,
+            1 => 2,
+            _ => 1,
         };
-        psg_l = (psg_l * (left_vol + 1)) >> shift;
-        psg_r = (psg_r * (right_vol + 1)) >> shift;
+        psg_l = (psg_l * (left_vol + 1) * 4) >> shift;
+        psg_r = (psg_r * (right_vol + 1) * 4) >> shift;
 
-        // Direct Sound: 8-bit signed, 100% or 50% volume (bits 2/3).
-        let a = self.ds_a as i32 * if cnt_h & 0x04 != 0 { 4 } else { 2 };
-        let b = self.ds_b as i32 * if cnt_h & 0x08 != 0 { 4 } else { 2 };
+        // Direct Sound: 8-bit signed PCM, at 100% or 50% volume (bits 2/3).
+        let a = self.ds_level(false) >> if cnt_h & 0x04 != 0 { 0 } else { 1 };
+        let b = self.ds_level(true) >> if cnt_h & 0x08 != 0 { 0 } else { 1 };
         let mut l = psg_l;
         let mut r = psg_r;
         if cnt_h & 0x0200 != 0 {
@@ -865,13 +900,46 @@ impl Apu {
     /// paid for that headroom in volume. Clipping here, per sub-sample before the
     /// oversample average, is also where the console does it.
     fn dac(&mut self, mix: i32) -> i32 {
-        let bias = (self.r16(0x88) & 0x3FF) as i32;
+        // Everything above is in eighths of a DAC step, so the bias and the clip
+        // window scale by 8 too. Clipping in the fine unit rather than rounding
+        // first is what keeps the Direct Sound interpolation's resolution.
+        let bias = (self.r16(0x88) & 0x3FF) as i32 * 8;
         let biased = mix + bias;
-        let clipped = biased.clamp(0, 0x3FF);
+        let clipped = biased.clamp(0, 0x3FF * 8 + 7);
         if clipped != biased {
             self.dbg_dac_clips += 1;
         }
-        (clipped - bias) * DAC_TO_I16
+        (clipped - bias) * (DAC_TO_I16 / 8)
+    }
+
+    /// One Direct Sound channel at 100% volume, in eighths of a DAC step,
+    /// LINEARLY INTERPOLATED towards the sample that will be popped next.
+    ///
+    /// Holding each PCM byte until the next pop is a zero-order hold, and its
+    /// images fold back as broadband hiss. Measured between the harmonics at
+    /// 4-10 kHz, holding put our noise floor 5.3 dB above gpSP's, which the owner
+    /// heard as the output being grainy. gpSP interpolates the same way; this is
+    /// the single thing it does to the FIFO stream that we did not.
+    ///
+    /// Degrades to a hold whenever there is nothing to interpolate towards: an
+    /// empty FIFO, or a stopped timer. Ramping towards a sample that never arrives
+    /// would be worse than the hold.
+    fn ds_level(&self, is_b: bool) -> i32 {
+        let (cur, at, period, recip, next) = if is_b {
+            (self.ds_b, self.b_next, self.b_period, self.b_recip, self.fifo_b.peek())
+        } else {
+            (self.ds_a, self.a_next, self.a_period, self.a_recip, self.fifo_a.peek())
+        };
+        // 32 eighths per PCM step: a full-amplitude sample reaches 4096, which is
+        // the 512 DAC steps one Direct Sound channel covers at 100%.
+        let cur = cur as i32 * 32;
+        let (Some(next), true) = (next, period > 0) else {
+            return cur;
+        };
+        // How far through the current PCM sample we are, as 0..256.
+        let left = at.saturating_sub(self.cycle).min(period as u64) as u32;
+        let frac = (((period - left) as u64 * recip as u64) >> 16) as i32;
+        cur + ((next as i32 * 32 - cur) * frac >> 8)
     }
 
     // --- Save-state -----------------------------------------------------------

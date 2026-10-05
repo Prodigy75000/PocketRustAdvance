@@ -786,6 +786,9 @@ fn main() {
         // is headroom the output stage owes the DC blocker.
         println!("  audio headroom: pre-clamp peak {} ({:.2}x the i16 rail, mixer ceiling is 32704)",
             gba.bus.apu.dbg_peak, gba.bus.apu.dbg_peak as f64 / 32768.0);
+        let (pops, und) = (gba.bus.apu.dbg_pops, gba.bus.apu.dbg_underruns);
+        println!("  audio FIFO: {pops} pops, {und} underruns ({:.3}%) [an underrun holds the last sample]",
+            und as f64 * 100.0 / (pops + und).max(1) as f64);
         println!("  audio: the emulated DAC clipped {} times (the console would have too)",
             gba.bus.apu.dbg_dac_clips);
         println!(
