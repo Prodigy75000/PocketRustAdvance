@@ -1157,6 +1157,135 @@ mod tests {
         assert_eq!(child.cable_stats(), (9, 0));
     }
 
+    /// Nine transfers inside ONE emulated frame, at the interval the game uses.
+    ///
+    /// This is the case connected mode actually runs and the one nothing tested.
+    /// `a_nine_transfer_pokemon_frame_runs_end_to_end` drives nine transfers
+    /// across nine FRAMES, which is the handshake's cadence, not the trade's. A
+    /// trade issues all nine inside a single 280896-cycle frame, 28672 cycles
+    /// apart, which is gpSP's measured figure for the Pokemon protocol
+    /// (`SLAVE_IRQ_CYCLES_C`), and every link failure seen on hardware has been
+    /// at the moment the game switches from the first cadence to the second.
+    ///
+    /// Both cores are stepped a scanline at a time rather than by `run_frame`,
+    /// so the test can be the games' two interrupt handlers: each side checks
+    /// the words the transfer landed and arms its next one, which is what makes
+    /// the child's answers fresh. The CPU does not run, so this is the register
+    /// model, the busy pacing, the cable and the interrupt, not the ROM.
+    ///
+    /// It fails if a transfer outlasts the gap the protocol leaves for it, if
+    /// the child's engine cannot keep up at nine per frame, if a word lands in
+    /// the wrong slot, or if the interrupt stops arriving part way through.
+    #[test]
+    fn nine_transfers_land_inside_one_emulated_frame() {
+        use crate::bus::{Access::NonSeq as N, Bus};
+
+        // Absolute numbers, not expressions over the constants they check.
+        const GAP: u64 = 28672; // gpSP's SLAVE_IRQ_CYCLES_C
+        const LINE: u64 = 1232;
+        const LINES: u64 = 228;
+        const MULTI: u16 = 0x2000 | 0x4000 | 3;
+
+        let mut rom = vec![0u8; 0x200];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        let (parent_end, child_end) = crate::cable::local_pair();
+        let mut parent = Gba::new(rom.clone(), Vec::new());
+        let mut child = Gba::new(rom, Vec::new());
+        parent.connect_cable(Box::new(parent_end));
+        child.connect_cable(Box::new(child_end));
+        for g in [&mut parent, &mut child] {
+            g.render_enabled = false;
+            g.bus.write16(0x0400_0134, 0x0000, N);
+            g.bus.write16(0x0400_0128, MULTI, N);
+        }
+
+        // One checksum word and eight data words on each side, the frame shape
+        // gpSP documents.
+        let parent_words: [u16; 9] =
+            [0xA55A, 0x8FFF, 0x0102, 0x0304, 0x0506, 0x0708, 0x090A, 0x0B0C, 0x0D0E];
+        let child_words: [u16; 9] =
+            [0x5AA5, 0xB9A0, 0x1112, 0x1314, 0x1516, 0x1718, 0x191A, 0x1B1C, 0x1D1E];
+
+        // The child's handler armed its first word before the parent clocked.
+        child.bus.write16(0x0400_012A, child_words[0], N);
+
+        let (mut issued, mut parent_done, mut child_done) = (0usize, 0usize, 0usize);
+        let mut next_due = 0u64;
+        let mut ninth_landed_at = None;
+
+        for line in 0..LINES {
+            if issued < 9 && line * LINE >= next_due {
+                assert_eq!(
+                    parent.bus.read16(0x0400_0128, N) & 0x0080,
+                    0,
+                    "transfer {issued} is due at line {line} and the previous one is still busy"
+                );
+                parent.bus.write16(0x0400_012A, parent_words[issued], N);
+                parent.bus.write16(0x0400_0128, MULTI | 0x0080, N);
+                issued += 1;
+                next_due += GAP;
+            }
+
+            for g in [&mut parent, &mut child] {
+                g.bus.cycles += LINE;
+                g.bus.step_serial();
+            }
+
+            // Each game's serial interrupt handler: read the slots, arm the
+            // next word. The child's store here is the one a parked child never
+            // makes, which is the hazard
+            // a_parked_child_answers_two_clocks_with_the_word_armed_for_the_first
+            // pins down.
+            if parent.bus.if_ & 0x80 != 0 {
+                parent.bus.if_ &= !0x80;
+                let i = parent_done;
+                assert_eq!(
+                    (parent.bus.read16(0x0400_0120, N), parent.bus.read16(0x0400_0122, N)),
+                    (parent_words[i], child_words[i]),
+                    "parent transfer {i} landed the wrong pair"
+                );
+                parent_done += 1;
+                if parent_done == 9 {
+                    ninth_landed_at = Some(parent.bus.cycles);
+                }
+            }
+            if child.bus.if_ & 0x80 != 0 {
+                child.bus.if_ &= !0x80;
+                let i = child_done;
+                assert_eq!(
+                    (child.bus.read16(0x0400_0120, N), child.bus.read16(0x0400_0122, N)),
+                    (parent_words[i], child_words[i]),
+                    "child transfer {i} landed the wrong pair"
+                );
+                child_done += 1;
+                if child_done < 9 {
+                    child.bus.write16(0x0400_012A, child_words[child_done], N);
+                }
+            }
+        }
+
+        assert_eq!(issued, 9, "the parent could not issue nine transfers in a frame");
+        assert_eq!(
+            (parent_done, child_done),
+            (9, 9),
+            "both ends have to complete all nine inside the frame"
+        );
+        assert_eq!(parent.cable_stats(), (9, 0), "nine completed, none lost");
+        assert_eq!(child.cable_stats(), (9, 0));
+        assert_eq!(
+            parent.bus.read16(0x0400_0128, N) & 0x00C0,
+            0,
+            "the parent ends the frame idle and without an error"
+        );
+        // The frame is 280896 cycles. Asserted against the absolute number so
+        // this moves only when hardware does.
+        let landed = ninth_landed_at.expect("the ninth transfer never landed");
+        assert!(
+            landed <= 280_896,
+            "the ninth transfer landed at cycle {landed}, past the end of the frame"
+        );
+    }
+
     /// A child cannot clock the bus. The start bit is read-only for it on
     /// hardware, and a game that writes it anyway must not be left polling a
     /// busy bit that nothing is ever going to clear.
