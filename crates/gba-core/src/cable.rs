@@ -790,7 +790,21 @@ impl CableProto {
     /// Counts its own consecutive calls so a parent that has gone away releases
     /// the child instead of freezing it.
     pub fn hold(&mut self) -> bool {
-        if !self.engaged || self.budget > 0 || !self.child_input.is_empty() {
+        // An UNARMED child must keep running, even past its horizon.
+        //
+        // This is the condition the design claimed was implied and the devices
+        // proved was not. "Nothing uncollected" does not mean "armed": a child
+        // collects a transfer, parks before its interrupt handler has stored the
+        // next word, and answers the following clock with the previous one. Both
+        // ends then agree on a wrong word, which is why cable_wordsum matched
+        // while the game still refused the trade, and cable_cold counted 297 of
+        // them in 5893 transfers.
+        //
+        // Running on costs at most one handler's worth of overshoot against a
+        // one-frame horizon, and it makes "parked implies armed" true by
+        // construction instead of by appeal to what the game ought to do.
+        let unarmed = self.answered > 0 && !self.armed_since_answer;
+        if !self.engaged || self.budget > 0 || !self.child_input.is_empty() || unarmed {
             self.hold_spins = 0;
             return false;
         }
@@ -1241,9 +1255,12 @@ mod tests {
                 // handler arms the next word, exactly as the register model does.
                 if let Some((_parent_word, _answered)) = w.proto[1].child_clock() {
                     collected += 1;
-                    if collected < 9 {
-                        w.proto[1].set_output(child_words[collected]);
-                    }
+                    // A real handler always stores SIOMLT_SEND, even when it has
+                    // nothing new to say, and the distinction matters now that an
+                    // unarmed child refuses to park: a model that stopped arming
+                    // after the last word would show the child running free past
+                    // its horizon for reasons no game would produce.
+                    w.proto[1].set_output(child_words[collected.min(8)]);
                 }
             }
             w.send_all(1);
@@ -1489,6 +1506,34 @@ mod tests {
         c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 1_000_000 + 280_896));
         assert_eq!(c.budget(), 280_896);
         assert!(!c.hold(), "and it is released by the parent moving, nothing else");
+    }
+
+    /// An unarmed child keeps running instead of parking, even past the horizon.
+    ///
+    /// Measured on two devices: 297 of 5893 clocks were answered before the
+    /// child's game had stored the next word, so the parent read the previous one
+    /// back. Both ends agreed on it, which is why the word hash matched while the
+    /// game still refused the trade. Parking is only safe once the handler has
+    /// run, so "parked implies armed" is enforced here rather than assumed.
+    #[test]
+    fn an_unarmed_child_keeps_running_rather_than_parking() {
+        let mut c = CableProto::new();
+        c.set_output(0x1111);
+
+        // A clock arrives and is answered, which consumes the armed word.
+        c.on_packet(&parent_pkt(TAG_CLOCK, 0, 0x8FFF, 1_000));
+        assert_eq!(c.child_clock(), Some((0x8FFF, 0x1111)), "the engine collects it");
+        c.advance(280_896); // and the whole frame of budget is spent
+
+        assert!(
+            !c.hold(),
+            "the handler has not stored the next word yet, so it must keep running"
+        );
+        assert_eq!(c.budget(), 0, "it is out of budget, which is not the question here");
+
+        c.set_output(0x2222); // the handler runs
+        assert!(c.hold(), "armed and out of budget, now parking is safe");
+        assert_eq!(c.answered_cold, 0, "and no answer was given cold");
     }
 
     /// The handshake must not be throttled at all.
