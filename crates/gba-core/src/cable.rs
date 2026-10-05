@@ -104,6 +104,15 @@ pub const TRANSFER_CYCLES: [[u32; MAX_UNITS]; 4] = [
 /// extra seconds on a trade, against a link that does not work at all. Smoothness
 /// at 60 fps on both devices was the explicit requirement.
 ///
+/// Worth knowing how far outside hardware this really is, because it sounds worse
+/// than it is: the SLOWEST legal Multi-Player transfer is 9600 baud with four
+/// units, 125829 cycles, 7.5 ms. So games already have to tolerate a 7.5 ms
+/// transfer, and 12 ms is 1.6x that rather than the 35x it looks like next to the
+/// 343 us case Pokemon actually selects. 125829 is the fidelity-preferred value
+/// if more protocol throughput is ever wanted: it is exactly a legal hardware
+/// timing and gives 2.2 transfers a frame instead of 1.4, at the cost of blocking
+/// for the difference whenever the round trip runs long.
+///
 /// Above every entry in [`TRANSFER_CYCLES`], so the baud table currently never
 /// decides the pacing. It is still consulted, and still right, for a transport
 /// faster than Wi-Fi: two cores in one process, or a LAN worth the name.
