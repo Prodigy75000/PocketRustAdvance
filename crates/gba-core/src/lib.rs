@@ -651,6 +651,13 @@ impl Gba {
         (self.bus.cable_transfers, self.bus.cable_failures)
     }
 
+    /// Rolling hash of the words every completed transfer landed. Both ends must
+    /// agree at an equal transfer count, which is the only way to tell a healthy
+    /// wire carrying the wrong data from one carrying the right data.
+    pub fn cable_wordsum(&self) -> u64 {
+        self.bus.cable_wordsum
+    }
+
     /// Tell the adapter which peer the frontend thinks we are. The device id
     /// it advertises is derived from this, so without it two devices running
     /// the same ROM advertise the same id and refuse to join each other.
@@ -1184,6 +1191,15 @@ mod tests {
 
         assert_eq!(parent.cable_stats(), (9, 0), "nine completed, none lost");
         assert_eq!(child.cable_stats(), (9, 0));
+        // The instrument the device run needed: both ends hash the words they
+        // landed, in order, so an equal count with unequal hashes means a healthy
+        // wire carried the wrong data. Tested here so the number means something
+        // when it comes off a phone.
+        assert_eq!(
+            parent.cable_wordsum(),
+            child.cable_wordsum(),
+            "the two ends must have landed the same words in the same order"
+        );
     }
 
     /// The core's pacing hook: charge every scanline, and pump the transport
@@ -1402,6 +1418,15 @@ mod tests {
         );
         assert_eq!(parent.cable_stats(), (9, 0), "nine completed, none lost");
         assert_eq!(child.cable_stats(), (9, 0));
+        // The instrument the device run needed: both ends hash the words they
+        // landed, in order, so an equal count with unequal hashes means a healthy
+        // wire carried the wrong data. Tested here so the number means something
+        // when it comes off a phone.
+        assert_eq!(
+            parent.cable_wordsum(),
+            child.cable_wordsum(),
+            "the two ends must have landed the same words in the same order"
+        );
         assert_eq!(
             parent.bus.read16(0x0400_0128, N) & 0x00C0,
             0,

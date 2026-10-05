@@ -375,6 +375,24 @@ pub struct CableProto {
     /// present one word across several transfers, and gating on a dirty flag
     /// would hang it.
     pub stale_risk: u64,
+    /// Clocks answered without the game having refreshed SIOMLT_SEND since the
+    /// last one we answered.
+    ///
+    /// `stale_risk` only sees the case where the PREVIOUS transfer was still
+    /// uncollected, and that is a proxy: a child can collect a transfer, be
+    /// asked again before its interrupt handler has run, and answer with the
+    /// previous word while its queue is empty. Same corruption, invisible to
+    /// that counter. This is the precondition exactly: an answer given cold.
+    ///
+    /// Still a counter and not a gate, for the reason the design records: a game
+    /// is free to present one word across several transfers, so refusing here
+    /// would hang a conforming game.
+    pub answered_cold: u64,
+    /// Clocks answered at all, so the first answer of a session is not counted
+    /// as cold when nothing has been armed yet.
+    pub answered: u64,
+    /// Has the game stored SIOMLT_SEND since the last clock we answered?
+    armed_since_answer: bool,
     /// Packets from a peer speaking a cable version this build does not.
     ///
     /// Non-zero means the two devices are on different builds, and it latches:
@@ -439,6 +457,9 @@ impl CableProto {
             child_input: VecDeque::new(),
             dropped: 0,
             stale_risk: 0,
+            answered_cold: 0,
+            answered: 0,
+            armed_since_answer: false,
             version_mismatch: 0,
             peer_lag: 0, // nothing reported yet, see LAG_HEALTHY
             peer_gave_up: false,
@@ -469,6 +490,9 @@ impl CableProto {
         self.child_input.clear();
         self.dropped = 0;
         self.stale_risk = 0;
+        self.answered_cold = 0;
+        self.answered = 0;
+        self.armed_since_answer = false;
         self.version_mismatch = 0;
         self.peer_lag = 0; // nothing reported yet, see LAG_HEALTHY
         self.peer_gave_up = false;
@@ -509,6 +533,7 @@ impl CableProto {
     /// Present `word` on the bus. A child's reply is answered from this.
     pub fn set_output(&mut self, word: u16) {
         self.own_output = word;
+        self.armed_since_answer = true;
     }
 
     /// Begin a parent exchange of `out`. Returns the sequence number to wait on.
@@ -804,6 +829,13 @@ impl CableProto {
                 self.seen[self.seen_pos] = Some(seq);
                 self.seen_pos = (self.seen_pos + 1) % SEEN_WINDOW;
                 let answered = self.own_output;
+                if self.answered > 0 && !self.armed_since_answer {
+                    // The game has not stored a new word since the last clock we
+                    // answered, so this transfer carries the previous one.
+                    self.answered_cold += 1;
+                }
+                self.answered += 1;
+                self.armed_since_answer = false;
                 if !self.child_input.is_empty() {
                     // The previous transfer has not reached the game's handler,
                     // so `answered` is the word that handler would have
@@ -1362,6 +1394,64 @@ mod tests {
         assert_eq!(w.proto[1].dropped, 0, "nothing was dropped: the queue is nowhere near full");
         assert_eq!(w.proto[1].version_mismatch, 0, "and this is not a version problem");
         assert_eq!(w.proto[1].lag(), 2, "both transfers are still waiting for the serial engine");
+    }
+
+    /// The hazard `stale_risk` cannot see: a cold answer with an empty queue.
+    ///
+    /// This is the case that makes the queue-depth proxy insufficient. The child
+    /// collects transfer N, so nothing is uncollected, and the next clock arrives
+    /// before its interrupt handler has stored the word for N+1. `stale_risk`
+    /// stays at zero and the parent still reads the previous word.
+    #[test]
+    fn a_clock_answered_before_the_game_rearmed_is_counted_even_with_an_empty_queue() {
+        let mut w = Wire::new();
+        w.proto[1].set_output(0xB9A0);
+
+        let first = w.proto[0].begin_exchange(0x8FFF);
+        w.deliver(0);
+        w.deliver(1);
+        assert_eq!(w.proto[0].take_reply(first), Some(0xB9A0));
+        // The child's serial engine collects it, so the queue is empty, but its
+        // game has not reached the handler that stores the next word.
+        assert_eq!(w.proto[1].child_clock(), Some((0x8FFF, 0xB9A0)));
+        assert_eq!(w.proto[1].lag(), 0);
+
+        let second = w.proto[0].begin_exchange(0x1234);
+        w.deliver(0);
+        w.deliver(1);
+        assert_eq!(
+            w.proto[0].take_reply(second),
+            Some(0xB9A0),
+            "the same word again, which is the corruption"
+        );
+        assert_eq!(
+            w.proto[1].stale_risk, 0,
+            "the queue was empty, so the older proxy sees nothing at all"
+        );
+        assert_eq!(
+            w.proto[1].answered_cold, 1,
+            "and the precise counter sees exactly one cold answer"
+        );
+    }
+
+    /// A game that rearms between clocks is never counted cold, including the
+    /// very first clock of a session.
+    #[test]
+    fn a_game_that_rearms_between_clocks_is_never_counted_cold() {
+        let mut w = Wire::new();
+        for i in 0..9u16 {
+            w.proto[1].set_output(0x1000 + i);
+            let seq = w.proto[0].begin_exchange(0x8F00 + i);
+            w.deliver(0);
+            w.deliver(1);
+            assert_eq!(w.proto[0].take_reply(seq), Some(0x1000 + i), "transfer {i}");
+            assert_eq!(w.proto[1].child_clock(), Some((0x8F00 + i, 0x1000 + i)));
+        }
+        assert_eq!(w.proto[1].answered, 9);
+        assert_eq!(
+            w.proto[1].answered_cold, 0,
+            "nine armed answers, none of them cold, and the first is not counted"
+        );
     }
 
     /// A child that is keeping up must NOT be counted as at risk.

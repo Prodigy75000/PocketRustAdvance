@@ -402,6 +402,10 @@ pub struct CableStats {
     /// reply. One device's log can answer "how far apart were we" without the
     /// other's.
     pub skew: i32,
+    /// Clocks answered before the game had rearmed, and clocks answered at all.
+    /// The precise form of the stale-word hazard, where `stale_risk` is a proxy.
+    pub cold: u64,
+    pub answered: u64,
 }
 
 pub fn cable_stats() -> CableStats {
@@ -418,6 +422,8 @@ pub fn cable_stats() -> CableStats {
         holds: n.cable.holds,
         starved: n.cable.starved,
         skew: n.cable.skew().unwrap_or(0),
+        cold: n.cable.answered_cold,
+        answered: n.cable.answered,
     })
 }
 

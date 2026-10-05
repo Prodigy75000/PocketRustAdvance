@@ -104,6 +104,15 @@ pub struct GbaBus {
     /// whole device session.
     pub cable_transfers: u64,
     pub cable_failures: u64,
+    /// Rolling hash of every word every completed transfer landed, in order.
+    ///
+    /// The two ends see the SAME four words for the same transfer, so at an equal
+    /// `cable_transfers` the hashes must match. That is the one question the
+    /// counters could not answer after the second device run: the wire was
+    /// provably healthy and the game still refused the data, and nothing we
+    /// logged could say whether the words themselves agreed. FNV-1a, and the
+    /// order is part of it, so a pair delivered out of sequence diverges too.
+    pub cable_wordsum: u64,
     /// `cycles` as of the last `step_serial`, so serial timing is a delta the
     /// same way the timers are.
     serial_cycles: u64,
@@ -447,6 +456,7 @@ impl GbaBus {
             cable_words: None,
             cable_transfers: 0,
             cable_failures: 0,
+            cable_wordsum: 0xcbf2_9ce4_8422_2325, // FNV-1a offset basis
             serial_cycles: 0,
             serial_pending: 0,
             bios: b.into_boxed_slice(),
@@ -1705,8 +1715,14 @@ impl GbaBus {
             // duration instead of being added to it.
             None => self.cable.as_mut().and_then(|c| c.parent_result()),
         };
-        if words.is_some() {
+        if let Some(w) = words {
             self.cable_transfers += 1;
+            for half in w {
+                for byte in half.to_be_bytes() {
+                    self.cable_wordsum ^= byte as u64;
+                    self.cable_wordsum = self.cable_wordsum.wrapping_mul(0x100_0000_01b3);
+                }
+            }
         } else {
             self.cable_failures += 1;
         }
