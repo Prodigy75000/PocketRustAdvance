@@ -8,7 +8,7 @@
 //!
 //! Usage: sweep <rom-dir> [frames=250] [out.tsv=sweep.tsv] [workers=cores-2]
 //!
-//! Each ROM is HLE direct-booted (the shipping libretro config: no BIOS), run
+//! Each ROM is HLE direct-booted by default, run
 //! for `frames` frames with the same A+Start auto-input pulse the interactive
 //! runner uses, and scored by the peak distinct-colour count of any frame (the
 //! boot signal), plus CPU steps and audio activity. A per-ROM panic is caught
@@ -46,8 +46,11 @@ fn distinct(fb: &[u16]) -> usize {
 
 /// Boot one ROM and return (peak distinct colours, frame of that peak, CPU
 /// steps, non-zero audio samples). Panics propagate to the caller's catch.
-/// With `bios` empty this is HLE direct-boot (the shipping config); pass a real
-/// 16 KB BIOS (via GBA_BIOS) to measure how many failures are BIOS-dependent.
+/// With `bios` empty this is HLE direct-boot. That is NOT the shipping config,
+/// which this comment used to claim: `gba-libretro` bundles an open BIOS with
+/// `include_bytes!` and only prefers a real dump if one is in the system
+/// directory, so the shipped core always boots through a BIOS. Pass one via
+/// GBA_BIOS to measure the config users actually run.
 fn run_one(rom: Vec<u8>, bios: &[u8], frames: u32) -> (usize, u32, u64, usize, u64, u64) {
     let mut gba = Gba::new(rom, bios.to_vec());
     let (mut best, mut best_frame) = (0usize, 0u32);

@@ -98,6 +98,14 @@ pub struct Arm7tdmi {
     /// When set, SWIs are emulated at the CPU level (HLE BIOS) instead of
     /// vectoring to 0x08. Enabled on direct boot when no real BIOS is present.
     pub hle_bios: bool,
+    /// True while an HLE `IntrWait` is parked waiting for its interrupt.
+    ///
+    /// The wait works by halting and rewinding R15 so the SWI runs again on
+    /// wake, and that re-runs the whole instruction: for `VBlankIntrWait` it
+    /// re-loads r0 = 1, which would discard the very flag the game's handler had
+    /// just posted. The wait could then never complete. This says "the discard
+    /// already happened for this wait", so only the first pass honours it.
+    pub in_intr_wait: bool,
 
     /// Saved r8..r12: [0] = the bank shared by every non-FIQ mode, [1] = FIQ.
     r8_12: [[u32; 5]; 2],
@@ -114,6 +122,7 @@ impl Default for Arm7tdmi {
             cpsr: Mode::System as u32,
             pipeline: [0; 2],
             hle_bios: false,
+            in_intr_wait: false,
             r8_12: [[0; 5]; 2],
             r13_14: [[0; 2]; 6],
             spsr_bank: [0; 5],
@@ -134,7 +143,11 @@ impl Arm7tdmi {
         w.u32(self.cpsr);
         w.u32(self.pipeline[0]);
         w.u32(self.pipeline[1]);
-        w.bool(self.hle_bios);
+        // Packed into the byte that used to hold `hle_bios` alone, so the state
+        // layout and `retro_serialize_size` are unchanged and no version bump is
+        // needed. Version 1 and 2 states wrote 0 or 1 here, so bit 1 reads false
+        // for them, which is the correct resume value.
+        w.u8((self.hle_bios as u8) | ((self.in_intr_wait as u8) << 1));
         for bank in &self.r8_12 {
             for &v in bank {
                 w.u32(v);
@@ -156,7 +169,9 @@ impl Arm7tdmi {
         self.cpsr = r.u32();
         self.pipeline[0] = r.u32();
         self.pipeline[1] = r.u32();
-        self.hle_bios = r.bool();
+        let flags = r.u8();
+        self.hle_bios = flags & 1 != 0;
+        self.in_intr_wait = flags & 2 != 0;
         for bank in &mut self.r8_12 {
             for v in bank {
                 *v = r.u32();

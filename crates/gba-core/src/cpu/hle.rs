@@ -24,12 +24,14 @@ pub fn swi<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, num: u8) -> bool {
         0x00 => return soft_reset(cpu),
         0x01 => register_ram_reset(cpu, bus),
         0x02 | 0x03 => bus.set_halted(true), // Halt / Stop
-        0x04 => intr_wait(cpu, bus),
+        0x04 => return intr_wait(cpu, bus),
         0x05 => {
-            // VBlankIntrWait == IntrWait(discard=1, mask=VBlank).
+            // VBlankIntrWait == IntrWait(discard=1, mask=VBlank). The real BIOS
+            // implements it by literally loading these two and falling into 04h,
+            // so clobbering them is hardware behaviour, not a shortcut.
             cpu.r[0] = 1;
             cpu.r[1] = 1;
-            intr_wait(cpu, bus);
+            return intr_wait(cpu, bus);
         }
         0x06 => div(cpu, cpu.r[0] as i32, cpu.r[1] as i32),
         0x07 => div(cpu, cpu.r[1] as i32, cpu.r[0] as i32), // DivArm: args swapped
@@ -95,9 +97,59 @@ fn register_ram_reset<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B) {
 
 /// SWI 04h/05h IntrWait: park the CPU until an interrupt in the r1 mask fires.
 /// Modeled as: force IME on, then halt — the frame loop wakes us on the IRQ.
-fn intr_wait<B: Bus>(_cpu: &mut Arm7tdmi, bus: &mut B) {
-    bus.write16(0x0400_0208, 1, N); // IME = 1
+/// The BIOS Interrupt Flags halfword, at 0x03007FF8 (GBATEK). Not the IF
+/// register: this is a separate copy in IWRAM that the GAME's interrupt handler
+/// is required to maintain, by ORing into it whatever it writes to IF.
+const BIOS_IF: u32 = 0x0300_7FF8;
+
+/// SWI 04h IntrWait, and 05h VBlankIntrWait through it.
+///
+/// Waits in Halt until one of the interrupt flags in r1 shows up in [`BIOS_IF`],
+/// then clears exactly those flags there and returns. r0 selects whether flags
+/// that were ALREADY pending count: 0 returns immediately on an old flag, 1
+/// discards the old ones first and waits for a genuinely new one.
+///
+/// **It cannot block, so it re-executes instead.** A SWI handler here is an
+/// ordinary function call that has to return, and there is no way to suspend
+/// inside it. When the wait is not yet satisfied this halts AND rewinds R15 to
+/// the SWI itself, so the instruction runs again when the next interrupt lifts
+/// the halt, and re-tests. The frame loop clears `halted` on `ie & if_` without
+/// consulting IME, so a wake cannot be lost.
+///
+/// Returning true tells the caller R15 was changed and the pipeline must refill.
+///
+/// **This waits forever if the game's handler never maintains [`BIOS_IF`]**, and
+/// that is correct: real hardware and the bundled open BIOS both hang in exactly
+/// the same way, which is why GBATEK prints a caution about it. The previous
+/// implementation here halted once and returned unconditionally, which papered
+/// over any game whose handler we were failing to reach.
+fn intr_wait<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B) -> bool {
+    bus.write16(0x0400_0208, 1, N); // IME = 1, forcefully, per GBATEK
+
+    let want = cpu.r[1] as u16;
+    // Discard old flags once per WAIT, not once per pass. The re-execution below
+    // re-runs the whole instruction, and SWI 05h re-loads r0 = 1 when it does, so
+    // keying this off r0 alone would discard the flag the handler just posted and
+    // the wait would never end. Measured: 1616 of 3732 ROMs stopped drawing.
+    if cpu.r[0] != 0 && !cpu.in_intr_wait {
+        let pending = bus.read16(BIOS_IF, N);
+        bus.write16(BIOS_IF, pending & !want, N);
+    }
+
+    let pending = bus.read16(BIOS_IF, N);
+    if pending & want != 0 {
+        bus.write16(BIOS_IF, pending & !want, N);
+        cpu.in_intr_wait = false;
+        return false; // satisfied; fall through to the instruction after the SWI
+    }
+
+    cpu.in_intr_wait = true;
     bus.set_halted(true);
+    // Rewind to the SWI. R15 runs two instructions ahead of the one executing,
+    // so the SWI itself is at R15 minus one full pipeline.
+    let back = if cpu.thumb() { 4 } else { 8 };
+    cpu.r[15] = cpu.r[15].wrapping_sub(back);
+    true
 }
 
 /// SWI 06h/07h Div: signed 32-bit division. r0 = num/den, r1 = num%den,
@@ -538,4 +590,158 @@ fn huff_uncomp<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B) {
         }
     }
     write_out(bus, dst, &out, true);
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::Bus as _;
+    use crate::Gba;
+
+    /// An HLE machine: no BIOS image, so SWIs come here.
+    fn hle() -> Gba {
+        Gba::new(vec![0u8; 0x2000], Vec::new())
+    }
+
+    fn bios_if(g: &mut Gba) -> u16 {
+        g.bus.read16(BIOS_IF, N)
+    }
+
+    /// r0 = 0 means an already-pending flag satisfies the wait at once. The
+    /// flags waited for must be cleared on the way out, or the next call returns
+    /// immediately on a stale flag and the game free-runs.
+    #[test]
+    fn intr_wait_returns_at_once_on_a_flag_that_is_already_pending() {
+        let mut g = hle();
+        g.bus.write16(BIOS_IF, 0x0003, N); // VBlank and HBlank pending
+        g.cpu.r[0] = 0;
+        g.cpu.r[1] = 0x0001; // wait on VBlank only
+        let pc = g.cpu.r[15];
+        let moved = swi(&mut g.cpu, &mut g.bus, 0x04);
+        assert!(!moved, "a satisfied wait must fall through, not rewind");
+        assert!(!g.bus.halted, "a satisfied wait must not halt");
+        assert_eq!(bios_if(&mut g), 0x0002, "only the waited-for flag is cleared");
+        assert_eq!(g.cpu.r[15], pc, "PC untouched when the wait is satisfied");
+    }
+
+    /// r0 = 1 discards what is already pending and waits for something NEW. This
+    /// is the mode every VBlankIntrWait uses, so getting it wrong would make a
+    /// game run a frame ahead of itself forever.
+    #[test]
+    fn intr_wait_with_discard_ignores_a_stale_flag_and_waits() {
+        let mut g = hle();
+        g.bus.write16(BIOS_IF, 0x0001, N);
+        g.cpu.r[0] = 1;
+        g.cpu.r[1] = 0x0001;
+        let pc = g.cpu.r[15];
+        let moved = swi(&mut g.cpu, &mut g.bus, 0x04);
+        assert!(moved, "an unsatisfied wait must rewind to re-execute");
+        assert!(g.bus.halted, "an unsatisfied wait must halt");
+        assert_eq!(bios_if(&mut g), 0, "the stale flag is discarded");
+        assert_eq!(g.cpu.r[15], pc.wrapping_sub(8), "rewound to the ARM SWI itself");
+        assert!(g.cpu.in_intr_wait, "the wait is marked, so a re-run cannot discard again");
+    }
+
+    /// The whole point of the rewind: the SWI runs again when the halt lifts, and
+    /// completes once the game's handler has posted the flag. Without the r0
+    /// clear above, this second call would discard the flag it is waiting for and
+    /// wait forever.
+    #[test]
+    fn a_rewound_intr_wait_completes_once_the_handler_posts_the_flag() {
+        let mut g = hle();
+        g.bus.write16(BIOS_IF, 0x0001, N);
+        g.cpu.r[0] = 1;
+        g.cpu.r[1] = 0x0001;
+        assert!(swi(&mut g.cpu, &mut g.bus, 0x04), "first pass waits");
+
+        // What a game's interrupt handler is required to do (GBATEK): OR what it
+        // wrote to IF into the BIOS flags.
+        let posted = bios_if(&mut g) | 0x0001;
+        g.bus.write16(BIOS_IF, posted, N);
+
+        let pc = g.cpu.r[15];
+        assert!(!swi(&mut g.cpu, &mut g.bus, 0x04), "second pass completes");
+        assert_eq!(bios_if(&mut g), 0, "and consumes the flag");
+        assert_eq!(g.cpu.r[15], pc, "PC untouched once satisfied");
+    }
+
+    /// Thumb rewinds by a Thumb pipeline, not an ARM one. Getting this wrong
+    /// lands four bytes early, which is inside the previous instruction.
+    #[test]
+    fn the_rewind_matches_the_instruction_width() {
+        let mut g = hle();
+        g.cpu.write_cpsr(g.cpu.cpsr | (1 << 5)); // Thumb
+        g.cpu.r[0] = 0;
+        g.cpu.r[1] = 0x0001;
+        let pc = g.cpu.r[15];
+        assert!(swi(&mut g.cpu, &mut g.bus, 0x04));
+        assert_eq!(g.cpu.r[15], pc.wrapping_sub(4), "rewound one Thumb pipeline");
+    }
+
+    /// SWI 05h is SWI 04h with both arguments forced, which is literally how the
+    /// real BIOS implements it.
+    #[test]
+    fn vblank_intr_wait_is_intr_wait_on_the_vblank_flag() {
+        let mut g = hle();
+        g.cpu.r[0] = 0xDEAD;
+        g.cpu.r[1] = 0xBEEF;
+        g.bus.write16(BIOS_IF, 0x0001, N);
+        let moved = swi(&mut g.cpu, &mut g.bus, 0x05);
+        assert!(moved, "discard mode must wait for a new VBlank");
+        assert_eq!(g.cpu.r[1], 1, "r1 forced to the VBlank flag");
+        assert_eq!(bios_if(&mut g), 0, "the stale VBlank flag is discarded");
+    }
+
+
+    /// The one that matters, and the one my first cut got wrong.
+    ///
+    /// SWI 05h re-loads r0 = 1 every time it executes, and the wait re-executes
+    /// the whole instruction on each wake. Keying the discard off r0 therefore
+    /// threw away the flag the handler had just posted, every pass, forever. It
+    /// passed all the single-pass tests and hung 1616 of 3732 ROMs in the corpus
+    /// sweep. Drive at least two passes before believing a wait works.
+    #[test]
+    fn vblank_intr_wait_completes_across_a_re_execution() {
+        let mut g = hle();
+        g.bus.write16(BIOS_IF, 0x0001, N); // a stale VBlank, which must be discarded
+
+        assert!(swi(&mut g.cpu, &mut g.bus, 0x05), "pass 1 discards and waits");
+        assert_eq!(bios_if(&mut g), 0, "the stale flag went");
+
+        // The handler posts a real VBlank while the CPU is halted.
+        g.bus.write16(BIOS_IF, 0x0001, N);
+
+        // Wake and re-execute. SWI 05h sets r0 = 1 again here; that must not
+        // discard the flag we are waiting for.
+        assert!(!swi(&mut g.cpu, &mut g.bus, 0x05), "pass 2 must COMPLETE");
+        assert_eq!(bios_if(&mut g), 0, "and consume the flag");
+        assert!(!g.cpu.in_intr_wait, "the wait is over");
+    }
+
+    /// A second wait after a completed one must discard again, or a game that
+    /// stops waiting for a while comes back a frame early forever.
+    #[test]
+    fn a_fresh_wait_discards_again() {
+        let mut g = hle();
+        g.bus.write16(BIOS_IF, 0x0001, N);
+        assert!(swi(&mut g.cpu, &mut g.bus, 0x05), "first wait parks");
+        g.bus.write16(BIOS_IF, 0x0001, N);
+        assert!(!swi(&mut g.cpu, &mut g.bus, 0x05), "first wait completes");
+
+        // A stale flag appears, then the game waits again.
+        g.bus.write16(BIOS_IF, 0x0001, N);
+        assert!(swi(&mut g.cpu, &mut g.bus, 0x05), "the new wait must not accept a stale flag");
+        assert_eq!(bios_if(&mut g), 0, "which means discarding it");
+    }
+
+    /// IntrWait forcefully enables interrupts, and a game that halted with them
+    /// masked relies on it: without this the wait could never be satisfied.
+    #[test]
+    fn intr_wait_forces_interrupts_on() {
+        let mut g = hle();
+        g.bus.write16(0x0400_0208, 0, N); // IME = 0
+        g.cpu.r[0] = 1;
+        g.cpu.r[1] = 0x0001;
+        swi(&mut g.cpu, &mut g.bus, 0x04);
+        assert_eq!(g.bus.read16(0x0400_0208, N) & 1, 1, "IME must be forced on");
+    }
 }
