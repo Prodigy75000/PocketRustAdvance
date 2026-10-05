@@ -404,8 +404,27 @@ status quo, never toward a stale word or a frozen screen.
   what this layer can answer while parked. The correctness half, `stale_risk`
   staying zero across a paced run, is test 7 and still to come.
 
-What remains from this plan: `DelayedWire`, `PacedTestCable`, and tests 3
-through 7, all of which need the pacing surface to exist.
+**The pacing itself has now landed** (`961dd88`, `10402ff`, `3424f5b`,
+`f7898c6`), with eleven tests and two corrections to this document's own design:
+
+- `on_packet` checked LENGTH before family and version, so a 9-byte version-2
+  packet was discarded as malformed and the mismatch was never counted. Two
+  devices on different builds would have seen no peer at all, which is the
+  silent failure the family and version were split apart to prevent. The same
+  bug existed a layer up in `is_cable_packet`. Family, then version, then
+  length, in both places. Section 2's claim that "the existing machinery then
+  does the right thing unmodified" was wrong.
+- The hold loop has to PUMP the transport. A held child is waiting for a packet
+  that only arrives when something calls the frontend's poll, so a loop that
+  merely waits is released by nothing but its own patience, every time, and the
+  link works slowly with a desync at the end of every wait.
+
+What remains from this plan: `PacedTestCable` over two full cores, which needs a
+decision about how to model a parent that blocks in one process. The simulation
+in `a_child_tracks_a_parent_that_is_crawling_at_the_round_trip` covers the
+arithmetic at protocol level instead, and `a_held_core_charges_every_scanline_and_pumps_while_it_waits`
+covers the core's half, but no desk test yet drives two whole cores through a
+delayed wire.
 
 
 Correction first, and then a correction to the correction. The brief for this
