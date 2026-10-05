@@ -372,7 +372,11 @@ pub unsafe extern "C" fn retro_get_system_av_info(info: *mut retro_system_av_inf
     };
     (*info).timing = retro_system_timing {
         fps: 16_777_216.0 / 280_896.0, // ~59.7275 Hz
-        sample_rate: 32_768.0,         // GBA rate; no audio produced yet
+        // Must come from the core, never a literal: this used to be a hardcoded
+        // 32768 and the APU's rate is a tuning decision that lives there. A
+        // mismatch is not a small bug, the host would pace and pitch every game
+        // wrong while both numbers looked individually reasonable.
+        sample_rate: gba_core::Gba::SAMPLE_RATE as f64,
     };
 }
 
@@ -947,8 +951,9 @@ pub extern "C" fn retro_run() {
             }
         }
 
-        // Feed this frame's audio (interleaved stereo i16). Silent for now, but
-        // emitted at the correct rate so the host paces us to real time.
+        // Feed this frame's audio (interleaved stereo i16), at the rate reported
+        // in retro_get_system_av_info, which is how the host paces us to real
+        // time.
         if let (Some(gba), Some(audio)) = (&mut s.gba, s.audio_batch) {
             let samples = gba.take_audio();
             if !samples.is_empty() {

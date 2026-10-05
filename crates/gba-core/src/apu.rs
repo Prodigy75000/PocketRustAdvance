@@ -5,10 +5,17 @@
 //! hardware) plus the two 8-bit Direct Sound FIFO channels. Implemented from
 //! GBATEK's register maps and frequency formulas.
 //!
-//! Output is interleaved-stereo `i16` at 32768 Hz. The GBA system clock is
-//! 16_777_216 Hz, so one output sample is produced every 512 system cycles
-//! exactly. [`Apu::generate`] advances the channel state in 512-cycle chunks and
-//! pushes one stereo frame per chunk; the front-end drains [`Apu::take_output`].
+//! Output is interleaved-stereo `i16` at 65536 Hz. The GBA system clock is
+//! 16_777_216 Hz, so one output sample is produced every 256 system cycles
+//! exactly. [`Apu::generate`] advances the channel state in sub-sample chunks and
+//! pushes one stereo frame per output sample; the front-end drains
+//! [`Apu::take_output`].
+//!
+//! 65536 Hz is what gpSP and mGBA both emit, and the rate is not cosmetic. At
+//! 32768 Hz the top octave is unreachable, the 2-tap smoothing below costs about
+//! 5 dB at 10 kHz instead of 1, and several standard GBA sound-driver rates
+//! (36314, 40137, 42048 Hz) are above Nyquist and get decimated rather than
+//! resampled.
 //!
 //! Direct Sound: each FIFO is popped one byte per selected-timer overflow. The
 //! pop times are scheduled analytically from the timer period the bus passes in,
@@ -18,13 +25,20 @@
 
 use crate::state::{Reader, Writer};
 
-const CYCLES_PER_SAMPLE: u64 = 512;
+const CYCLES_PER_SAMPLE: u64 = 256;
 /// Internal oversampling: the mixer is sampled this many times per output sample
-/// and box-averaged down. This band-limits the zero-order-hold steps of the 8-bit
-/// Direct Sound PCM and the PSG square edges, and averages out the small jitter
-/// when a channel's rate isn't a clean divisor of the output grid, which is what
-/// otherwise reads as a sprinkle of static. 512 / 4 = 128 cycles per sub-sample.
-const OVERSAMPLE: u64 = 4;
+/// and box-averaged down. This band-limits the PSG square edges and averages out
+/// the small jitter when a channel's rate isn't a clean divisor of the output
+/// grid, which is what otherwise reads as a sprinkle of static. 256 / 2 = 128
+/// cycles per sub-sample, so the mixer still sees 131072 Hz.
+///
+/// **It was 4 when the output was 32768 Hz, and 4 buys nothing here.** Measured
+/// side by side at 65536 Hz: the between-harmonic noise floor is -25.6 dB either
+/// way and the band shares agree to within 0.03 points, while 4 costs 5.5% of
+/// frame time (703-715 us against 672-679). Doubling the output rate already
+/// moved the images an octave up, which is the job the extra sub-samples were
+/// doing. Raising this again needs a measurement that shows it earning something.
+const OVERSAMPLE: u64 = 2;
 const SUB_CYCLES: u64 = CYCLES_PER_SAMPLE / OVERSAMPLE;
 /// System cycles per 512 Hz frame-sequencer tick (16_777_216 / 512).
 const FS_PERIOD: u32 = 32_768;
@@ -1238,6 +1252,26 @@ mod tests {
             assert!(peak > 500, "volume {volume} should produce a waveform, peak {peak}");
             assert_eq!(sum, 0, "volume {volume} dragged a centred waveform off centre");
         }
+    }
+
+    /// The rate the front-end is told has to be the rate we actually emit.
+    ///
+    /// These are two constants in two files, and the libretro layer had a third
+    /// hardcoded copy until this change. If they drift, every game is paced and
+    /// pitched wrong while each number still looks reasonable on its own, which is
+    /// the kind of bug that survives a listen because it sounds like the game.
+    #[test]
+    fn the_advertised_sample_rate_is_the_rate_we_emit() {
+        assert_eq!(
+            crate::SAMPLE_RATE * CYCLES_PER_SAMPLE,
+            16_777_216,
+            "SAMPLE_RATE and CYCLES_PER_SAMPLE disagree about the GBA clock"
+        );
+        // And the APU really does emit at that rate: one stereo frame per
+        // CYCLES_PER_SAMPLE cycles, counted rather than assumed.
+        let mut a = Apu::new();
+        a.generate([None, None], CYCLES_PER_SAMPLE * 100);
+        assert_eq!(a.out.len(), 200, "expected 100 stereo frames, got {}", a.out.len() / 2);
     }
 
     /// SOUNDBIAS has to come up centred. With a bias of zero the clip in

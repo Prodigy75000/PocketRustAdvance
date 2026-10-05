@@ -41,9 +41,10 @@ pub enum Button {
 }
 
 /// A whole console: the CPU plus the system bus.
-/// Audio output rate. The GBA's own sound hardware runs at 32768 Hz; the value
-/// only needs to match [`Gba::SAMPLE_RATE`] and the AV-info the front-end reads.
-const SAMPLE_RATE: u64 = 32_768;
+/// Audio output rate, and the single source of truth for it: [`Gba::SAMPLE_RATE`]
+/// re-exports this and the libretro layer's AV-info reads that, so the two cannot
+/// drift. It must equal `16_777_216 / apu::CYCLES_PER_SAMPLE`.
+const SAMPLE_RATE: u64 = 65_536;
 
 pub struct Gba {
     pub cpu: Arm7tdmi,

@@ -505,12 +505,21 @@ fn main() {
         // eyeballed. Off by default because reading the framebuffer back would
         // perturb the benchmark.
         let want_hash = std::env::var_os("GBA_FBHASH").is_some();
+        // GBA_FBHASH=last hashes only the FINAL frame. The cumulative hash above
+        // catches a one-scanline shift anywhere in 900 frames, which is the right
+        // sensitivity for proving a renderer refactor inert but far too strict for
+        // a change that legitimately moves timing: it cannot tell "ends in the
+        // same place" from "broken". This is the follow-up question.
+        let last_only = std::env::var_os("GBA_FBHASH").is_some_and(|v| v == *"last");
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let t1 = std::time::Instant::now();
         for f in 0..measured {
             press(&mut gba, warmup + f);
             let fb = gba.run_frame();
             if want_hash {
+                if last_only {
+                    hash = 0xcbf2_9ce4_8422_2325;
+                }
                 for &px in fb.iter() {
                     hash ^= px as u64;
                     hash = hash.wrapping_mul(0x100_0000_01b3);
