@@ -386,6 +386,28 @@ status quo, never toward a stale word or a frozen screen.
 
 ## 6. Desk test plan
 
+**Status, 2026-10-05: tests 1 and 2 have landed, before any pacing code.**
+
+- `nine_transfers_land_inside_one_emulated_frame` (`6af1c8c`): nine transfers
+  28672 cycles apart inside one 280896-cycle frame, both cores stepped a
+  scanline at a time with the test playing both interrupt handlers. **Proven to
+  fail by putting the reverted 12 ms floor back**, where it stops at "transfer 1
+  is due at line 24 and the previous one is still busy", the game's own
+  complaint reproduced on the desk in 30 ms. The nine-FRAME test stays green
+  under that same change, which is why it was never evidence about this.
+- `a_parked_child_answers_two_clocks_with_the_word_armed_for_the_first` and
+  `a_child_that_collects_each_transfer_is_never_counted_as_at_risk`
+  (`7043c7a`): the hazard pinned down against today's code, plus the
+  `stale_risk` counter of section 4 layer 3, on the heartbeat as
+  `cable_stale_risk`. The first asserts the stale answer rather than a
+  corrected one on purpose: pacing removes the parked child, it does not change
+  what this layer can answer while parked. The correctness half, `stale_risk`
+  staying zero across a paced run, is test 7 and still to come.
+
+What remains from this plan: `DelayedWire`, `PacedTestCable`, and tests 3
+through 7, all of which need the pacing surface to exist.
+
+
 Correction first, and then a correction to the correction. The brief for this
 document named an existing test `a_nine_transfer_pokemon_frame_runs_end_to_end`
 and it was absent from HEAD, which is what the survey above reported. The
