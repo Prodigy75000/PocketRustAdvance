@@ -249,6 +249,35 @@ impl Gba {
                     rfu.frame_update();
                 }
             }
+            // Cable pacing, charged and checked before any of this scanline's
+            // emulated work.
+            //
+            // A scanline boundary is the only place a child can wait. Blocking
+            // where the game is mid-transfer would leave it holding one word
+            // while several clocks arrive, and it would answer them all with
+            // that word: a corrupted trade over a wire that looks perfect. The
+            // cable's own park predicate adds the other half, that its queue is
+            // empty, so a parked child has always serviced the last transfer and
+            // its game has armed the next word.
+            //
+            // Charging here and asking immediately after means the budget being
+            // tested is the one this scanline will spend, not the one the last
+            // one did. A parent's `advance` never holds; it is how a parent knows
+            // when to put its position on the wire.
+            if self.bus.cable.is_some() && self.bus.multi_mode() {
+                let per_line = ppu::CYCLES_PER_LINE as u32;
+                self.bus.cable.as_mut().unwrap().advance(per_line);
+                // The transport only receives when something pumps it, and while
+                // this core is held nothing else will: the packet that releases
+                // it arrives through `poll`.
+                while self.bus.cable.as_mut().unwrap().hold() {
+                    for (from, bytes) in poll() {
+                        if let Some(rfu) = self.bus.rfu.as_mut() {
+                            rfu.net_receive(&bytes, from);
+                        }
+                    }
+                }
+            }
             self.bus.line_cycle_base = self.bus.cycles;
             self.bus.audio_line_base = self.audio_clock;
             self.bus.ppu.begin_line(line);
@@ -1155,6 +1184,107 @@ mod tests {
 
         assert_eq!(parent.cable_stats(), (9, 0), "nine completed, none lost");
         assert_eq!(child.cable_stats(), (9, 0));
+    }
+
+    /// The core's pacing hook: charge every scanline, and pump the transport
+    /// while held.
+    ///
+    /// The second half is the one that can fail silently. A held child is waiting
+    /// for a packet that only arrives when something calls the frontend's poll,
+    /// and if the hold loop does not do that, the only thing that can release it
+    /// is its own patience running out. The link would then work, slowly, and
+    /// with a desync at the end of every wait, which is close to the hardest
+    /// possible symptom to attribute.
+    #[test]
+    fn a_held_core_charges_every_scanline_and_pumps_while_it_waits() {
+        use crate::bus::{Access::NonSeq as N, Bus};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct Script {
+            advances: Vec<u32>,
+            holds_left: u32,
+            asks: u32,
+        }
+
+        struct ScriptedCable(Rc<RefCell<Script>>);
+
+        impl crate::cable::LinkCable for ScriptedCable {
+            fn units(&self) -> u8 {
+                2
+            }
+            fn id(&self) -> u8 {
+                1 // a child: the only role that is ever held
+            }
+            fn set_output(&mut self, _word: u16) {}
+            fn parent_start(&mut self, _own: u16) {}
+            fn parent_result(&mut self) -> Option<[u16; crate::cable::MAX_UNITS]> {
+                None
+            }
+            fn child_clock(&mut self) -> Option<(u16, u16)> {
+                None
+            }
+            fn flush(&mut self) {}
+            fn advance(&mut self, cycles: u32) {
+                self.0.borrow_mut().advances.push(cycles);
+            }
+            fn hold(&mut self) -> bool {
+                let mut s = self.0.borrow_mut();
+                s.asks += 1;
+                if s.holds_left == 0 {
+                    return false;
+                }
+                s.holds_left -= 1;
+                true
+            }
+        }
+
+        // Returns what the cable saw, how often the transport was pumped, and the
+        // emulated cycles the frame cost.
+        let run = |holds: u32| -> (Script, u32, u64) {
+            let script = Rc::new(RefCell::new(Script { holds_left: holds, ..Script::default() }));
+            let mut rom = vec![0u8; 0x200];
+            rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+            let mut gba = Gba::new(rom, Vec::new());
+            gba.render_enabled = false;
+            gba.connect_cable(Box::new(ScriptedCable(Rc::clone(&script))));
+            gba.bus.write16(0x0400_0134, 0x0000, N);
+            gba.bus.write16(0x0400_0128, 0x2000 | 3, N); // Multi-Player, 115200
+
+            let polls = Rc::new(RefCell::new(0u32));
+            let p = Rc::clone(&polls);
+            let before = gba.bus.cycles;
+            gba.run_frame_polling(&mut || {
+                *p.borrow_mut() += 1;
+                Vec::new()
+            });
+            let seen = std::mem::take(&mut *script.borrow_mut());
+            let pumped = *polls.borrow();
+            let spent = gba.bus.cycles - before;
+            (seen, pumped, spent)
+        };
+
+        let (s, polls, cycles) = run(5);
+        // The control: the same core, nothing held. A frame costs slightly more
+        // than 280896 cycles because the last instruction of each half-scanline
+        // can overshoot its target, so the number to compare against is this run,
+        // not the nominal frame length.
+        let (_, control_polls, control_cycles) = run(0);
+        assert_eq!(s.advances.len(), 228, "one charge per scanline of the frame");
+        assert!(
+            s.advances.iter().all(|&c| c == 1232),
+            "and each charge is a scanline of 1232 cycles"
+        );
+        assert_eq!(s.asks, 228 + 5, "asked once per scanline, plus once per hold");
+        assert_eq!(
+            polls, control_polls + 5,
+            "the transport must be pumped inside the hold, or nothing can release it"
+        );
+        assert_eq!(
+            cycles, control_cycles,
+            "and holding costs wall time, never emulated time"
+        );
     }
 
     /// Nine transfers inside ONE emulated frame, at the interval the game uses.
