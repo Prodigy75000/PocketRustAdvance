@@ -102,6 +102,26 @@ pub const TRANSFER_CYCLES: [[u32; MAX_UNITS]; 4] = [
 /// together, which is what [`LinkCable::wait_for_clock`] is for. A trade runs at
 /// about 14 fps and completes, instead of running at 60 and failing.
 
+/// What still has to be solved, so the next session starts from the finding and
+/// not from the idea: **the two emulated clocks have to be held together, and
+/// that cannot be done from a signal local to one device.**
+///
+/// Tried and reverted: blocking a child as soon as its game writes SIOMLT_SEND.
+/// That write means "the next word is ready", NOT "I am waiting", and the game
+/// goes on to do a whole frame of other work after it. Measured on device: the
+/// child fell to 6.6 fps against a parent at 56.7, which is the first test's
+/// ninefold divergence pointing the other way. A readiness signal is not a
+/// waiting signal.
+///
+/// The information that actually decides it is the PARENT'S emulated frame
+/// count, which only the parent has, so it has to go on the wire. A child
+/// throttles at a frame boundary only while it is ahead. During the handshake
+/// both ends run at 60 fps, the counts stay level and nothing throttles; in
+/// connected mode the parent slows to the round trip and the child is held to
+/// match. Note the hazard that rules out blocking mid-frame: a child blocked
+/// while several clocks arrive answers them all from one `own_output`, which
+/// corrupts a trade while leaving the wire looking perfectly healthy.
+///
 /// Units one Multi-Player bus can hold, which is also the number of SIOMULTI
 /// slots.
 pub const MAX_UNITS: usize = 4;
@@ -143,25 +163,6 @@ pub trait LinkCable {
     /// with, not whatever SIOMLT_SEND holds by the time its emulation catches
     /// up.
     fn child_clock(&mut self) -> Option<(u16, u16)>;
-    /// Child: BLOCK until the parent clocks the next transfer, or give up.
-    ///
-    /// This is what keeps the two emulated clocks together, and it is needed
-    /// because the game's expectation and the network's speed cannot both be
-    /// met at 60 fps. Nine transfers a frame at an 8 ms round trip is 72 ms of
-    /// network inside a frame the game thinks lasts 16.7 ms, so the frame has to
-    /// stretch, and it has to stretch on BOTH devices or their protocol clocks
-    /// diverge. Measured ninefold divergence is what failed the first device
-    /// test: parent at 6.7 fps, child at a flat 59.7.
-    ///
-    /// Only called once the child's game has written SIOMLT_SEND for the next
-    /// transfer, so the game itself says when it is ready rather than us
-    /// guessing a cycle budget. That matters: block too early and the interrupt
-    /// handler never gets to prepare the word, so the child answers every
-    /// transfer with the same stale value.
-    ///
-    /// `None` means nothing arrived in time, which releases the child to run on
-    /// and reach its own link-error path rather than hanging.
-    fn wait_for_clock(&mut self) -> Option<(u16, u16)>;
     /// Throw away transfers in flight, because the game just selected
     /// Multi-Player mode and anything from before that is not addressed to the
     /// protocol it is about to run.
@@ -578,12 +579,6 @@ impl LinkCable for LocalCable {
 
     fn child_clock(&mut self) -> Option<(u16, u16)> {
         self.wire.borrow_mut().to_child.pop_front()
-    }
-
-    /// Never actually blocks: the two cores share memory and run on one thread,
-    /// so there is nobody to wait for. A desk test must not be able to hang.
-    fn wait_for_clock(&mut self) -> Option<(u16, u16)> {
-        self.child_clock()
     }
 
     fn flush(&mut self) {
