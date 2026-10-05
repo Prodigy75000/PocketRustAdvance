@@ -762,11 +762,19 @@ pub extern "C" fn retro_run() {
                 log_line(
                     s.log,
                     &format!(
-                        "[cable] {} self_id={}",
+                        "[cable] {} self_id={} (the role is elected on the wire, not from this)",
                         if want { "attached" } else { "detached" },
                         netpacket::self_id()
                     ),
                 );
+            }
+            if gba.cable_attached() {
+                // Announce our identity until the roles are settled, and flush
+                // whatever the cable queued. Once per frame, from here, because
+                // `np_start` cannot send (the host holds a mutex across it) and
+                // the per-scanline charge only runs in Multi-Player mode, which
+                // the game will not enter until the election has given it a peer.
+                netpacket::cable_keepalive();
             }
         }
 

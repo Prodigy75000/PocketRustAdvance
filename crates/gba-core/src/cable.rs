@@ -468,9 +468,7 @@ pub struct CableProto {
     peer_identity: Option<u64>,
     /// Identities that arrived equal to ours, so one of them had to move.
     pub election_ties: u64,
-    /// Cycles since the last identity announcement, so hellos repeat at most once
-    /// a frame while the roles are unsettled.
-    since_hello: u32,
+
 }
 
 impl Default for CableProto {
@@ -513,7 +511,6 @@ impl CableProto {
             identity: 0,
             peer_identity: None,
             election_ties: 0,
-            since_hello: 0,
         }
     }
 
@@ -552,7 +549,6 @@ impl CableProto {
         // would only add a chance of colliding with the one we already sent.
         self.peer_identity = None;
         self.election_ties = 0;
-        self.since_hello = 0;
     }
 
     /// What this unit presents on the bus.
@@ -692,7 +688,6 @@ impl CableProto {
 
     /// Queue an identity announcement.
     pub fn say_hello(&mut self) {
-        self.since_hello = 0;
         let mut pkt = [0u8; PACKET_LEN];
         let hi = (self.identity >> 32) as u16;
         let lo = self.identity as u32;
@@ -702,12 +697,18 @@ impl CableProto {
 
     /// Say hello again if the roles are still unsettled. Returns whether it did.
     ///
-    /// Rate-limited by the caller, which knows about wall time. One packet a
-    /// frame until the peer answers is nothing next to a transfer every 28672
-    /// cycles, and it has to repeat because the first one can be lost while the
-    /// peer's session is still starting.
-    pub fn maybe_hello(&mut self) -> bool {
-        if self.peer_identity.is_some() || self.identity == 0 || self.since_hello < HORIZON {
+    /// **Driven by the FRONT-END's frames, not by emulated cycles, and that is not
+    /// a detail.** The emulated-cycle version only ran while the game had selected
+    /// Multi-Player mode, and the game will not select it until it sees a partner,
+    /// which it cannot do until the election completes. The election has to work
+    /// with no emulated time passing at all, which
+    /// `the_roles_settle_without_the_game_ever_entering_multi_player_mode` pins
+    /// down.
+    ///
+    /// It repeats because the first announcement can go out while the peer's
+    /// session is still coming up, and a lost one must not leave the pair silent.
+    pub fn hello_tick(&mut self) -> bool {
+        if self.peer_identity.is_some() || self.identity == 0 {
             return false;
         }
         self.say_hello();
@@ -740,7 +741,6 @@ impl CableProto {
     /// child never asks.
     pub fn advance(&mut self, cycles: u32) {
         self.local_cycles = self.local_cycles.wrapping_add(cycles);
-        self.since_hello = self.since_hello.saturating_add(cycles);
         if !self.engaged {
             return;
         }
@@ -1329,6 +1329,38 @@ mod tests {
         );
     }
 
+    /// The election must complete with no emulated time passing at all.
+    ///
+    /// The chicken and egg that broke the first build of this: the bus reports one
+    /// unit until the roles are settled, so the game reads SD low and never
+    /// selects Multi-Player mode, and the cable is only charged with emulated
+    /// cycles WHILE that mode is selected. An election driven by emulated time can
+    /// therefore never start. This drives it the way the front-end does, one tick
+    /// per displayed frame, and calls `advance` zero times.
+    #[test]
+    fn the_roles_settle_without_the_game_ever_entering_multi_player_mode() {
+        let mut w = Wire::new();
+        w.proto[0].set_identity(0x0000_0000_0100);
+        w.proto[1].set_identity(0x0000_0000_0200);
+        // Not one cycle of emulated time, and the first announcements are lost.
+        w.drop_all(0);
+        w.drop_all(1);
+        for frame in 0..3 {
+            let (a, b) = (w.proto[0].hello_tick(), w.proto[1].hello_tick());
+            if frame == 0 {
+                assert!(a && b, "both lost their first hello, so both must ask again");
+            }
+            w.deliver(0);
+            w.deliver(1);
+        }
+        assert!(
+            !w.proto[0].hello_tick() && !w.proto[1].hello_tick(),
+            "and once settled neither keeps announcing"
+        );
+        assert_eq!(w.proto[0].role(), Some(0));
+        assert_eq!(w.proto[1].role(), Some(1));
+    }
+
     /// The order the hellos arrive in must not change the outcome.
     #[test]
     fn the_election_does_not_depend_on_who_spoke_first() {
@@ -1381,18 +1413,14 @@ mod tests {
         a.set_identity(0x0000_0000_0007);
         a.take_outbox(); // the announcement set_identity queued
 
-        assert!(!a.maybe_hello(), "and not again in the same frame");
-        for _ in 0..228 {
-            a.advance(1232);
-        }
-        assert!(a.maybe_hello(), "still unsettled a frame later, so it asks again");
+        assert!(a.hello_tick(), "still unsettled, so the next frame asks again");
         assert_eq!(a.take_outbox().len(), 1, "one announcement per frame, not a flood");
 
         let mut peer = [0u8; PACKET_LEN];
         put(&mut peer, TAG_HELLO, 0, 0, 0, 9);
         a.on_packet(&peer);
         assert_eq!(a.role(), Some(0), "identity 7 against 9 makes us the parent");
-        assert!(!a.maybe_hello(), "settled, so it stops");
+        assert!(!a.hello_tick(), "settled, so it stops");
     }
 
     /// A peer that restarts its session with a new identity is re-elected.

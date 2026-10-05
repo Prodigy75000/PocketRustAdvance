@@ -278,7 +278,14 @@ unsafe extern "C" fn np_start(client_id: u16, send: SendFn, poll_receive: PollRe
             .wrapping_add(std::process::id() as u64);
         n.cable.set_identity(nonce);
     });
-    flush_cable_outbox();
+    // **Nothing is sent from here, and that is not an optimisation.** The host
+    // calls this from `start_locked` while holding the same non-recursive mutex
+    // that `send_fn` takes, so sending from inside this callback is a self
+    // deadlock. It froze the app on the phone for ten seconds, which Android
+    // reported as an ANR against MainActivity, with no heartbeat at all because
+    // the emulator never reached its sixtieth frame. The announcement
+    // `set_identity` queued goes out from `cable_keepalive` on the next frame,
+    // which is inside `retro_run`, where libretro expects a core to send.
 }
 
 unsafe extern "C" fn np_receive(buf: *const c_void, len: usize, client_id: u16) {
@@ -336,6 +343,22 @@ unsafe extern "C" fn np_stop() {
         n.inbox.clear();
         n.reset_cable();
     });
+}
+
+/// Once per frame, from `retro_run`: announce our identity while the roles are
+/// unsettled, and put anything the cable has queued on the wire.
+///
+/// This exists because of two things that are each true and together leave a
+/// hole. Identity announcements cannot go out from `np_start`, where the host
+/// holds a mutex that sending would deadlock on. And they cannot be driven by
+/// emulated time either, because the cable is only charged with cycles while the
+/// game is in Multi-Player mode, which the game will not enter until the election
+/// has told it there is a partner. So the front-end's own frame is the only clock
+/// that works, and `retro_run` is where libretro says a core may send.
+pub fn cable_keepalive() {
+    let said_hello = with_net(|n| n.active && n.cable.hello_tick());
+    let _ = said_hello;
+    flush_cable_outbox();
 }
 
 /// Is a netplay session live?
@@ -490,19 +513,17 @@ impl LinkCable for NetCable {
     /// transport concern: the core only says how much time passed. A child's
     /// `advance` sends nothing.
     fn advance(&mut self, cycles: u32) {
-        let send = with_net(|n| {
+        // A tick is a PARENT'S position, so only an elected parent may send one:
+        // an unsettled end emitting ticks would feed its peer's pacing budget
+        // while claiming a role it has not got. The identity announcements are not
+        // here at all, because this runs only while the game is in Multi-Player
+        // mode and the game will not enter that mode until the election has
+        // already given it a partner. See `cable_keepalive`.
+        let ticked = with_net(|n| {
             n.cable.advance(cycles);
-            // A tick is a PARENT'S position, so only an elected parent may send
-            // one: an unsettled end emitting ticks would feed its peer's pacing
-            // budget while claiming a role it has not got.
-            let ticked = n.cable.role() == Some(0) && n.cable.maybe_tick();
-            // And while unsettled, say hello once a frame until the peer answers.
-            // The first announcement can go out while the peer's session is still
-            // coming up, and a lost one must not leave the pair silent forever.
-            let said_hello = n.cable.maybe_hello();
-            ticked || said_hello
+            n.cable.role() == Some(0) && n.cable.maybe_tick()
         });
-        if send {
+        if ticked {
             flush_cable_outbox();
         }
     }
