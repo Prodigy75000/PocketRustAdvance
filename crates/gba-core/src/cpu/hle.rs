@@ -21,7 +21,7 @@ const N: Access = Access::NonSeq;
 /// PC (a branch, e.g. SoftReset) and the pipeline must be refilled.
 pub fn swi<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, num: u8) -> bool {
     match num {
-        0x00 => return soft_reset(cpu),
+        0x00 => return soft_reset(cpu, bus),
         0x01 => register_ram_reset(cpu, bus),
         0x02 | 0x03 => bus.set_halted(true), // Halt / Stop
         0x04 => return intr_wait(cpu, bus),
@@ -53,15 +53,46 @@ pub fn swi<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, num: u8) -> bool {
     false
 }
 
-/// SWI 00h SoftReset: jump back to 0x02000000 or 0x08000000 per the flag byte at
-/// 0x03007FFA, reset the stacks, and enter System mode.
-fn soft_reset(cpu: &mut Arm7tdmi) -> bool {
-    // The flag is written before calling; default (0) => cartridge at 0x08000000.
-    // We read it lazily via the register the caller staged is not available, so
-    // default to the ROM entry (the common case for a boot-time soft reset).
-    cpu.r[13] = 0x0300_7F00; // SP_usr/sys
-    cpu.write_cpsr((cpu.cpsr & !0x1F) | 0x1F); // System mode
-    cpu.r[15] = 0x0800_0000;
+/// SWI 00h SoftReset, per GBATEK, and taken over even when a BIOS IS present.
+///
+/// **This is what stops the bundled open BIOS showing its boot logo mid-game.**
+/// Normmatt's BIOS implements SoftReset by re-entering its own reset path, which
+/// replays the boot animation; real hardware does not, it goes straight back to
+/// the entry point. Measured: with the open BIOS a SoftReset puts 29% of the
+/// following frames' instructions inside the BIOS, against 0% here. gpSP bundles
+/// the same BIOS, which is why the owner has seen the same logo there.
+///
+/// Taking a BIOS call over is normally the wrong move, for the reason written on
+/// [`patch_div`]: returning instantly where the BIOS burns a loop gives a timing
+/// profile neither a real BIOS nor full HLE has. SoftReset is the case where that
+/// does not apply. It happens once, it discards all machine state by definition,
+/// and nothing can be timing-coupled to a reset that is about to zero the stacks.
+///
+/// GBATEK: zero 0x200 bytes at 0x03007E00, set the three stack pointers, clear
+/// r0-r12 and the banked LR/SPSR for Supervisor and IRQ, enter System mode, and
+/// jump per the flag byte at 0x03007FFA (0 = ROM, else EWRAM).
+fn soft_reset<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B) -> bool {
+    // Read the entry flag BEFORE zeroing, since it lives inside the cleared area.
+    let flag = bus.read8(0x0300_7FFA, N);
+    let entry = if flag == 0 { 0x0800_0000 } else { 0x0200_0000 };
+
+    for off in (0..0x200u32).step_by(4) {
+        bus.write32(0x0300_7E00 + off, 0, N);
+    }
+
+    let mut r = [0u32; 16];
+    r[13] = 0x0300_7F00; // SP_usr/sys
+    r[15] = entry;
+    cpu.load_full(
+        0x1F,              // System mode, IRQ/FIQ unmasked, ARM state
+        r,
+        [0; 7],            // FIQ bank
+        [0x0300_7FE0, 0],  // SP_svc, LR_svc
+        [0; 2],            // Abort bank
+        [0x0300_7FA0, 0],  // SP_irq, LR_irq
+        [0; 2],            // Undefined bank
+        [0; 5],            // every SPSR
+    );
     true
 }
 
@@ -205,6 +236,11 @@ fn divide_by_zero(cpu: &mut Arm7tdmi, number: i32) -> bool {
 /// the case hardware itself defines. The third-party binary stays untouched.
 ///
 /// Returns true when the call was answered and must not reach the vector.
+/// SWI 00h is handled here even with a BIOS loaded: see [`soft_reset`].
+pub fn patch_soft_reset<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, num: u8) -> bool {
+    num == 0x00 && soft_reset(cpu, bus)
+}
+
 pub fn patch_div(cpu: &mut Arm7tdmi, num: u8) -> bool {
     let (number, denom) = match num {
         0x06 => (cpu.r[0] as i32, cpu.r[1] as i32),
@@ -731,6 +767,52 @@ mod tests {
         g.bus.write16(BIOS_IF, 0x0001, N);
         assert!(swi(&mut g.cpu, &mut g.bus, 0x05), "the new wait must not accept a stale flag");
         assert_eq!(bios_if(&mut g), 0, "which means discarding it");
+    }
+
+
+    /// SoftReset must not reach the BIOS even when one is loaded. That is the
+    /// whole point: Normmatt's BIOS replays its boot animation here, which is the
+    /// logo the owner sees mid-game, and real hardware shows nothing.
+    #[test]
+    fn soft_reset_never_enters_the_bios_even_with_one_loaded() {
+        // A BIOS whose SWI vector is an endless loop: if SoftReset reaches it,
+        // the machine parks there and never returns to the cartridge.
+        let mut bios = vec![0u8; 0x4000];
+        bios[8..12].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes()); // 0x08: b .
+        let mut rom = vec![0u8; 0x2000];
+        rom[0..4].copy_from_slice(&0xEF00_0000u32.to_le_bytes()); // swi #0
+        let mut g = crate::Gba::new(rom, bios);
+        g.run_frame();
+        assert_eq!(g.bios_steps, 0, "SoftReset must never vector into the BIOS");
+        assert!(g.cpu.r[15] >= 0x0800_0000, "and must land back in the cartridge");
+    }
+
+    /// The entry point is the flag byte at 0x03007FFA, not a constant: 0 is the
+    /// cartridge, anything else is EWRAM. Games that stage code in EWRAM and
+    /// reset into it depend on this.
+    #[test]
+    fn soft_reset_honours_the_entry_flag() {
+        for (flag, want) in [(0u8, 0x0800_0000u32), (1, 0x0200_0000)] {
+            let mut g = hle();
+            g.bus.write8(0x0300_7FFA, flag, N);
+            soft_reset(&mut g.cpu, &mut g.bus);
+            assert_eq!(g.cpu.r[15], want, "flag {flag} should enter at {want:08X}");
+        }
+    }
+
+    /// GBATEK: 0x200 bytes at 0x03007E00 are cleared, the stacks are reset and
+    /// System mode is entered. A game relying on a clean stack after a reset gets
+    /// a dirty one otherwise.
+    #[test]
+    fn soft_reset_clears_the_stack_area_and_resets_the_stacks() {
+        let mut g = hle();
+        g.bus.write32(0x0300_7E00, 0xDEAD_BEEF, N);
+        g.bus.write32(0x0300_7FFC, 0xDEAD_BEEF, N);
+        soft_reset(&mut g.cpu, &mut g.bus);
+        assert_eq!(g.bus.read32(0x0300_7E00, N), 0, "start of the cleared area");
+        assert_eq!(g.bus.read32(0x0300_7FFC, N), 0, "end of the cleared area");
+        assert_eq!(g.cpu.r[13], 0x0300_7F00, "SP_sys");
+        assert_eq!(g.cpu.cpsr & 0x1F, 0x1F, "System mode");
     }
 
     /// IntrWait forcefully enables interrupts, and a game that halted with them

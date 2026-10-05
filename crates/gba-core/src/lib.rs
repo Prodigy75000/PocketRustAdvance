@@ -1197,8 +1197,13 @@ mod tests {
         );
 
         // Cartridge B vectors into the BIOS on its first instruction and stays.
+        // Any SWI the core does not handle itself will do; SWI 08h (Sqrt) is one.
+        // It CANNOT be SWI 00h, which this test used to use: SoftReset is now
+        // taken over in `hle::soft_reset` even when a BIOS is loaded, so it never
+        // reaches the vector. That is the point of the interception, not a
+        // regression in what this test is actually about, which is `bios_steps`.
         let mut rom = vec![0u8; 0x2000];
-        rom[0..4].copy_from_slice(&0xEF00_0000u32.to_le_bytes()); // swi #0
+        rom[0..4].copy_from_slice(&0xEF08_0000u32.to_le_bytes()); // swi #8 (Sqrt)
         let mut b = Gba::new(rom, bios);
         b.run_frame();
         assert!(

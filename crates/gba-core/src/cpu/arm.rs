@@ -187,6 +187,11 @@ fn software_interrupt<B: Bus>(cpu: &mut Arm7tdmi, bus: &mut B, op: u32) -> bool 
     // The bundled open BIOS gets Div wrong twice: it hangs on 0/0, and it never
     // writes r3, which the contract says is abs(quotient). Both are repaired
     // around the BIOS rather than instead of it. See hle::patch_div.
+    // SoftReset is taken over even with a BIOS present: the bundled open BIOS
+    // replays its boot animation here and hardware does not.
+    if super::hle::patch_soft_reset(cpu, bus, num) {
+        return true;
+    }
     if super::hle::patch_div(cpu, num) {
         return false;
     }
