@@ -8,5 +8,10 @@ description = "A clean-room Game Boy Advance emulator core, written from scratch
 name = "gba_core"
 path = "src/lib.rs"
 
+# No dependencies, deliberately. The core was written against GBATEK with no
+# external crates, and it used to carry an unused path dependency on
+# `pocketrust-common` that pointed OUTSIDE this repository, at an umbrella
+# sibling with no git remote. That made the published repo unbuildable by anyone
+# who did not already have that directory, which TH-iOS hit on the first clean
+# clone. Nothing in src/ ever referenced it.
 [dependencies]
-pocketrust-common = { path = "../../../pocketrust-common" }
