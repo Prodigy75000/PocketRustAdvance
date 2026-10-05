@@ -79,44 +79,28 @@ pub const TRANSFER_CYCLES: [[u32; MAX_UNITS]; 4] = [
     [3140, 5755, 8376, 10486],     // 115200 bps
 ];
 
-/// The shortest a cable transfer is allowed to take, in cycles.
+/// Why there is no "make the transfer longer" fix, recorded so nobody tries it
+/// again: it was tried, on device, and the arithmetic forbids it.
 ///
-/// **This is an emulation concession to transport latency, not hardware.** At the
-/// real 115200 baud a transfer is 5755 cycles, 343 us, and Pokemon issues nine of
-/// them per video frame. A networked cable cannot complete one without the peer's
-/// word, so nine round trips have to fit inside a 16.7 ms frame: 1.8 ms each.
-/// Measured between the owner's two devices on his own Wi-Fi, a round trip is
-/// 6.0 ms min, 8.1 ms mean, 10.7 ms max. Nine of those is 72 ms, which is four
-/// and a half frames, so at hardware pacing the parent CANNOT keep 60 fps and
-/// does not: measured 6.7 fps while the child sat at 59.7, and the two games'
-/// emulated clocks diverged ninefold until the link failed.
+/// A networked transfer cannot complete without the peer's word, so each one
+/// costs a round trip. Measured between the owner's two devices on his own
+/// Wi-Fi: 6.0 ms min, 8.1 ms mean, 10.7 ms max, 0% loss, with Android already
+/// holding WIFI_MODE_FULL_LOW_LATENCY. Pokemon's connected mode issues NINE
+/// transfers per video frame.
 ///
-/// So the line is modelled as what it actually is, a slow one. Stretching a
-/// transfer to 12 ms of EMULATED time means the parent spends the round trip
-/// emulating rather than blocking, and the wait disappears into work it had to do
-/// anyway. Both ends derive the same floor from this same constant, which is why
-/// it is here and not in the transport: if the two disagreed on how long a
-/// transfer takes, their protocol clocks would drift apart, which is the failure
-/// this exists to prevent.
+/// Stretching the emulated transfer so the round trip hides inside it needs each
+/// transfer to last longer than 8 ms. Letting the game fit nine of them into one
+/// 280896-cycle frame needs each to last less than 1.86 ms. **Both cannot hold.**
+/// Tried at 12 ms: both devices held 60 fps and the game said "we have a
+/// transmission error" the instant it entered connected mode, because its
+/// nine-word frame now needed six and a half video frames. Our cable was
+/// blameless, with 8827 transfers completed on each end, counts agreeing to the
+/// digit, and not one give-up or retransmit.
 ///
-/// The cost is protocol throughput: about 1.4 transfers per frame instead of
-/// nine, so a trade takes several times longer in emulated time. That is a few
-/// extra seconds on a trade, against a link that does not work at all. Smoothness
-/// at 60 fps on both devices was the explicit requirement.
-///
-/// Worth knowing how far outside hardware this really is, because it sounds worse
-/// than it is: the SLOWEST legal Multi-Player transfer is 9600 baud with four
-/// units, 125829 cycles, 7.5 ms. So games already have to tolerate a 7.5 ms
-/// transfer, and 12 ms is 1.6x that rather than the 35x it looks like next to the
-/// 343 us case Pokemon actually selects. 125829 is the fidelity-preferred value
-/// if more protocol throughput is ever wanted: it is exactly a legal hardware
-/// timing and gives 2.2 transfers a frame instead of 1.4, at the cost of blocking
-/// for the difference whenever the round trip runs long.
-///
-/// Above every entry in [`TRANSFER_CYCLES`], so the baud table currently never
-/// decides the pacing. It is still consulted, and still right, for a transport
-/// faster than Wi-Fi: two cores in one process, or a LAN worth the name.
-pub const MIN_TRANSFER_CYCLES: u32 = 201_327; // 12 ms at 16.78 MHz
+/// So nine round trips, 72 ms, have to happen inside what the game believes is
+/// one 16.7 ms frame. The frame has to STRETCH IN WALL TIME, on both devices
+/// together, which is what [`LinkCable::wait_for_clock`] is for. A trade runs at
+/// about 14 fps and completes, instead of running at 60 and failing.
 
 /// Units one Multi-Player bus can hold, which is also the number of SIOMULTI
 /// slots.
@@ -159,6 +143,25 @@ pub trait LinkCable {
     /// with, not whatever SIOMLT_SEND holds by the time its emulation catches
     /// up.
     fn child_clock(&mut self) -> Option<(u16, u16)>;
+    /// Child: BLOCK until the parent clocks the next transfer, or give up.
+    ///
+    /// This is what keeps the two emulated clocks together, and it is needed
+    /// because the game's expectation and the network's speed cannot both be
+    /// met at 60 fps. Nine transfers a frame at an 8 ms round trip is 72 ms of
+    /// network inside a frame the game thinks lasts 16.7 ms, so the frame has to
+    /// stretch, and it has to stretch on BOTH devices or their protocol clocks
+    /// diverge. Measured ninefold divergence is what failed the first device
+    /// test: parent at 6.7 fps, child at a flat 59.7.
+    ///
+    /// Only called once the child's game has written SIOMLT_SEND for the next
+    /// transfer, so the game itself says when it is ready rather than us
+    /// guessing a cycle budget. That matters: block too early and the interrupt
+    /// handler never gets to prepare the word, so the child answers every
+    /// transfer with the same stale value.
+    ///
+    /// `None` means nothing arrived in time, which releases the child to run on
+    /// and reach its own link-error path rather than hanging.
+    fn wait_for_clock(&mut self) -> Option<(u16, u16)>;
     /// Throw away transfers in flight, because the game just selected
     /// Multi-Player mode and anything from before that is not addressed to the
     /// protocol it is about to run.
@@ -190,11 +193,12 @@ pub const FAMILY: [u8; 3] = *b"CBL";
 /// the family and version are one readable token on the wire. Bump it whenever
 /// the layout or the MEANING of a field changes.
 ///
-/// Went to `2` for a change with no layout in it at all: `MIN_TRANSFER_CYCLES`.
-/// Both ends derive the busy window from that constant and never send it, so two
-/// builds that disagree would quietly drift their protocol clocks apart, which is
-/// the exact silent-mismatch failure this version byte exists to prevent. A
-/// semantic agreement counts as the wire. There is no
+/// Went to `2` for a change with no layout in it at all: how a transfer is paced,
+/// and whether a child throttles itself to its parent. Both ends decide that from
+/// shared constants and never send them, so two builds that disagree would
+/// quietly drift their protocol clocks apart, which is the exact silent-mismatch
+/// failure this version byte exists to prevent. A semantic agreement counts as
+/// the wire. There is no
 /// negotiation and there should not be: two devices come off the same APK, so a
 /// mismatch is a mis-install rather than a case to support.
 pub const WIRE_VERSION: u8 = b'2';
@@ -574,6 +578,12 @@ impl LinkCable for LocalCable {
 
     fn child_clock(&mut self) -> Option<(u16, u16)> {
         self.wire.borrow_mut().to_child.pop_front()
+    }
+
+    /// Never actually blocks: the two cores share memory and run on one thread,
+    /// so there is nobody to wait for. A desk test must not be able to hang.
+    fn wait_for_clock(&mut self) -> Option<(u16, u16)> {
+        self.child_clock()
     }
 
     fn flush(&mut self) {

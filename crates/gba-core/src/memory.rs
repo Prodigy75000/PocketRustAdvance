@@ -20,10 +20,11 @@ use crate::save::Save;
 /// games' idea of how long a transfer takes.
 fn multi_cycles(cnt: u16, units: u8) -> u32 {
     let slot = (units as usize).clamp(1, crate::cable::MAX_UNITS) - 1;
-    // Never faster than the transport can answer. See MIN_TRANSFER_CYCLES: this
-    // is what turns a blocking network wait into overlapped emulation, and both
-    // ends have to arrive at the same number or their clocks drift.
-    crate::cable::TRANSFER_CYCLES[(cnt & 3) as usize][slot].max(crate::cable::MIN_TRANSFER_CYCLES)
+    // Hardware timing, deliberately. A floor here to hide the network round trip
+    // was tried on device and the game rejected it: see the note above
+    // TRANSFER_CYCLES in cable.rs for why no value can work. The wall-clock wait
+    // is handled by stretching the frame on both devices instead.
+    crate::cable::TRANSFER_CYCLES[(cnt & 3) as usize][slot]
 }
 
 const CYC_256KHZ_8BIT: u32 = 524;
@@ -93,6 +94,14 @@ pub struct GbaBus {
     /// A Multi-Player transfer is in flight over the cable. Distinguishes a
     /// cable completion from an adapter one, which clear different bits.
     cable_busy: bool,
+    /// A child's game has written SIOMLT_SEND and is now waiting for its parent
+    /// to clock. The child may not advance past this point, or it runs ahead of
+    /// the parent and the two games' protocol clocks diverge.
+    ///
+    /// Taken from the game rather than from a cycle budget: the write IS the
+    /// statement that the next word is ready. Blocking any earlier would starve
+    /// the interrupt handler that produces it.
+    cable_child_armed: bool,
     /// The words a child's transfer will land, held until its duration is up.
     /// `None` on a parent, which does not know them until it collects the
     /// children's replies at completion.
@@ -443,6 +452,7 @@ impl GbaBus {
             rfu,
             cable: None,
             cable_busy: false,
+            cable_child_armed: false,
             cable_words: None,
             cable_transfers: 0,
             cable_failures: 0,
@@ -1492,8 +1502,14 @@ impl GbaBus {
         }
         if touches_mlt_send {
             let word = self.io_u16(0x12A);
+            let mut child = false;
             if let Some(cable) = self.cable.as_mut() {
                 cable.set_output(word);
+                child = cable.id() != 0;
+            }
+            // A child presenting a word is a child ready for the next clock.
+            if child && self.multi_mode() {
+                self.cable_child_armed = true;
             }
         }
         if touches_siocnt {
@@ -1587,13 +1603,35 @@ impl GbaBus {
         if self.cable.is_some() && !self.cable_busy && self.multi_mode() {
             let id = self.cable.as_ref().map_or(0, |c| c.id());
             let units = self.cable.as_ref().map_or(1, |c| c.units());
-            let clocked = (id != 0).then(|| self.cable.as_mut().unwrap().child_clock()).flatten();
+            // An ARMED child blocks here. Its game has said it is ready for the
+            // next transfer, so letting it run on would advance its emulated
+            // clock past the parent's, and that divergence is what failed the
+            // first device test rather than any fault on the wire.
+            let armed = self.cable_child_armed;
+            let clocked = (id != 0)
+                .then(|| {
+                    let cable = self.cable.as_mut().unwrap();
+                    if armed {
+                        cable.wait_for_clock()
+                    } else {
+                        cable.child_clock()
+                    }
+                })
+                .flatten();
+            if armed && clocked.is_none() {
+                // Nothing came. Release the child rather than stalling it
+                // forever: a parent that has gone away has to surface as the
+                // game's own link error, not as a frozen emulator.
+                self.cable_child_armed = false;
+            }
             if let Some((parent_word, own_word)) = clocked {
                 let mut words = [crate::cable::ABSENT; crate::cable::MAX_UNITS];
                 words[0] = parent_word;
                 words[id as usize] = own_word;
                 self.cable_words = Some(words);
                 self.cable_busy = true;
+                // Re-armed only when the game writes the next word.
+                self.cable_child_armed = false;
                 let cnt = self.io_u16(0x128);
                 // Busy goes up for the transfer's real duration. A game that
                 // polls the bit mid-transfer has to see it set, and a child's
@@ -1632,6 +1670,7 @@ impl GbaBus {
     pub fn detach_cable(&mut self) {
         self.cable = None;
         self.cable_words = None;
+        self.cable_child_armed = false;
         // A transfer that was in flight has to stop counting down, or the next
         // completion lands on a port with nothing attached and clears bits a
         // cable owns.

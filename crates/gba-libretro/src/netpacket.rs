@@ -164,6 +164,10 @@ struct Net {
     cable_peers: [bool; MAX_UNITS],
     /// Consecutive exchanges the cable gave up on.
     cable_failures: u32,
+    /// Times a child gave up waiting for its parent to clock. Non-zero means the
+    /// pair fell out of step, which is a different failure from a lost packet and
+    /// has to be countable separately or the two look alike.
+    pub cable_child_waits_timed_out: u64,
     /// Exchanges completed and exchanges abandoned, for the heartbeat.
     pub cable_done: u64,
     pub cable_lost: u64,
@@ -193,6 +197,7 @@ impl Net {
             cable: CableProto::new(),
             cable_peers: [false; MAX_UNITS],
             cable_failures: 0,
+            cable_child_waits_timed_out: 0,
             cable_done: 0,
             cable_lost: 0,
             cable_rtx: 0,
@@ -374,6 +379,7 @@ pub fn send(to: u16, bytes: &[u8]) {
 /// identical from outside, which is exactly how two adapter bugs stayed
 /// invisible for a whole device session.
 pub struct CableStats {
+    pub child_stalls: u64,
     pub done: u64,
     pub lost: u64,
     pub extra_peers: usize,
@@ -386,6 +392,7 @@ pub struct CableStats {
 
 pub fn cable_stats() -> CableStats {
     with_net(|n| CableStats {
+        child_stalls: n.cable_child_waits_timed_out,
         done: n.cable_done,
         lost: n.cable_lost,
         extra_peers: n.cable_extra_peers(),
@@ -509,6 +516,27 @@ impl LinkCable for NetCable {
             n.cable.flush_pending();
             n.cable_failures = 0;
         });
+    }
+
+    /// Block until the parent clocks, polling the network meanwhile.
+    ///
+    /// Bounded by the same timeout the parent uses, so a parent that has gone
+    /// away costs the child one timeout and then releases it to its own link
+    /// error rather than freezing the emulator.
+    fn wait_for_clock(&mut self) -> Option<(u16, u16)> {
+        let deadline = Instant::now() + EXCHANGE_TIMEOUT;
+        loop {
+            poll_receive();
+            if let Some(got) = with_net(|n| n.cable.child_clock()) {
+                with_net(|n| n.cable_done += 1);
+                return Some(got);
+            }
+            if !with_net(|n| n.active) || Instant::now() >= deadline {
+                with_net(|n| n.cable_child_waits_timed_out += 1);
+                return None;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
     }
 
     fn child_clock(&mut self) -> Option<(u16, u16)> {

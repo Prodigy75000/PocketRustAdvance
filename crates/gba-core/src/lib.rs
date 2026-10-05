@@ -986,33 +986,23 @@ mod tests {
         assert_eq!(child.cable_stats(), (1, 0));
     }
 
-    /// A transfer has to occupy real emulated time, and over a network that
-    /// time is set by the transport rather than by the baud rate.
+    /// A transfer has to occupy the time its baud rate says, and no more.
     ///
     /// The lone-unit path completes inside the store, which is safe because there
-    /// is nobody to stay in step with. Over a cable it is not: both ends compute
-    /// the window from the same constants, a game can poll the busy bit, and a
+    /// is nobody to stay in step with. Over a cable it is not: a game can poll the
+    /// busy bit, and both ends compute this window from the same table, so a
     /// transfer that completed instantly would let a parent clock faster than its
     /// peer can answer.
     ///
-    /// At hardware pacing 115200 baud with two units is 5755 cycles, which the
-    /// first device test showed is hopeless against an 8 ms round trip. The floor
-    /// of 201327 cycles is 12 ms, so the parent spends the round trip emulating
-    /// instead of blocked. Asserted in scanlines against absolute numbers, never
-    /// against the constants themselves, since a test phrased in terms of what it
-    /// checks agrees with any typo in it.
+    /// **A floor was added here to hide the network round trip, and the game
+    /// rejected it on device.** Nine transfers have to fit in one 280896-cycle
+    /// frame, so each must stay under 1.86 ms, while hiding an 8 ms round trip
+    /// needs over 8 ms. The wall-clock wait is handled by stretching the frame on
+    /// both devices instead. So this asserts hardware timing: 5755 cycles at
+    /// 115200 baud with two units, which is five scanlines of 1232.
     #[test]
-    fn a_transfer_occupies_the_time_the_slowest_link_in_the_chain_needs() {
+    fn a_transfer_occupies_the_time_its_baud_rate_says() {
         use crate::bus::{Access::NonSeq as N, Bus};
-
-        // The floor outruns every entry in the baud table, so on a networked
-        // cable the table never decides the pacing. Worth pinning: if someone
-        // lowers the floor below 125829 the table silently starts mattering
-        // again, and the two ends only agree while they agree on which rule won.
-        assert!(
-            crate::cable::MIN_TRANSFER_CYCLES > 125_829,
-            "the floor must dominate the slowest baud, or pacing depends on the mode"
-        );
 
         let mut rom = vec![0u8; 0x200];
         rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
@@ -1035,10 +1025,82 @@ mod tests {
             lines += 1;
             assert!(lines <= 300, "the transfer never completed");
         }
-        // 201327 cycles is 163 full scanlines of 1232 plus a remainder, so the
-        // 164th is the one that lands it. Five would be the hardware answer and
-        // is what this asserted before the device test.
-        assert_eq!(lines, 164, "12 ms is 164 scanlines of 1232, not 5");
+        assert_eq!(lines, 5, "5755 cycles is five scanlines of 1232");
+        // Nine of these have to fit in a frame, which is the constraint that
+        // killed the floor. Asserted in absolute numbers on purpose.
+        assert!(5755 * 9 < 280_896, "nine transfers must fit one frame");
+    }
+
+    /// A child blocks for the next clock only once its game says it is ready.
+    ///
+    /// This is the throttle that keeps the two emulated clocks together, and both
+    /// halves of the condition matter. Without it the child runs at 60 fps while
+    /// its parent crawls through nine round trips a frame, and the ninefold
+    /// divergence is what failed the first device test. Blocking too EARLY is the
+    /// other failure: the interrupt handler that prepares the next word would
+    /// never get to run, so the child would answer every transfer with the same
+    /// stale value. The write to SIOMLT_SEND is the game saying the word is ready,
+    /// which is why it is the trigger rather than a cycle budget we picked.
+    #[test]
+    fn a_child_blocks_for_its_parent_only_once_its_game_has_the_next_word_ready() {
+        use crate::bus::{Access::NonSeq as N, Bus};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct Calls {
+            blocking: u32,
+            polling: u32,
+        }
+        struct Spy(Rc<RefCell<Calls>>);
+        impl crate::cable::LinkCable for Spy {
+            fn units(&self) -> u8 {
+                2
+            }
+            fn id(&self) -> u8 {
+                1 // a child
+            }
+            fn set_output(&mut self, _word: u16) {}
+            fn parent_start(&mut self, _own: u16) {}
+            fn parent_result(&mut self) -> Option<[u16; crate::cable::MAX_UNITS]> {
+                None
+            }
+            fn child_clock(&mut self) -> Option<(u16, u16)> {
+                self.0.borrow_mut().polling += 1;
+                None
+            }
+            fn wait_for_clock(&mut self) -> Option<(u16, u16)> {
+                self.0.borrow_mut().blocking += 1;
+                None
+            }
+            fn flush(&mut self) {}
+        }
+
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        let mut rom = vec![0u8; 0x200];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        let mut gba = Gba::new(rom, Vec::new());
+        gba.connect_cable(Box::new(Spy(calls.clone())));
+        gba.render_enabled = false;
+
+        gba.bus.write16(0x0400_0134, 0x0000, N);
+        gba.bus.write16(0x0400_0128, 0x2003, N); // Multi-Player, 115200
+        gba.run_frame();
+        assert_eq!(calls.borrow().blocking, 0, "nothing to wait for before the game is ready");
+        assert!(calls.borrow().polling > 0, "but it is still listening every scanline");
+
+        // The game presents its word: now it is waiting on its parent.
+        calls.borrow_mut().polling = 0;
+        gba.bus.write16(0x0400_012A, 0xB9A0, N);
+        gba.run_frame();
+        assert_eq!(
+            calls.borrow().blocking, 1,
+            "an armed child must block, exactly once: the first failed wait releases it"
+        );
+        assert!(
+            calls.borrow().polling > 0,
+            "and after being released it goes back to listening rather than stalling"
+        );
     }
 
     /// A child that reaches the link menu late must not inherit the transfers
