@@ -176,6 +176,28 @@ pub trait LinkCable {
     /// their interrupts, and reports a backlog that makes it look far behind
     /// when it has simply not started.
     fn flush(&mut self);
+
+    /// This core emulated `cycles` more cycles. Called once per scanline while
+    /// the game is in Multi-Player mode.
+    ///
+    /// A parent uses it to decide when to put its position on the wire; a child
+    /// spends it out of the budget the parent's position granted. Both ends
+    /// measure only their own progress, which is the property the two reverted
+    /// attempts lacked.
+    fn advance(&mut self, cycles: u32) {
+        let _ = cycles;
+    }
+
+    /// Must this core stop before emulating the next scanline?
+    ///
+    /// Only ever true on a child, and only while it is ahead of the parent's
+    /// last reported position. The caller loops on this, pumping its transport
+    /// between calls, so an implementation may block for a short interval before
+    /// answering and MUST eventually answer false on its own: a parent that has
+    /// gone away has to leave the child running, not frozen.
+    fn hold(&mut self) -> bool {
+        false
+    }
 }
 
 /// Wire-format family, "CBL".
@@ -205,10 +227,17 @@ pub const FAMILY: [u8; 3] = *b"CBL";
 /// the wire. There is no
 /// negotiation and there should not be: two devices come off the same APK, so a
 /// mismatch is a mis-install rather than a case to support.
-pub const WIRE_VERSION: u8 = b'2';
+///
+/// Went to `3` for the pacing: every packet now carries the sender's position in
+/// emulated cycles, and a parent sends [`TAG_TICK`] once a frame. Both halves
+/// matter for refusal. The layout grew, so a v2 packet is 9 bytes where this
+/// build needs 13, and the meaning changed, so a v3 child paired with a v2
+/// parent would never hear a tick, would starve, and would silently give up
+/// pacing. A session that degrades is harder to attribute than one that refuses.
+pub const WIRE_VERSION: u8 = b'3';
 
-/// The full four-byte header of a packet this build will act on, "CBL2".
-pub const MAGIC: u32 = 0x4342_4C32;
+/// The full four-byte header of a packet this build will act on, "CBL3".
+pub const MAGIC: u32 = 0x4342_4C33;
 
 /// `[magic, 1, seq, word, 0]`: "I am clocking `word` into you as exchange
 /// `seq`."
@@ -223,8 +252,53 @@ pub const TAG_REPLY: u8 = 2;
 /// that is holding up the cable.
 pub const TAG_GAVE_UP: u8 = 3;
 
-/// Every cable packet is this long: magic, tag, seq, word, lag.
-pub const PACKET_LEN: usize = 9;
+/// `[magic, 4, 0, 0, 0, time]`: "I am a parent and I have reached `time`."
+///
+/// The 60 Hz floor under the pacing. A child's budget is fed by the parent's
+/// position, and a position carried only by transfers stops arriving the moment
+/// the parent's game stops clocking, which is most of a menu. Without this the
+/// pacing would freeze a child whenever the link went quiet, which is a worse
+/// bug than the one it fixes. One 13-byte datagram per frame is noise next to a
+/// transfer every 28672 cycles.
+///
+/// Same job as mGBA's `SIO_EV_HARD_SYNC`, which fires every 0x80000 cycles
+/// whether or not a transfer is happening.
+pub const TAG_TICK: u8 = 4;
+
+/// Every cable packet is this long: magic, tag, seq, word, lag, time.
+pub const PACKET_LEN: usize = 13;
+
+/// Byte offset of the sender's position, a big-endian u32 of emulated cycles
+/// since this cable end was reset.
+///
+/// Session-relative and never compared to the peer's absolutely: the two cores
+/// power on seconds apart and share no epoch, so a child integrates the
+/// DIFFERENCES between successive parent positions. That needs no shared anchor
+/// and its failure direction is safe, because a lost or late packet can only
+/// slow a child down, never let it run ahead.
+pub const TIME_OFF: usize = 9;
+
+/// How far ahead of the parent's last reported position a child may emulate: one
+/// frame.
+///
+/// Not a tuning knob picked for feel. It is the largest value that cannot hide a
+/// whole protocol frame: Pokemon's connected mode clocks every 28672 cycles, so
+/// one frame of slack is about nine transfers, and a child that is a frame ahead
+/// has already run every transfer the parent has issued. Smaller would throttle
+/// the handshake, which must stay at 60 fps.
+pub const HORIZON: u32 = 280_896;
+
+/// Consecutive [`LinkCable::hold`] answers before a child stops waiting and runs
+/// free.
+///
+/// The fail-open bound. The transport waits about 250 us between calls, so this
+/// is roughly 300 ms: comfortably past the parent's own 150 ms give-up timeout,
+/// so a child does not start free-running while its parent is merely slow, and
+/// short enough that a parent which has gone away releases the child in a third
+/// of a second rather than freezing the screen. A frozen emulator is a worse
+/// failure than a desynchronised one, because the player cannot even quit the
+/// link from inside the game.
+pub const HOLD_SPINS_MAX: u32 = 1200;
 
 /// Recently answered sequence numbers kept for duplicate suppression. One
 /// exchange is outstanding at a time, so anything past a couple is slack;
@@ -249,12 +323,13 @@ pub const LAG_HEALTHY: u8 = 1;
 /// deliver stale words later rather than letting the game's own error path run.
 const CHILD_QUEUE_MAX: usize = 8;
 
-fn put(out: &mut [u8; PACKET_LEN], tag: u8, seq: u8, word: u16, lag: u8) {
+fn put(out: &mut [u8; PACKET_LEN], tag: u8, seq: u8, word: u16, lag: u8, time: u32) {
     out[..4].copy_from_slice(&MAGIC.to_be_bytes());
     out[4] = tag;
     out[5] = seq;
     out[6..8].copy_from_slice(&word.to_be_bytes());
     out[8] = lag;
+    out[TIME_OFF..TIME_OFF + 4].copy_from_slice(&time.to_be_bytes());
 }
 
 /// The cable's wire protocol.
@@ -313,6 +388,35 @@ pub struct CableProto {
     peer_gave_up: bool,
     /// Packets for the transport to send.
     outbox: VecDeque<[u8; PACKET_LEN]>,
+    /// This end's own position: emulated cycles since the cable was reset.
+    local_cycles: u32,
+    /// Position at which a parent owes the next [`TAG_TICK`].
+    next_tick_at: u32,
+    /// The parent's position as of its most recent packet. `None` until one
+    /// arrives, which is also what "pacing has not engaged" means on a child.
+    parent_time: Option<u32>,
+    /// Cycles this child may still emulate before it is a whole frame ahead of
+    /// the parent's last reported position. Signed because a long scanline can
+    /// overshoot, and the overshoot has to be paid back rather than forgiven.
+    budget: i64,
+    /// Is this end pacing itself against a parent at all? False on a parent, on
+    /// a child before first contact, and on a child whose parent went silent.
+    engaged: bool,
+    /// Cycles emulated since the last parent packet, for the silent-parent case
+    /// where the child is NOT held and so never spins.
+    since_parent: u32,
+    /// Consecutive holds, reset by any parent packet. Bounded by
+    /// [`HOLD_SPINS_MAX`] so a vanished parent cannot freeze a child.
+    hold_spins: u32,
+    /// Scanlines this child has been held, and the times it gave up waiting.
+    /// Both on the heartbeat: the first says the pacing is working, the second
+    /// says it stopped trusting the parent.
+    pub holds: u64,
+    pub starved: u64,
+    /// The peer's position as of its last reply, for diagnostics only. It paces
+    /// nobody; it lets ONE device's log answer "how far apart were we", which
+    /// until now needed both logs side by side.
+    peer_time: Option<u32>,
 }
 
 impl Default for CableProto {
@@ -339,6 +443,16 @@ impl CableProto {
             peer_lag: 0, // nothing reported yet, see LAG_HEALTHY
             peer_gave_up: false,
             outbox: VecDeque::new(),
+            local_cycles: 0,
+            next_tick_at: HORIZON,
+            parent_time: None,
+            budget: 0,
+            engaged: false,
+            since_parent: 0,
+            hold_spins: 0,
+            holds: 0,
+            starved: 0,
+            peer_time: None,
         }
     }
 
@@ -359,6 +473,16 @@ impl CableProto {
         self.peer_lag = 0; // nothing reported yet, see LAG_HEALTHY
         self.peer_gave_up = false;
         self.outbox.clear();
+        self.local_cycles = 0;
+        self.next_tick_at = HORIZON;
+        self.parent_time = None;
+        self.budget = 0;
+        self.engaged = false;
+        self.since_parent = 0;
+        self.hold_spins = 0;
+        self.holds = 0;
+        self.starved = 0;
+        self.peer_time = None;
     }
 
     /// What this unit presents on the bus.
@@ -396,7 +520,7 @@ impl CableProto {
         self.reply = None;
         self.own_output = out;
         let mut pkt = [0u8; PACKET_LEN];
-        put(&mut pkt, TAG_CLOCK, seq, out, 0);
+        put(&mut pkt, TAG_CLOCK, seq, out, 0, self.local_cycles);
         self.outbox.push_back(pkt);
         seq
     }
@@ -409,7 +533,7 @@ impl CableProto {
     pub fn retry_exchange(&mut self) {
         if let Some(seq) = self.awaiting {
             let mut pkt = [0u8; PACKET_LEN];
-            put(&mut pkt, TAG_CLOCK, seq, self.pending_out, 0);
+            put(&mut pkt, TAG_CLOCK, seq, self.pending_out, 0, self.local_cycles);
             self.outbox.push_back(pkt);
         }
     }
@@ -447,7 +571,7 @@ impl CableProto {
             self.awaiting = None;
             self.reply = None;
             let mut pkt = [0u8; PACKET_LEN];
-            put(&mut pkt, TAG_GAVE_UP, seq, 0, 0);
+            put(&mut pkt, TAG_GAVE_UP, seq, 0, 0, self.local_cycles);
             self.outbox.push_back(pkt);
         }
     }
@@ -466,11 +590,146 @@ impl CableProto {
         self.child_input.clear();
         self.awaiting = None;
         self.reply = None;
+        // The game just selected Multi-Player mode, so the budget earned
+        // against whatever it was doing before means nothing. Disengaging rather
+        // than zeroing leaves the child free-running until the parent's next
+        // packet, which is the safe direction: a child that is briefly too fast
+        // catches a clock late, where a child wrongly held sees no clocks at all.
+        self.parent_time = None;
+        self.budget = 0;
+        self.engaged = false;
+        self.since_parent = 0;
+        self.hold_spins = 0;
     }
 
     /// Take the oldest transfer a parent clocked into us.
     pub fn child_clock(&mut self) -> Option<(u16, u16)> {
         self.child_input.pop_front()
+    }
+
+    /// This end emulated `cycles` more cycles.
+    ///
+    /// Both roles call it. A parent uses it only to know when it owes a tick; a
+    /// child spends it, and a child that is NOT being held still ages out a
+    /// silent parent here, which is the case `hold` cannot see because a free
+    /// child never asks.
+    pub fn advance(&mut self, cycles: u32) {
+        self.local_cycles = self.local_cycles.wrapping_add(cycles);
+        if !self.engaged {
+            return;
+        }
+        self.budget -= cycles as i64;
+        self.since_parent = self.since_parent.saturating_add(cycles);
+        if self.since_parent >= HORIZON * 2 {
+            // Two frames with nothing from the parent. It is not slow, it is
+            // gone, or its game left Multi-Player mode. Stop pacing against a
+            // position that is no longer being updated.
+            self.disengage();
+        }
+    }
+
+    /// This end's own position, in cycles since the cable was reset.
+    pub fn local_cycles(&self) -> u32 {
+        self.local_cycles
+    }
+
+    /// Parent only: put this position on the wire if a frame has passed since the
+    /// last one. Returns whether a tick was queued.
+    ///
+    /// Called once per scanline from the same place as [`CableProto::advance`],
+    /// so the tick lands within a scanline of the frame boundary.
+    pub fn maybe_tick(&mut self) -> bool {
+        // Wrapping-safe: the difference read as a signed value is negative until
+        // the position actually reaches the deadline, whatever side of 2^32 both
+        // happen to sit on.
+        if (self.local_cycles.wrapping_sub(self.next_tick_at) as i32) < 0 {
+            return false;
+        }
+        self.next_tick_at = self.local_cycles.wrapping_add(HORIZON);
+        let mut pkt = [0u8; PACKET_LEN];
+        put(&mut pkt, TAG_TICK, 0, 0, 0, self.local_cycles);
+        self.outbox.push_back(pkt);
+        true
+    }
+
+    /// Must this child stop before emulating another scanline?
+    ///
+    /// The park predicate is `budget exhausted AND nothing uncollected`, and the
+    /// second half is what keeps the stale-word hazard shut: a child is only ever
+    /// parked with its queue empty, which means it has serviced the last transfer
+    /// and its game has armed the next word. See
+    /// `a_parked_child_answers_two_clocks_with_the_word_armed_for_the_first` for
+    /// what the other case costs.
+    ///
+    /// Counts its own consecutive calls so a parent that has gone away releases
+    /// the child instead of freezing it.
+    pub fn hold(&mut self) -> bool {
+        if !self.engaged || self.budget > 0 || !self.child_input.is_empty() {
+            self.hold_spins = 0;
+            return false;
+        }
+        self.hold_spins += 1;
+        if self.hold_spins > HOLD_SPINS_MAX {
+            self.disengage();
+            self.starved += 1;
+            return false;
+        }
+        self.holds += 1;
+        true
+    }
+
+    /// Stop pacing and run free. Every path here is a fail-open: a child that
+    /// cannot tell where its parent is must keep emulating.
+    fn disengage(&mut self) {
+        self.engaged = false;
+        self.budget = 0;
+        self.parent_time = None;
+        self.since_parent = 0;
+        self.hold_spins = 0;
+    }
+
+    /// Is this end pacing itself against a parent?
+    pub fn pacing(&self) -> bool {
+        self.engaged
+    }
+
+    /// Cycles this child may still emulate before it must wait.
+    pub fn budget(&self) -> i64 {
+        self.budget
+    }
+
+    /// How far this end is ahead of the peer's last reported position, in cycles.
+    /// Diagnostics only, and `None` until the peer has sent one.
+    pub fn skew(&self) -> Option<i32> {
+        self.peer_time
+            .map(|t| self.local_cycles.wrapping_sub(t) as i32)
+    }
+
+    /// Credit a child's budget with the parent's progress.
+    ///
+    /// Differences, not absolutes: the two cores share no epoch. A duplicate or
+    /// reordered packet reads as a non-positive difference and credits nothing,
+    /// which is why the retransmit path replaying a cached reply verbatim is
+    /// correct rather than merely harmless: a retransmit is not new progress.
+    fn credit(&mut self, parent_time: u32) {
+        let delta = match self.parent_time {
+            // First contact: one frame of slack, so a child that connects
+            // mid-frame is not held before it has heard anything.
+            None => HORIZON as i64,
+            Some(prev) => {
+                let d = parent_time.wrapping_sub(prev) as i32;
+                if d <= 0 {
+                    0
+                } else {
+                    (d as i64).min(HORIZON as i64)
+                }
+            }
+        };
+        self.parent_time = Some(parent_time);
+        self.engaged = true;
+        self.since_parent = 0;
+        self.hold_spins = 0;
+        self.budget = (self.budget + delta).min(HORIZON as i64);
     }
 
     /// Packets the transport should put on the wire.
@@ -485,7 +744,15 @@ impl CableProto {
     /// continuously, so making the peer wait for our emulation to come round
     /// would stall it for a frame.
     pub fn on_packet(&mut self, pkt: &[u8]) {
-        if pkt.len() < PACKET_LEN || pkt[..3] != FAMILY {
+        // Family and version BEFORE length, and that order is the whole point of
+        // splitting them. A version-2 packet is 9 bytes where this build needs
+        // 13, so a length check first would discard it as malformed and the
+        // mismatch would never be counted: two devices on different builds would
+        // see NO PEER instead of a refusal, which is the silent failure the split
+        // exists to prevent. Caught by
+        // `a_peer_on_the_previous_wire_version_never_paces_a_child`, which failed
+        // against exactly that ordering.
+        if pkt.len() < 4 || pkt[..3] != FAMILY {
             return;
         }
         if pkt[3] != WIRE_VERSION {
@@ -498,9 +765,30 @@ impl CableProto {
         if self.version_mismatch > 0 {
             return; // latched: this pair is not going to link
         }
+        if pkt.len() < PACKET_LEN {
+            return; // our own version, but truncated: nothing safe to read
+        }
         let (tag, seq) = (pkt[4], pkt[5]);
         let word = u16::from_be_bytes([pkt[6], pkt[7]]);
+        let time = u32::from_be_bytes([
+            pkt[TIME_OFF],
+            pkt[TIME_OFF + 1],
+            pkt[TIME_OFF + 2],
+            pkt[TIME_OFF + 3],
+        ]);
+        // Anything a PARENT sends carries its position, and every one of them
+        // feeds the budget, including a retransmitted clock: the retransmit is a
+        // duplicate transfer but it is not duplicate progress, it was stamped
+        // when it was sent.
+        if tag == TAG_CLOCK || tag == TAG_TICK {
+            self.credit(time);
+        }
         match tag {
+            TAG_TICK => {
+                // Nothing else to do. The position was the whole message, and it
+                // is what keeps a child paced through menus, naming screens and
+                // every other stretch where the parent's game is not clocking.
+            }
             TAG_CLOCK => {
                 if self.seen.contains(&Some(seq)) {
                     // A duplicate clock gets the identical reply back. Dropping
@@ -528,12 +816,13 @@ impl CableProto {
                 }
                 self.child_input.push_back((word, answered));
                 let mut reply = [0u8; PACKET_LEN];
-                put(&mut reply, TAG_REPLY, seq, answered, self.lag());
+                put(&mut reply, TAG_REPLY, seq, answered, self.lag(), self.local_cycles);
                 self.last_reply = reply;
                 self.outbox.push_back(reply);
             }
             TAG_REPLY => {
                 self.peer_lag = pkt[8];
+                self.peer_time = Some(time);
                 if self.awaiting == Some(seq) {
                     self.reply = Some(word);
                 }
@@ -684,6 +973,199 @@ mod tests {
     /// CHILD, it does not change what this layer answers when asked while
     /// parked. A protocol that could answer correctly here would need to know
     /// what the game has not yet told it.
+    /// Build a parent packet the way the wire carries one.
+    fn parent_pkt(tag: u8, seq: u8, word: u16, time: u32) -> [u8; PACKET_LEN] {
+        let mut pkt = [0u8; PACKET_LEN];
+        put(&mut pkt, tag, seq, word, 0, time);
+        pkt
+    }
+
+    /// A child may run one frame ahead of where the parent says it is, and not a
+    /// scanline more.
+    ///
+    /// The horizon is what transmits the parent's slowness. In connected mode the
+    /// parent is wall-paced by its own blocking round trip, so its reported
+    /// position advances at about 14 fps, and this is what makes the child match
+    /// it instead of running nine protocol frames into the future.
+    #[test]
+    fn the_child_never_runs_more_than_one_frame_past_the_parent() {
+        let mut c = CableProto::new();
+
+        // Before any parent packet there is nothing to pace against, and a child
+        // that has heard nothing must run rather than wait.
+        c.advance(280_896);
+        assert!(!c.hold(), "a child that has heard nothing from a parent runs free");
+        assert!(!c.pacing());
+
+        // First contact grants one frame of slack. The absolute position is
+        // arbitrary on purpose: the two cores share no epoch, only differences.
+        c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 1_000_000));
+        assert!(c.pacing(), "a parent packet engages the pacing");
+        assert_eq!(c.budget(), 280_896, "one frame of slack");
+
+        // 227 scanlines of 1232 cycles is 279664, so there is still 1232 left.
+        for _ in 0..227 {
+            c.advance(1232);
+            assert!(!c.hold(), "a child inside the horizon must never be held");
+        }
+        assert_eq!(c.budget(), 1232);
+
+        c.advance(1232);
+        assert_eq!(c.budget(), 0);
+        assert!(c.hold(), "a child a full frame ahead has to wait");
+        assert_eq!(c.holds, 1);
+
+        // One frame of parent progress unlocks exactly one frame of ours.
+        c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 1_000_000 + 280_896));
+        assert_eq!(c.budget(), 280_896);
+        assert!(!c.hold(), "and it is released by the parent moving, nothing else");
+    }
+
+    /// The handshake must not be throttled at all.
+    ///
+    /// This is where the second reverted attempt died: it held a child during the
+    /// phase that was already working, and the device went to 6.6 fps against a
+    /// parent at 56.7. Both ends at 60 fps have to produce zero holds, or the
+    /// pacing has broken the phase it was never meant to touch.
+    #[test]
+    fn a_level_handshake_never_holds_the_child() {
+        let mut c = CableProto::new();
+        let mut parent_at = 0u32;
+        for frame in 0..60 {
+            parent_at = parent_at.wrapping_add(280_896);
+            c.on_packet(&parent_pkt(TAG_TICK, 0, 0, parent_at));
+            for line in 0..228 {
+                assert!(!c.hold(), "frame {frame} line {line} was held at 60 fps");
+                c.advance(1232);
+            }
+        }
+        assert_eq!(c.holds, 0, "a level link must never hold");
+        assert_eq!(c.starved, 0, "and never give up on a parent that is talking");
+        assert!(c.pacing(), "while staying engaged the whole time");
+    }
+
+    /// A parent that goes away releases the child instead of freezing it.
+    ///
+    /// A frozen emulator is worse than a desynchronised one: the player cannot
+    /// even leave the link from inside the game. So every path out of pacing is a
+    /// fail-open, and this pins the bound rather than trusting it.
+    #[test]
+    fn a_parent_that_stops_answering_releases_a_held_child() {
+        let mut c = CableProto::new();
+        c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 500));
+        c.advance(280_896); // spend the frame of slack
+
+        // 1200 answers of "wait", at the transport's 250 us poll, is about 300 ms:
+        // past the parent's own 150 ms give-up timeout, so a merely slow parent
+        // does not lose its child.
+        for i in 0..1200 {
+            assert!(c.hold(), "hold {i} should still be waiting");
+        }
+        assert!(!c.hold(), "the 1201st answer has to let the child run");
+        assert_eq!(c.starved, 1);
+        assert!(!c.pacing(), "and the pacing is off until the parent comes back");
+
+        // It comes back: pacing re-engages with a fresh frame of slack and no
+        // memory of the old position.
+        c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 9_000_000));
+        assert!(c.pacing());
+        assert_eq!(c.budget(), 280_896);
+        assert!(!c.hold());
+    }
+
+    /// The silent parent the hold loop cannot see.
+    ///
+    /// A child with budget to spare never asks whether it should wait, so the
+    /// spin bound above never runs. If the parent's game leaves Multi-Player mode
+    /// mid-session, the only thing that notices is emulated time passing with no
+    /// packet behind it.
+    #[test]
+    fn a_silent_parent_is_aged_out_by_emulated_time_as_well() {
+        let mut c = CableProto::new();
+        c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 77));
+        assert!(c.pacing());
+        // Two frames of emulated time with nothing from the parent.
+        for _ in 0..456 {
+            c.advance(1232);
+        }
+        assert!(!c.pacing(), "561792 cycles of silence is a parent that has gone");
+        assert!(!c.hold());
+        assert_eq!(c.starved, 0, "aged out rather than given up on while waiting");
+    }
+
+    /// A peer on the old wire is refused, and refusal must not look like a
+    /// parent that is simply slow.
+    #[test]
+    fn a_peer_on_the_previous_wire_version_never_paces_a_child() {
+        let mut c = CableProto::new();
+        // Exactly what a version-2 build sends: 9 bytes, no time field.
+        let mut v2 = [0u8; 9];
+        v2[..3].copy_from_slice(&FAMILY);
+        v2[3] = b'2';
+        v2[4] = TAG_CLOCK;
+        c.on_packet(&v2);
+        assert_eq!(c.version_mismatch, 1, "it is ours, and it is not this version");
+        assert!(!c.pacing(), "a refused peer must not engage the pacing");
+        assert!(!c.hold(), "and must never hold the child");
+        assert_eq!(c.child_clock(), None, "nor deliver a transfer");
+    }
+
+    /// The 60 Hz floor: one tick a frame, whether or not the game is clocking.
+    #[test]
+    fn a_parent_ticks_once_a_frame_and_not_twice() {
+        let mut p = CableProto::new();
+        for line in 0..227 {
+            p.advance(1232);
+            assert!(!p.maybe_tick(), "line {line} is still inside the first frame");
+        }
+        p.advance(1232);
+        assert!(p.maybe_tick(), "280896 cycles is a frame, so a tick is owed");
+        assert!(!p.maybe_tick(), "and owed once, not every time it is asked");
+
+        let out = p.take_outbox();
+        assert_eq!(out.len(), 1, "exactly one packet on the wire for the frame");
+        assert_eq!(out[0][4], TAG_TICK);
+        assert_eq!(
+            u32::from_be_bytes([
+                out[0][TIME_OFF],
+                out[0][TIME_OFF + 1],
+                out[0][TIME_OFF + 2],
+                out[0][TIME_OFF + 3],
+            ]),
+            280_896,
+            "carrying the position it was sent at"
+        );
+
+        for _ in 0..228 {
+            p.advance(1232);
+        }
+        assert!(p.maybe_tick(), "and again the frame after");
+    }
+
+    /// Selecting Multi-Player mode drops the pacing with everything else.
+    ///
+    /// The budget was earned against whatever the parent was doing before the
+    /// game committed to this protocol, so it means nothing now. Disengaging
+    /// rather than zeroing is the safe direction: a child that is briefly too
+    /// fast collects a clock late, where a child wrongly held sees none at all.
+    #[test]
+    fn the_mode_select_edge_drops_the_pacing_too() {
+        let mut c = CableProto::new();
+        c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 12_345));
+        c.advance(280_896);
+        assert!(c.hold());
+
+        c.flush_pending();
+        assert!(!c.pacing(), "pacing is dropped with the transfers");
+        assert!(!c.hold(), "so the child runs until the parent speaks again");
+        c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 12_345 + 1232));
+        assert_eq!(
+            c.budget(),
+            280_896,
+            "and re-engaging grants a fresh frame, not a stale difference"
+        );
+    }
+
     #[test]
     fn a_parked_child_answers_two_clocks_with_the_word_armed_for_the_first() {
         let mut w = Wire::new();
@@ -944,7 +1426,7 @@ mod tests {
         // It LATCHES: a peer that also sends well-formed packets does not get a
         // half-working cable out of it.
         let mut ok = [0u8; PACKET_LEN];
-        put(&mut ok, TAG_CLOCK, 0, 0x8FFF, 0);
+        put(&mut ok, TAG_CLOCK, 0, 0x8FFF, 0, 0);
         p.on_packet(&ok);
         assert_eq!(
             p.child_clock(),
@@ -956,8 +1438,11 @@ mod tests {
     #[test]
     fn a_packet_without_the_cable_magic_is_ignored() {
         let mut p = CableProto::new();
-        // A wireless adapter packet on the same session: "RFU1" and 12 bytes.
-        let rfu = [0x52, 0x46, 0x55, 0x31, 1, 0, 0, 0, 0, 0, 0, 0];
+        // A wireless adapter packet on the same session: "RFU1" magic. Padded
+        // to a cable packet's length on purpose, so what rejects it is the
+        // family check and not the length check.
+        let rfu = [0x52, 0x46, 0x55, 0x31, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(rfu.len(), PACKET_LEN, "the test is only meaningful at full length");
         p.on_packet(&rfu);
         assert_eq!(p.child_clock(), None);
         assert!(p.take_outbox().is_empty(), "an adapter packet must not draw a cable reply");
