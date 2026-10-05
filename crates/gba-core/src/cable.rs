@@ -234,10 +234,17 @@ pub const FAMILY: [u8; 3] = *b"CBL";
 /// build needs 13, and the meaning changed, so a v3 child paired with a v2
 /// parent would never hear a tick, would starve, and would silently give up
 /// pacing. A session that degrades is harder to attribute than one that refuses.
-pub const WIRE_VERSION: u8 = b'3';
+///
+/// Went to `4` because the ROLES are now elected on this wire instead of taken
+/// from the frontend's peer numbering. Measured on two devices: each numbered
+/// the other peer 1 and itself 0, so both played the parent, both games offered
+/// the leader menu, and both clocked at each other. A v4 peer paired with a v3
+/// one must refuse rather than have one end elect while the other trusts its
+/// frontend. See [`TAG_HELLO`].
+pub const WIRE_VERSION: u8 = b'4';
 
-/// The full four-byte header of a packet this build will act on, "CBL3".
-pub const MAGIC: u32 = 0x4342_4C33;
+/// The full four-byte header of a packet this build will act on, "CBL4".
+pub const MAGIC: u32 = 0x4342_4C34;
 
 /// `[magic, 1, seq, word, 0]`: "I am clocking `word` into you as exchange
 /// `seq`."
@@ -264,6 +271,23 @@ pub const TAG_GAVE_UP: u8 = 3;
 /// Same job as mGBA's `SIO_EV_HARD_SYNC`, which fires every 0x80000 cycles
 /// whether or not a transfer is happening.
 pub const TAG_TICK: u8 = 4;
+
+/// `[magic, 5, 0, nonce_hi, 0, nonce_lo]`: "my identity is this, which end am I?"
+///
+/// Role election, on the wire, because the frontend's numbering cannot carry it.
+/// Measured on the owner's two devices on 2026-10-05: the tablet saw the phone as
+/// `cid=1` and the phone saw the tablet as `cid=1`, so both took themselves for
+/// peer 0 and both played the parent. An earlier session of the same pair came
+/// out 0 and 1, so the numbering is not stable either, and a role that is right
+/// by luck is worse than one that is wrong, because it hides for a session.
+///
+/// The rule: the LOWER identity is the parent. Both ends compute it from the same
+/// two numbers and cannot disagree. A collision is broken by perturbing our own
+/// identity and saying hello again, rather than by either end assuming. Until an
+/// identity has been heard from the peer the bus reports ONE unit, so the game
+/// reads SD low, concludes it has no partner, and never offers to link: the
+/// failure direction is a link that will not start rather than two leaders.
+pub const TAG_HELLO: u8 = 5;
 
 /// Every cable packet is this long: magic, tag, seq, word, lag, time.
 pub const PACKET_LEN: usize = 13;
@@ -435,6 +459,18 @@ pub struct CableProto {
     /// nobody; it lets ONE device's log answer "how far apart were we", which
     /// until now needed both logs side by side.
     peer_time: Option<u32>,
+    /// This end's identity for the role election, 48 bits. Supplied by the
+    /// transport, which is the layer that has a clock and an address to derive
+    /// one from.
+    identity: u64,
+    /// The peer's identity, once it has said hello. `None` is "the roles are not
+    /// settled", which is also "this bus has one unit on it".
+    peer_identity: Option<u64>,
+    /// Identities that arrived equal to ours, so one of them had to move.
+    pub election_ties: u64,
+    /// Cycles since the last identity announcement, so hellos repeat at most once
+    /// a frame while the roles are unsettled.
+    since_hello: u32,
 }
 
 impl Default for CableProto {
@@ -474,6 +510,10 @@ impl CableProto {
             holds: 0,
             starved: 0,
             peer_time: None,
+            identity: 0,
+            peer_identity: None,
+            election_ties: 0,
+            since_hello: 0,
         }
     }
 
@@ -507,6 +547,12 @@ impl CableProto {
         self.holds = 0;
         self.starved = 0;
         self.peer_time = None;
+        // The identity survives a reset; the peer's does not. A session edge
+        // means the pairing has to be made again, and re-deriving our own number
+        // would only add a chance of colliding with the one we already sent.
+        self.peer_identity = None;
+        self.election_ties = 0;
+        self.since_hello = 0;
     }
 
     /// What this unit presents on the bus.
@@ -632,6 +678,60 @@ impl CableProto {
         self.child_input.pop_front()
     }
 
+    /// Set this end's identity and announce it.
+    ///
+    /// Called by the transport at session start. 48 bits of it are used, which is
+    /// what fits beside the tag in a packet, and the odds of two devices drawing
+    /// the same number are negligible; a collision is handled anyway, because
+    /// "negligible" is how the last three evenings started.
+    pub fn set_identity(&mut self, nonce: u64) {
+        self.identity = nonce & 0xFFFF_FFFF_FFFF;
+        self.peer_identity = None;
+        self.say_hello();
+    }
+
+    /// Queue an identity announcement.
+    pub fn say_hello(&mut self) {
+        self.since_hello = 0;
+        let mut pkt = [0u8; PACKET_LEN];
+        let hi = (self.identity >> 32) as u16;
+        let lo = self.identity as u32;
+        put(&mut pkt, TAG_HELLO, 0, hi, 0, lo);
+        self.outbox.push_back(pkt);
+    }
+
+    /// Say hello again if the roles are still unsettled. Returns whether it did.
+    ///
+    /// Rate-limited by the caller, which knows about wall time. One packet a
+    /// frame until the peer answers is nothing next to a transfer every 28672
+    /// cycles, and it has to repeat because the first one can be lost while the
+    /// peer's session is still starting.
+    pub fn maybe_hello(&mut self) -> bool {
+        if self.peer_identity.is_some() || self.identity == 0 || self.since_hello < HORIZON {
+            return false;
+        }
+        self.say_hello();
+        true
+    }
+
+    /// Which end this unit is, or `None` while the roles are unsettled.
+    ///
+    /// The lower identity is the parent. Both ends compute this from the same two
+    /// numbers, so they cannot disagree, which is the whole point: the previous
+    /// version asked the frontend and the two devices got different answers.
+    pub fn role(&self) -> Option<u8> {
+        let peer = self.peer_identity?;
+        if self.identity == peer {
+            return None; // a tie is not a role, it is a re-roll
+        }
+        Some(u8::from(self.identity > peer))
+    }
+
+    /// Are the roles settled? While this is false the bus must report one unit.
+    pub fn elected(&self) -> bool {
+        self.role().is_some()
+    }
+
     /// This end emulated `cycles` more cycles.
     ///
     /// Both roles call it. A parent uses it only to know when it owes a tick; a
@@ -640,6 +740,7 @@ impl CableProto {
     /// child never asks.
     pub fn advance(&mut self, cycles: u32) {
         self.local_cycles = self.local_cycles.wrapping_add(cycles);
+        self.since_hello = self.since_hello.saturating_add(cycles);
         if !self.engaged {
             return;
         }
@@ -809,6 +910,31 @@ impl CableProto {
             self.credit(time);
         }
         match tag {
+            TAG_HELLO => {
+                let peer = ((word as u64) << 32) | time as u64;
+                if peer == self.identity {
+                    // Both ends drew the same number. Move ours rather than let
+                    // either end decide it is the parent: a tie broken by
+                    // assumption is two parents, which is the failure this whole
+                    // tag exists to end.
+                    self.election_ties += 1;
+                    self.identity = self
+                        .identity
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add(1)
+                        & 0xFFFF_FFFF_FFFF;
+                    self.peer_identity = None;
+                    self.say_hello();
+                } else {
+                    let first = self.peer_identity != Some(peer);
+                    self.peer_identity = Some(peer);
+                    // Answer so the peer learns ours too. Only on a new identity,
+                    // so two ends cannot trade hellos forever.
+                    if first {
+                        self.say_hello();
+                    }
+                }
+            }
             TAG_TICK => {
                 // Nothing else to do. The position was the whole message, and it
                 // is what keeps a child paced through menus, naming screens and
@@ -1169,6 +1295,123 @@ mod tests {
             w.proto[1].holds > child_lines as u64,
             "the child emulated {child_lines} scanlines and waited {} times, so it was              hardly throttled (the parent managed {parent_lines})",
             w.proto[1].holds
+        );
+    }
+
+    /// Two ends must come out of the election as opposite halves of one cable.
+    ///
+    /// This is the bug the second device session found, stated as a test. The
+    /// frontend numbered each device 0 and its peer 1, so both played the parent,
+    /// both games offered the leader menu, and both clocked at each other. The
+    /// roles cannot come from a number only one device computes.
+    #[test]
+    fn two_ends_elect_opposite_halves_of_the_cable() {
+        let mut w = Wire::new();
+        assert!(!w.proto[0].elected(), "nothing is settled before hello");
+        assert_eq!(w.proto[0].role(), None);
+
+        w.proto[0].set_identity(0x0000_1111_2222);
+        w.proto[1].set_identity(0x0000_3333_4444);
+        w.deliver(0);
+        w.deliver(1);
+
+        assert_eq!(w.proto[0].role(), Some(0), "the lower identity is the parent");
+        assert_eq!(w.proto[1].role(), Some(1), "and the higher one is the child");
+        assert!(w.proto[0].elected() && w.proto[1].elected());
+        assert_eq!(w.proto[0].election_ties, 0);
+
+        // Both ends computed the same answer from the same two numbers, which is
+        // the property that makes it impossible for them to disagree.
+        assert_ne!(
+            w.proto[0].role(),
+            w.proto[1].role(),
+            "two parents is the failure this exists to prevent"
+        );
+    }
+
+    /// The order the hellos arrive in must not change the outcome.
+    #[test]
+    fn the_election_does_not_depend_on_who_spoke_first() {
+        for first in [0usize, 1] {
+            let mut w = Wire::new();
+            w.proto[0].set_identity(0x0000_AAAA_0001);
+            w.proto[1].set_identity(0x0000_AAAA_0002);
+            w.deliver(first);
+            w.deliver(1 - first);
+            w.deliver(first);
+            assert_eq!(w.proto[0].role(), Some(0), "first={first}");
+            assert_eq!(w.proto[1].role(), Some(1), "first={first}");
+        }
+    }
+
+    /// An identity collision is broken, not assumed away.
+    ///
+    /// If both ends drew the same number, neither may decide it is the parent. One
+    /// of them has to move, and a tie is explicitly NOT a role.
+    #[test]
+    fn an_identity_collision_is_broken_rather_than_assumed() {
+        let mut w = Wire::new();
+        w.proto[0].set_identity(0x0000_DEAD_BEEF);
+        w.proto[1].set_identity(0x0000_DEAD_BEEF);
+
+        // Both say hello, both see their own number coming back at them.
+        for _ in 0..6 {
+            w.deliver(0);
+            w.deliver(1);
+        }
+        assert!(w.proto[0].election_ties > 0, "the collision has to be noticed");
+        assert_eq!(w.proto[0].elected(), w.proto[1].elected());
+        if w.proto[0].elected() {
+            assert_ne!(
+                w.proto[0].role(),
+                w.proto[1].role(),
+                "whatever the re-roll produced, the two ends must not agree on a role"
+            );
+        }
+    }
+
+    /// Hellos stop once the roles are settled, and repeat until they are.
+    ///
+    /// A hello every frame forever would be noise, and no hello after the first
+    /// lost one would be a session that never starts: the peer's own session can
+    /// still be coming up when the first announcement goes out.
+    #[test]
+    fn hello_repeats_until_answered_and_then_stops() {
+        let mut a = CableProto::new();
+        a.set_identity(0x0000_0000_0007);
+        a.take_outbox(); // the announcement set_identity queued
+
+        assert!(!a.maybe_hello(), "and not again in the same frame");
+        for _ in 0..228 {
+            a.advance(1232);
+        }
+        assert!(a.maybe_hello(), "still unsettled a frame later, so it asks again");
+        assert_eq!(a.take_outbox().len(), 1, "one announcement per frame, not a flood");
+
+        let mut peer = [0u8; PACKET_LEN];
+        put(&mut peer, TAG_HELLO, 0, 0, 0, 9);
+        a.on_packet(&peer);
+        assert_eq!(a.role(), Some(0), "identity 7 against 9 makes us the parent");
+        assert!(!a.maybe_hello(), "settled, so it stops");
+    }
+
+    /// A peer that restarts its session with a new identity is re-elected.
+    #[test]
+    fn a_peer_that_comes_back_with_a_new_identity_is_elected_again() {
+        let mut a = CableProto::new();
+        a.set_identity(0x0000_0000_0050);
+        let mut hello = |n: u32, a: &mut CableProto| {
+            let mut pkt = [0u8; PACKET_LEN];
+            put(&mut pkt, TAG_HELLO, 0, 0, 0, n);
+            a.on_packet(&pkt);
+        };
+        hello(0x80, &mut a);
+        assert_eq!(a.role(), Some(0), "0x50 against 0x80 makes us the parent");
+        hello(0x10, &mut a);
+        assert_eq!(
+            a.role(),
+            Some(1),
+            "the peer restarted with a lower number, so the roles swap rather than stick"
         );
     }
 

@@ -55,7 +55,7 @@ const RETRO_NETPACKET_FLUSH_HINT: i32 = 1 << 2;
 ///
 /// The Android side documents this core as advertising `-rfu-1`
 /// (`NetplayPlatformOverride.kt`), which this makes stale. Nothing reads it.
-static PROTOCOL: &[u8] = b"pocketrustadvance-link-3\0";
+static PROTOCOL: &[u8] = b"pocketrustadvance-link-4\0";
 
 /// How long a parent waits for a child's reply before giving up and reporting
 /// the transfer to the game as a failure.
@@ -223,7 +223,13 @@ impl Net {
     /// 2 and 3 carry nothing, which is worse than a session that plainly only
     /// links two. `cable_extra_peers` counts the ones left out.
     fn cable_units(&self) -> u8 {
-        if self.active && !self.cable.refusing() {
+        // Elected, not merely connected. A session that is live but whose roles
+        // are unsettled must look like a cable with nothing on the far end: the
+        // game reads SD low, decides it has no partner, and does not offer to
+        // link. The alternative is what the second device session did, where both
+        // ends believed they were the parent and both games offered the leader
+        // menu.
+        if self.active && !self.cable.refusing() && self.cable.elected() {
             2
         } else {
             1
@@ -257,7 +263,22 @@ unsafe extern "C" fn np_start(client_id: u16, send: SendFn, poll_receive: PollRe
         n.active = true;
         n.inbox.clear();
         n.reset_cable();
+        // An identity for the role election. The frontend's peer number cannot
+        // carry the roles (see `NetCable::id`), so the two ends compare numbers
+        // they each draw and the lower one is the parent. The clock supplies the
+        // entropy, mixed with our own peer number so that two devices starting in
+        // the same microsecond still differ.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let nonce = nanos
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add((client_id as u64) << 17)
+            .wrapping_add(std::process::id() as u64);
+        n.cable.set_identity(nonce);
     });
+    flush_cable_outbox();
 }
 
 unsafe extern "C" fn np_receive(buf: *const c_void, len: usize, client_id: u16) {
@@ -406,6 +427,10 @@ pub struct CableStats {
     /// The precise form of the stale-word hazard, where `stale_risk` is a proxy.
     pub cold: u64,
     pub answered: u64,
+    /// Which end the election made us, and how many identity collisions it broke.
+    /// `None` means the roles are not settled, which the game sees as no peer.
+    pub role: Option<u8>,
+    pub ties: u64,
 }
 
 pub fn cable_stats() -> CableStats {
@@ -424,6 +449,8 @@ pub fn cable_stats() -> CableStats {
         skew: n.cable.skew().unwrap_or(0),
         cold: n.cable.answered_cold,
         answered: n.cable.answered,
+        role: n.cable.role(),
+        ties: n.cable.election_ties,
     })
 }
 
@@ -436,14 +463,20 @@ impl LinkCable for NetCable {
         with_net(|n| n.cable_units())
     }
 
-    /// The parent is the device the frontend made peer 0.
+    /// Which end of the cable this is, elected on the wire.
     ///
-    /// Verified at source in the Android bridge: peer order is lowest IPv4
-    /// ascending and index 0 is the host, so both devices agree on the roles
-    /// without negotiating. The game does not care which end it is, it reads its
-    /// own ID out of SIOCNT and plays that part.
+    /// **It used to be the frontend's peer number, and that was wrong.** Measured
+    /// on the owner's two devices on 2026-10-05: the tablet saw the phone as
+    /// `cid=1` and the phone saw the tablet as `cid=1`, so both took themselves
+    /// for peer 0, both played the parent, and both games offered the leader
+    /// menu. An earlier session of the same pair came out 0 and 1, so the
+    /// numbering is not stable between sessions either, and the run that worked
+    /// worked by luck.
+    ///
+    /// Zero while unsettled is safe because `cable_units` reports one unit until
+    /// the election completes, so the game sees no partner and never clocks.
     fn id(&self) -> u8 {
-        with_net(|n| n.self_id.min(u8::MAX as u16) as u8)
+        with_net(|n| n.cable.role().unwrap_or(0))
     }
 
     fn set_output(&mut self, word: u16) {
@@ -457,11 +490,19 @@ impl LinkCable for NetCable {
     /// transport concern: the core only says how much time passed. A child's
     /// `advance` sends nothing.
     fn advance(&mut self, cycles: u32) {
-        let ticked = with_net(|n| {
+        let send = with_net(|n| {
             n.cable.advance(cycles);
-            n.self_id == 0 && n.cable.maybe_tick()
+            // A tick is a PARENT'S position, so only an elected parent may send
+            // one: an unsettled end emitting ticks would feed its peer's pacing
+            // budget while claiming a role it has not got.
+            let ticked = n.cable.role() == Some(0) && n.cable.maybe_tick();
+            // And while unsettled, say hello once a frame until the peer answers.
+            // The first announcement can go out while the peer's session is still
+            // coming up, and a lost one must not leave the pair silent forever.
+            let said_hello = n.cable.maybe_hello();
+            ticked || said_hello
         });
-        if ticked {
+        if send {
             flush_cable_outbox();
         }
     }

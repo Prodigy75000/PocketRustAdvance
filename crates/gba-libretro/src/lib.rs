@@ -992,10 +992,19 @@ pub extern "C" fn retro_run() {
                         // wire.
                         let mean = if c.waits > 0 { c.wait_us / c.waits } else { 0 };
                         format!(
-                            " cable_done={} cable_lost={} cable_extra={} cable_badver={} cable_rtx={} cable_wait_mean_us={} cable_wait_max_us={} cable_stale_risk={} cable_holds={} cable_starved={} cable_skew={} cable_cold={}/{} cable_wordsum={:016X}",
+                            " cable_done={} cable_lost={} cable_extra={} cable_badver={} cable_rtx={} cable_wait_mean_us={} cable_wait_max_us={} cable_stale_risk={} cable_holds={} cable_starved={} cable_skew={} cable_cold={}/{} cable_wordsum={:016X} cable_role={} cable_ties={}",
                             c.done, c.lost, c.extra_peers, c.bad_version, c.rtx, mean, c.wait_max_us,
                             c.stale_risk, c.holds, c.starved, c.skew, c.cold, c.answered,
-                            g.cable_wordsum()
+                            g.cable_wordsum(),
+                            match c.role {
+                                Some(0) => "parent",
+                                Some(_) => "child",
+                                // Unsettled. The bus reports one unit while this
+                                // reads none, so a game that is offering to link
+                                // at all has already elected.
+                                None => "none",
+                            },
+                            c.ties
                         )
                     } else {
                         String::new()
