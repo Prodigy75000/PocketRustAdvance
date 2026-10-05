@@ -1088,6 +1088,75 @@ mod tests {
         assert_eq!(child.bus.read16(0x0400_0120, N), 0x8FFF);
     }
 
+    /// A whole Pokemon link frame, nine transfers, driven the way the game
+    /// drives it.
+    ///
+    /// One transfer proves the plumbing; a sequence proves it keeps working.
+    /// This is the shape gpSP documents for the Pokemon protocol: a checksum
+    /// word followed by eight data words, with each side writing its next word
+    /// from the interrupt of the previous transfer. It catches what a single
+    /// exchange cannot: a sequence number that stops matching, a busy bit that
+    /// is not clear in time for the next clock, a child queue that drifts
+    /// behind, and an interrupt that fires once and then stops.
+    #[test]
+    fn a_nine_transfer_pokemon_frame_runs_end_to_end() {
+        use crate::bus::{Access::NonSeq as N, Bus};
+
+        let mut rom = vec![0u8; 0x200];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        let (parent_end, child_end) = crate::cable::local_pair();
+        let mut parent = Gba::new(rom.clone(), Vec::new());
+        let mut child = Gba::new(rom, Vec::new());
+        parent.connect_cable(Box::new(parent_end));
+        child.connect_cable(Box::new(child_end));
+        parent.render_enabled = false;
+        child.render_enabled = false;
+
+        const MULTI: u16 = 0x2000 | 0x4000 | 3;
+        for g in [&mut parent, &mut child] {
+            g.bus.write16(0x0400_0134, 0x0000, N);
+            g.bus.write16(0x0400_0128, MULTI, N);
+        }
+
+        // Transfer 0 is the checksum word, 1..=8 are the frame's data.
+        let parent_words: [u16; 9] = [0x0000, 0x8FFF, 0x0102, 0x0304, 0x0506, 0x0708, 0x090A, 0x0B0C, 0x0D0E];
+        let child_words: [u16; 9] = [0x0000, 0xB9A0, 0x1112, 0x1314, 0x1516, 0x1718, 0x191A, 0x1B1C, 0x1D1E];
+
+        for i in 0..9 {
+            // Each side presents its word, exactly as its serial interrupt
+            // handler would.
+            parent.bus.write16(0x0400_012A, parent_words[i], N);
+            child.bus.write16(0x0400_012A, child_words[i], N);
+            parent.bus.if_ = 0;
+            child.bus.if_ = 0;
+
+            parent.bus.write16(0x0400_0128, MULTI | 0x0080, N);
+            parent.run_frame();
+            child.run_frame();
+
+            assert_eq!(
+                (parent.bus.read16(0x0400_0120, N), parent.bus.read16(0x0400_0122, N)),
+                (parent_words[i], child_words[i]),
+                "transfer {i}: the parent must see both words"
+            );
+            assert_eq!(
+                (child.bus.read16(0x0400_0120, N), child.bus.read16(0x0400_0122, N)),
+                (parent_words[i], child_words[i]),
+                "transfer {i}: and the child must see the same pair, in the same slots"
+            );
+            assert_eq!(
+                parent.bus.read16(0x0400_0128, N) & 0x00C0,
+                0,
+                "transfer {i}: neither busy nor an error once it has landed"
+            );
+            assert_ne!(parent.bus.if_ & 0x80, 0, "transfer {i}: the parent interrupts");
+            assert_ne!(child.bus.if_ & 0x80, 0, "transfer {i}: so does the child");
+        }
+
+        assert_eq!(parent.cable_stats(), (9, 0), "nine completed, none lost");
+        assert_eq!(child.cable_stats(), (9, 0));
+    }
+
     /// A child cannot clock the bus. The start bit is read-only for it on
     /// hardware, and a game that writes it anyway must not be left polling a
     /// busy bit that nothing is ever going to clear.
