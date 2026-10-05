@@ -745,6 +745,31 @@ pub extern "C" fn retro_run() {
         // through the receive callback; that callback only touches the
         // netpacket module's own state, never `State`, which is why this is
         // safe to do from inside `with_state`.
+        // The link cable goes on when a session starts and comes off when it
+        // stops, because a cable is a property of the SESSION rather than of the
+        // cartridge. A cart that expects the wireless adapter keeps that
+        // instead: the two are different devices on the same port, and no game
+        // uses both, so attaching the cable only where there is no adapter keeps
+        // this change away from all 43 adapter titles.
+        if let Some(gba) = &mut s.gba {
+            let want = netpacket::is_active() && !gba.rfu_attached();
+            if want != gba.cable_attached() {
+                if want {
+                    gba.connect_cable(Box::new(netpacket::NetCable));
+                } else {
+                    gba.disconnect_cable();
+                }
+                log_line(
+                    s.log,
+                    &format!(
+                        "[cable] {} self_id={}",
+                        if want { "attached" } else { "detached" },
+                        netpacket::self_id()
+                    ),
+                );
+            }
+        }
+
         if netpacket::is_active() {
             if let Some(gba) = &mut s.gba {
                 // Cheap and idempotent, and it has to land before the game
@@ -936,8 +961,20 @@ pub extern "C" fn retro_run() {
                     // "it sounded rough on the tablet" cannot be told apart from a
                     // bug in the mixer. Both counters are cumulative, like the
                     // skip counts, so consecutive heartbeats give the rate.
+                    // The cable rides along for the same reason, and only while
+                    // one is attached: a cable that is moving words and a cable
+                    // that is silently never asked look identical on screen, so
+                    // the completed count is the one number that tells them
+                    // apart. `lost` is give-ups and `extra` is peers this cable
+                    // cannot carry.
+                    let cable = if g.cable_attached() {
+                        let (done, lost, extra) = netpacket::cable_stats();
+                        format!(" cable_done={done} cable_lost={lost} cable_extra={extra}")
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        " idle_pc={:08X} skips={} skipped_cycles={} ds_pops={} ds_underruns={}",
+                        " idle_pc={:08X} skips={} skipped_cycles={} ds_pops={} ds_underruns={}{cable}",
                         g.idle.probe_r15.wrapping_sub(4),
                         g.idle.skips,
                         g.idle.skipped_cycles,

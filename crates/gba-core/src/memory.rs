@@ -13,6 +13,16 @@ use crate::save::Save;
 /// Serial transfer durations, in system cycles, for eight bits at each of the
 /// two Normal-mode shift rates: 16777216 / 256000 * 8 and 16777216 / 2000000
 /// * 8. A 32-bit transfer costs four of them.
+/// Cycles a Multi-Player transfer occupies, from SIOCNT's baud field and the
+/// number of units on the bus. A free function so both ends compute the
+/// duration the same way: the parent sets the busy window when it clocks and
+/// the child sets it when the clock lands, and a mismatch would drift the two
+/// games' idea of how long a transfer takes.
+fn multi_cycles(cnt: u16, units: u8) -> u32 {
+    let slot = (units as usize).clamp(1, crate::cable::MAX_UNITS) - 1;
+    crate::cable::TRANSFER_CYCLES[(cnt & 3) as usize][slot]
+}
+
 const CYC_256KHZ_8BIT: u32 = 524;
 const CYC_2MHZ_8BIT: u32 = 67;
 
@@ -72,6 +82,24 @@ pub struct GbaBus {
     /// expect one. `None` leaves every serial path exactly as it was, which is
     /// what keeps the no-cable behaviour byte-identical for every other game.
     pub rfu: Option<crate::rfu::Rfu>,
+    /// The link cable, when a netplay session is live and the cartridge does
+    /// not use the wireless adapter instead. `None` leaves every serial path
+    /// exactly as it was, so the offline behaviour of all 2729 licensed titles
+    /// is untouched by this feature existing.
+    pub cable: Option<Box<dyn crate::cable::LinkCable>>,
+    /// A Multi-Player transfer is in flight over the cable. Distinguishes a
+    /// cable completion from an adapter one, which clear different bits.
+    cable_busy: bool,
+    /// The words a child's transfer will land, held until its duration is up.
+    /// `None` on a parent, which does not know them until it collects the
+    /// children's replies at completion.
+    cable_words: Option<[u16; crate::cable::MAX_UNITS]>,
+    /// Transfers completed over the cable, and transfers the cable gave up on.
+    /// Both counted because a silent cable and a broken one look identical from
+    /// outside, which is how two wireless adapter bugs stayed invisible for a
+    /// whole device session.
+    pub cable_transfers: u64,
+    pub cable_failures: u64,
     /// `cycles` as of the last `step_serial`, so serial timing is a delta the
     /// same way the timers are.
     serial_cycles: u64,
@@ -410,6 +438,11 @@ impl GbaBus {
         GbaBus {
             sensors,
             rfu,
+            cable: None,
+            cable_busy: false,
+            cable_words: None,
+            cable_transfers: 0,
+            cable_failures: 0,
             serial_cycles: 0,
             serial_pending: 0,
             bios: b.into_boxed_slice(),
@@ -1318,6 +1351,11 @@ impl GbaBus {
         let prev_rcnt = if touches_rcnt { self.io_u16(0x134) } else { 0 };
         let touches_siocnt = off < 0x12A && off + width > 0x128;
         let prev_siocnt = if touches_siocnt { self.io_u16(0x128) } else { 0 };
+        // SIOMLT_SEND, which in Multi-Player mode is this unit's word. A child's
+        // reply is answered by its transport the instant the parent's clock
+        // arrives, so the cable has to be told on the STORE rather than at the
+        // next transfer, or it answers with the previous word.
+        let touches_mlt_send = off < 0x12C && off + width > 0x12A;
         for i in 0..width {
             let o = off + i;
             let byte = (val >> (i * 8)) as u8;
@@ -1427,6 +1465,26 @@ impl GbaBus {
             }
             self.set_io16(0x128, cnt);
         }
+        // The read-only half of SIOCNT in Multi-Player mode. SI (bit 2), SD
+        // (bit 3), the ID (bits 4-5) and the error flag (bit 6) are driven by
+        // the cable, not by the game, and a game reads them to find out whether
+        // it is the parent and whether its peer is there. We used to store
+        // whatever the game wrote, which with a cable attached would let it
+        // declare itself parent and both units would then drive the clock.
+        if touches_siocnt && self.cable.is_some() && self.multi_mode() {
+            let written = self.io_u16(0x128);
+            // Bit 7 is Start on a parent and a read-only Busy on a child, so a
+            // child's write to it is dropped along with the status bits.
+            let keep = if self.cable.as_ref().is_some_and(|c| c.id() == 0) { 0x007C } else { 0x00FC };
+            self.set_io16(0x128, (written & !keep) | (prev_siocnt & keep));
+            self.drive_multi_status();
+        }
+        if touches_mlt_send {
+            let word = self.io_u16(0x12A);
+            if let Some(cable) = self.cable.as_mut() {
+                cable.set_output(word);
+            }
+        }
         if touches_siocnt {
             self.sio_transfer();
         }
@@ -1490,13 +1548,47 @@ impl GbaBus {
                 self.serial_pending -= delta;
             } else {
                 self.serial_pending = 0;
-                let cnt = self.io_u16(0x128);
-                // Clear start, and set SI to mark the device busy: that is the
-                // handshake the adapter runs between words.
-                self.set_io16(0x128, (cnt & !0x0080) | 0x0004);
-                if cnt & 0x4000 != 0 {
-                    self.if_ |= 1 << 7;
+                if self.cable_busy {
+                    self.multi_finish();
+                } else {
+                    let cnt = self.io_u16(0x128);
+                    // Clear start, and set SI to mark the device busy: that is
+                    // the handshake the adapter runs between words.
+                    self.set_io16(0x128, (cnt & !0x0080) | 0x0004);
+                    if cnt & 0x4000 != 0 {
+                        self.if_ |= 1 << 7;
+                    }
                 }
+            }
+        }
+
+        // A child's transfers are started by the parent, so they arrive rather
+        // than being asked for. Collected once per scanline: that adds at most
+        // 73 us to the parent's wait, against a transfer the game has budgeted
+        // 343 us for, and costs one test per scanline when no cable is attached.
+        if self.cable.is_some() && self.multi_mode() {
+            // Hardware drives SI, SD and the ID continuously, not only when the
+            // game writes SIOCNT. A game that set up Multi-Player mode before
+            // the session started would otherwise read SD low for as long as it
+            // only polls, and conclude it has no peer.
+            self.drive_multi_status();
+        }
+        if self.cable.is_some() && !self.cable_busy && self.multi_mode() {
+            let id = self.cable.as_ref().map_or(0, |c| c.id());
+            let units = self.cable.as_ref().map_or(1, |c| c.units());
+            let clocked = (id != 0).then(|| self.cable.as_mut().unwrap().child_clock()).flatten();
+            if let Some((parent_word, own_word)) = clocked {
+                let mut words = [crate::cable::ABSENT; crate::cable::MAX_UNITS];
+                words[0] = parent_word;
+                words[id as usize] = own_word;
+                self.cable_words = Some(words);
+                self.cable_busy = true;
+                let cnt = self.io_u16(0x128);
+                // Busy goes up for the transfer's real duration. A game that
+                // polls the bit mid-transfer has to see it set, and a child's
+                // only evidence a transfer is happening is this plus the IRQ.
+                self.set_io16(0x128, cnt | 0x0080);
+                self.serial_pending = multi_cycles(cnt, units);
             }
         }
 
@@ -1525,6 +1617,113 @@ impl GbaBus {
         }
     }
 
+    /// Drop the cable and any transfer in flight over it.
+    pub fn detach_cable(&mut self) {
+        self.cable = None;
+        self.cable_words = None;
+        // A transfer that was in flight has to stop counting down, or the next
+        // completion lands on a port with nothing attached and clears bits a
+        // cable owns.
+        if self.cable_busy {
+            self.cable_busy = false;
+            self.serial_pending = 0;
+        }
+    }
+
+    /// Is the port in Multi-Player mode? RCNT bit 15 has to be clear or the
+    /// pins are not serial pins at all, and SIOCNT bits 12-13 select the mode.
+    pub(crate) fn multi_mode(&self) -> bool {
+        self.io_u16(0x134) & 0x8000 == 0 && self.io_u16(0x128) & 0x3000 == 0x2000
+    }
+
+    /// Drive the bits of SIOCNT the cable owns rather than the game: SI says
+    /// which end of the chain we are, SD says the bus is whole, and the ID is
+    /// our position on it. All three are read-only to the game, and all three
+    /// are what a game reads to decide whether it is the parent and whether its
+    /// peer has arrived.
+    fn drive_multi_status(&mut self) {
+        let Some((id, units)) = self.cable.as_ref().map(|c| (c.id() as u16, c.units())) else {
+            return;
+        };
+        if !self.multi_mode() {
+            return;
+        }
+        let mut cnt = (self.io_u16(0x128) & !0x003C) | (id << 4);
+        if id != 0 {
+            cnt |= 0x0004; // SI low on the parent, high on a child
+        }
+        if units >= 2 {
+            cnt |= 0x0008; // SD: every unit is present and ready
+        }
+        self.set_io16(0x128, cnt);
+    }
+
+    /// Start a Multi-Player transfer over the cable.
+    ///
+    /// Only the parent can: on hardware the start bit is read-only for a child,
+    /// so a child that writes it is dropping the write, not queueing a transfer
+    /// it will wait for forever.
+    fn multi_start(&mut self, cnt: u16) {
+        let Some((id, units)) = self.cable.as_ref().map(|c| (c.id(), c.units())) else {
+            return;
+        };
+        if id != 0 {
+            self.set_io16(0x128, cnt & !0x0080);
+            return;
+        }
+        let own = self.io_u16(0x12A);
+        self.cable.as_mut().unwrap().parent_start(own);
+        // Every slot reads FFFF while the transfer is in flight, which is what
+        // a game polling mid-transfer sees on hardware.
+        for slot in 0..crate::cable::MAX_UNITS as u32 {
+            self.set_io16(0x120 + slot * 2, crate::cable::ABSENT);
+        }
+        self.cable_busy = true;
+        self.cable_words = None;
+        self.serial_pending = multi_cycles(cnt, units);
+    }
+
+    /// Land a Multi-Player transfer: every unit's word, the IDs, and the IRQ.
+    fn multi_finish(&mut self) {
+        self.cable_busy = false;
+        let words = match self.cable_words.take() {
+            Some(w) => Some(w),
+            // A parent collects the children's words HERE rather than at the
+            // start, so the network round trip overlaps the transfer's own
+            // duration instead of being added to it.
+            None => self.cable.as_mut().and_then(|c| c.parent_result()),
+        };
+        if words.is_some() {
+            self.cable_transfers += 1;
+        } else {
+            self.cable_failures += 1;
+        }
+        let landed = words.unwrap_or([crate::cable::ABSENT; crate::cable::MAX_UNITS]);
+        for (slot, word) in landed.iter().enumerate() {
+            self.set_io16(0x120 + slot as u32 * 2, *word);
+        }
+        // Clear busy, and raise the error flag only when the cable gave up: a
+        // game that is told the transfer worked will trust FFFF as data, where
+        // one that is told it failed runs its own link-error path.
+        let mut cnt = self.io_u16(0x128) & !0x00C0;
+        if words.is_none() {
+            cnt |= 0x0040;
+        }
+        self.set_io16(0x128, cnt);
+        self.drive_multi_status();
+        if std::env::var_os("GBA_SIOLOG").is_some() {
+            eprintln!(
+                "  CABLE {} {:04X} {:04X} {:04X} {:04X}{}",
+                if words.is_some() { "ok " } else { "ERR" },
+                landed[0], landed[1], landed[2], landed[3],
+                if cnt & 0x4000 != 0 { "  irq" } else { "" },
+            );
+        }
+        if cnt & 0x4000 != 0 {
+            self.if_ |= 1 << 7;
+        }
+    }
+
     /// Complete a serial transfer with nothing on the other end of the cable.
     ///
     /// The SIO registers used to be plain storage, so the start/busy bit stayed
@@ -1544,6 +1743,10 @@ impl GbaBus {
             return; // start/busy not set: nothing to do
         }
         if cnt & 0x3000 == 0x2000 {
+            if self.cable.is_some() && self.io_u16(0x134) & 0x8000 == 0 {
+                self.multi_start(cnt);
+                return;
+            }
             // Multi-Player. SIOMULTI0-3 reset to FFFF on start, then each unit's
             // own send data lands in its own slot. We are the parent (ID 0) and
             // alone, so slots 1-3 stay FFFF, which is how a game sees "no peer".

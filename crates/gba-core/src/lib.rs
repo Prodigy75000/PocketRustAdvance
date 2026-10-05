@@ -10,6 +10,7 @@
 
 pub mod apu;
 pub mod bus;
+pub mod cable;
 pub mod cpu;
 pub mod memory;
 pub mod jit;
@@ -276,7 +277,15 @@ impl Gba {
             // Only while the adapter is waiting on the air. Outside that window
             // the game is driving transfers itself and an early delivery buys
             // nothing, so this costs one check per scanline when idle.
-            if self.bus.rfu.as_ref().map_or(false, |r| r.awaiting_event()) {
+            // A cable widens this to every scanline. A child's reply is
+            // produced by its transport, so this is not about the reply: it is
+            // the only thing that makes the transport RUN, and until it does the
+            // peer's parent is blocked. 228 polls a frame puts the worst-case
+            // delivery delay at 73 us against a transfer the game has budgeted
+            // 343 us for.
+            if (self.bus.cable.is_some() && self.bus.multi_mode())
+                || self.bus.rfu.as_ref().map_or(false, |r| r.awaiting_event())
+            {
                 for (from, bytes) in poll() {
                     if let Some(rfu) = self.bus.rfu.as_mut() {
                         rfu.net_receive(&bytes, from);
@@ -566,6 +575,40 @@ impl Gba {
             .rfu
             .as_ref()
             .map(|r| (r.commands, r.resets, r.state_name()))
+    }
+
+    /// Attach a link cable. The serial port then models a real Multi-Player
+    /// bus instead of a lone unit with nothing plugged in.
+    ///
+    /// Deliberately NOT done from the cartridge the way the wireless adapter is:
+    /// a cable is a property of the session, not of the game, so it goes on when
+    /// a netplay session starts and comes off when it stops.
+    pub fn connect_cable(&mut self, cable: Box<dyn crate::cable::LinkCable>) {
+        self.bus.cable = Some(cable);
+    }
+
+    /// Take the cable away, leaving the port exactly as it is with nothing
+    /// attached.
+    pub fn disconnect_cable(&mut self) {
+        self.bus.detach_cable();
+    }
+
+    pub fn cable_attached(&self) -> bool {
+        self.bus.cable.is_some()
+    }
+
+    /// Does this cartridge use the wireless adapter? The two devices sit on the
+    /// same port, so a session attaches one or the other, never both.
+    pub fn rfu_attached(&self) -> bool {
+        self.bus.rfu.is_some()
+    }
+
+    /// Transfers the cable completed, and transfers it gave up on. Zero
+    /// completions separates "the cable is wrong" from "the game never asked",
+    /// which is the distinction every silent failure in the adapter work turned
+    /// out to need.
+    pub fn cable_stats(&self) -> (u64, u64) {
+        (self.bus.cable_transfers, self.bus.cable_failures)
     }
 
     /// Tell the adapter which peer the frontend thinks we are. The device id
@@ -859,6 +902,209 @@ mod tests {
             on.bus.cur_pc, 0x0800_0000,
             "an armed watchpoint must still track the executing PC"
         );
+    }
+
+    /// Two cores wired together must actually move a word in both directions.
+    ///
+    /// The desk harness: the register model is exercised the way a game drives
+    /// it (mode, word, start bit) rather than through the cable's own API, so
+    /// this fails if the masking, the pacing, the slot assignment or the IRQ is
+    /// wrong, and it needs no network and no second device. Every link bug
+    /// PocketRust shipped was reproducible this way.
+    #[test]
+    fn two_cores_exchange_a_word_over_the_cable() {
+        use crate::bus::{Access::NonSeq as N, Bus};
+
+        let mut rom = vec![0u8; 0x200];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes()); // B .
+        let (parent_end, child_end) = crate::cable::local_pair();
+        let mut parent = Gba::new(rom.clone(), Vec::new());
+        let mut child = Gba::new(rom, Vec::new());
+        parent.connect_cable(Box::new(parent_end));
+        child.connect_cable(Box::new(child_end));
+        parent.render_enabled = false;
+        child.render_enabled = false;
+
+        // Both games enter Multi-Player mode at 115200 baud with the serial
+        // interrupt enabled, which is what Pokemon's link code does.
+        const MULTI: u16 = 0x2000 | 0x4000 | 3;
+        for g in [&mut parent, &mut child] {
+            g.bus.write16(0x0400_0134, 0x0000, N); // RCNT: these are serial pins
+            g.bus.write16(0x0400_0128, MULTI, N);
+        }
+
+        // Before any transfer, each game has to be able to read which end it is
+        // and whether its peer is there.
+        assert_eq!(
+            parent.bus.read16(0x0400_0128, N) & 0x003C,
+            0x0008,
+            "the parent reads SI low, ID 0 and SD high"
+        );
+        assert_eq!(
+            child.bus.read16(0x0400_0128, N) & 0x003C,
+            0x001C,
+            "the child reads SI high, ID 1 and SD high"
+        );
+
+        // The child presents its word, then the parent clocks.
+        child.bus.write16(0x0400_012A, 0xB9A0, N);
+        parent.bus.write16(0x0400_012A, 0x8FFF, N);
+        parent.bus.write16(0x0400_0128, MULTI | 0x0080, N);
+        assert_eq!(
+            parent.bus.read16(0x0400_0128, N) & 0x0080,
+            0x0080,
+            "the transfer is paced, so it is still busy the instant it starts"
+        );
+
+        parent.run_frame();
+        assert_eq!(parent.bus.read16(0x0400_0120, N), 0x8FFF, "parent slot 0 is its own word");
+        assert_eq!(parent.bus.read16(0x0400_0122, N), 0xB9A0, "parent slot 1 is the child's");
+        assert_eq!(parent.bus.read16(0x0400_0124, N), 0xFFFF, "no third unit");
+        let cnt = parent.bus.read16(0x0400_0128, N);
+        assert_eq!(cnt & 0x0080, 0, "busy clears when the transfer lands");
+        assert_eq!(cnt & 0x0040, 0, "and it did not land as an error");
+        assert_ne!(parent.bus.if_ & 0x80, 0, "a completed transfer raises the serial IRQ");
+        assert_eq!(parent.cable_stats(), (1, 0));
+
+        // The child is driven by the parent's clock, not by its own game.
+        child.run_frame();
+        assert_eq!(child.bus.read16(0x0400_0120, N), 0x8FFF, "the child sees the parent's word");
+        assert_eq!(child.bus.read16(0x0400_0122, N), 0xB9A0, "and its own in its own slot");
+        assert_eq!(child.bus.read16(0x0400_0128, N) & 0x0080, 0, "the child is idle again");
+        assert_ne!(child.bus.if_ & 0x80, 0, "both ends interrupt on the same transfer");
+        assert_eq!(child.cable_stats(), (1, 0));
+    }
+
+    /// A transfer has to occupy the time hardware would spend on it.
+    ///
+    /// The lone-unit path completes inside the store, which is safe because
+    /// there is nobody to stay in step with. Over a cable it is not: both ends
+    /// compute the busy window from the same baud field, a game can poll the
+    /// busy bit, and completing in no time at all would let a parent clock
+    /// faster than its peer can answer. 115200 baud with two units is 5755
+    /// cycles, so four scanlines of 1232 must not be enough and five must be.
+    #[test]
+    fn a_transfer_occupies_the_time_its_baud_rate_says() {
+        use crate::bus::{Access::NonSeq as N, Bus};
+
+        let mut rom = vec![0u8; 0x200];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        let (parent_end, child_end) = crate::cable::local_pair();
+        let mut gba = Gba::new(rom, Vec::new());
+        gba.connect_cable(Box::new(parent_end));
+        let mut child = child_end;
+        crate::cable::LinkCable::set_output(&mut child, 0x4321);
+
+        const MULTI: u16 = 0x2000 | 3; // Multi-Player, 115200 baud
+        gba.bus.write16(0x0400_0134, 0x0000, N);
+        gba.bus.write16(0x0400_0128, MULTI, N);
+        gba.bus.write16(0x0400_012A, 0x1234, N);
+        gba.bus.write16(0x0400_0128, MULTI | 0x0080, N);
+
+        let mut lines = 0;
+        while gba.bus.read16(0x0400_0128, N) & 0x0080 != 0 {
+            gba.bus.cycles += 1232; // one scanline
+            gba.bus.step_serial();
+            lines += 1;
+            assert!(lines <= 8, "the transfer never completed");
+        }
+        assert_eq!(lines, 5, "5755 cycles is five scanlines of 1232, not one");
+    }
+
+    /// A cable has to be offered the network every scanline, and only while the
+    /// port is actually in Multi-Player mode.
+    ///
+    /// This is the one that matters most and the one PocketRust shipped wrong:
+    /// a child answers a clock from its transport, so the transport RUNNING is
+    /// the whole requirement, and polling once a frame makes every paired
+    /// exchange cost a peer a full frame. The mode gate is the other half: a
+    /// session can be live for an hour of a game that never links, and 228 calls
+    /// into the frontend per frame to deliver nothing is pure cost.
+    #[test]
+    fn a_cable_is_offered_the_network_every_scanline_but_only_in_multi_player_mode() {
+        use crate::bus::{Access::NonSeq as N, Bus};
+
+        let mut rom = vec![0u8; 0x200];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        let (parent_end, _child_end) = crate::cable::local_pair();
+        let mut gba = Gba::new(rom, Vec::new());
+        gba.connect_cable(Box::new(parent_end));
+        gba.render_enabled = false;
+
+        let mut polls = 0u32;
+        gba.run_frame_polling(&mut || {
+            polls += 1;
+            Vec::new()
+        });
+        assert_eq!(polls, 0, "the port is not in Multi-Player mode, so there is nothing to carry");
+
+        gba.bus.write16(0x0400_0134, 0x0000, N);
+        gba.bus.write16(0x0400_0128, 0x2003, N);
+        gba.run_frame_polling(&mut || {
+            polls += 1;
+            Vec::new()
+        });
+        assert_eq!(
+            polls, TOTAL_LINES,
+            "once linking, every scanline: a peer blocked on a reply is waiting on this"
+        );
+    }
+
+    /// A child cannot clock the bus. The start bit is read-only for it on
+    /// hardware, and a game that writes it anyway must not be left polling a
+    /// busy bit that nothing is ever going to clear.
+    #[test]
+    fn a_child_cannot_start_a_transfer() {
+        use crate::bus::{Access::NonSeq as N, Bus};
+
+        let mut rom = vec![0u8; 0x200];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        let (_parent_end, child_end) = crate::cable::local_pair();
+        let mut child = Gba::new(rom, Vec::new());
+        child.connect_cable(Box::new(child_end));
+        child.render_enabled = false;
+
+        child.bus.write16(0x0400_0134, 0x0000, N);
+        child.bus.write16(0x0400_0128, 0x2003, N);
+        child.bus.write16(0x0400_012A, 0x1234, N);
+        child.bus.write16(0x0400_0128, 0x2083, N);
+        assert_eq!(
+            child.bus.read16(0x0400_0128, N) & 0x0080,
+            0,
+            "the write to the start bit is dropped, not queued"
+        );
+        child.run_frame();
+        assert_eq!(child.cable_stats(), (0, 0), "and no transfer happened");
+    }
+
+    /// Taking the cable away has to leave the port exactly as it is with
+    /// nothing plugged in, because that is what every other game in the library
+    /// sees and it is the path the whole corpus was swept against.
+    #[test]
+    fn a_detached_cable_leaves_a_lone_unit_behind() {
+        use crate::bus::{Access::NonSeq as N, Bus};
+
+        let mut rom = vec![0u8; 0x200];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        let (parent_end, _child_end) = crate::cable::local_pair();
+        let mut gba = Gba::new(rom, Vec::new());
+        gba.connect_cable(Box::new(parent_end));
+        gba.render_enabled = false;
+        gba.bus.write16(0x0400_0134, 0x0000, N);
+        gba.bus.write16(0x0400_0128, 0x2003, N);
+        gba.bus.write16(0x0400_012A, 0xCAFE, N);
+        gba.bus.write16(0x0400_0128, 0x2083, N);
+        gba.disconnect_cable();
+        assert!(!gba.cable_attached());
+
+        // The lone-unit path completes inside the store, so the slots are right
+        // immediately and nothing is left counting down.
+        gba.bus.write16(0x0400_0128, 0x2083, N);
+        assert_eq!(gba.bus.read16(0x0400_0120, N), 0xCAFE, "its own word echoes back");
+        assert_eq!(gba.bus.read16(0x0400_0122, N), 0xFFFF, "no peer");
+        let cnt = gba.bus.read16(0x0400_0128, N);
+        assert_eq!(cnt & 0x0080, 0, "and the start bit does not stay set");
+        assert_eq!(cnt & 0x0008, 0x0008, "a lone unit drives SD");
     }
 
     /// Every single-register load spends one internal cycle moving the loaded
