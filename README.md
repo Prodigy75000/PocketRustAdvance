@@ -73,6 +73,24 @@ To cross-compile the Android `.so`, point `CARGO_TARGET_AARCH64_LINUX_ANDROID_LI
 at your NDK's `aarch64-linux-android21-clang` and build with
 `--target aarch64-linux-android`.
 
+**Where the artifact lands depends on how you invoke cargo, and it is not where
+most of this fleet's cores put it.** This repo has no workspace root of its own.
+Built from inside the TrophyHub umbrella it is a workspace member and output goes
+to the umbrella's `../target/`. Built standalone against a crate manifest, which
+is what a clean clone and any cross-compile script does, cargo puts `target/`
+beside that manifest:
+
+```sh
+cargo build --release --manifest-path crates/gba-libretro/Cargo.toml --target <triple>
+# -> crates/gba-libretro/target/<triple>/release/libgbacore_libretro.{so,dylib}
+#    NOT ./target/<triple>/release/...
+```
+
+Every other in-house Rust core here is its own workspace, so a script copied from
+one of them builds successfully and then fails at the copy step with "No such file
+or directory", which is a confusing five minutes. Derive the path from the
+manifest rather than assuming the repo root. (Found by TH-iOS, 2026-10-05.)
+
 ## License
 
 GPL-3.0-or-later. See [`LICENSE`](LICENSE).
