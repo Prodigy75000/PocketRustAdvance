@@ -99,8 +99,11 @@ pub const TRANSFER_CYCLES: [[u32; MAX_UNITS]; 4] = [
 ///
 /// So nine round trips, 72 ms, have to happen inside what the game believes is
 /// one 16.7 ms frame. The frame has to STRETCH IN WALL TIME, on both devices
-/// together, which is what [`LinkCable::wait_for_clock`] is for. A trade runs at
-/// about 14 fps and completes, instead of running at 60 and failing.
+/// together: a trade runs at about 14 fps and completes, instead of running at
+/// 60 and failing. There is no method here for that yet. The approach that was
+/// tried, a `wait_for_clock` on this trait which blocked a child as soon as its
+/// game wrote SIOMLT_SEND, is reverted and described below; `docs/LOCKSTEP.md`
+/// carries the design that replaces it.
 
 /// What still has to be solved, so the next session starts from the finding and
 /// not from the idea: **the two emulated clocks have to be held together, and
@@ -229,9 +232,14 @@ pub const PACKET_LEN: usize = 9;
 /// values the child never saw.
 const SEEN_WINDOW: usize = 8;
 
-/// Backlog a child reports while it is keeping up. The transfer being answered
-/// right now is in the queue, so zero means drained.
-pub const LAG_HEALTHY: u8 = 0;
+/// Backlog a child reports while it is keeping up.
+///
+/// ONE, not zero. The reply is built after the arriving transfer has been
+/// pushed, so the transfer being answered is itself in the queue and a child
+/// that is perfectly in step reports one. Zero only ever appears as the value
+/// `peer_lag` holds before any reply has come back, which is why the two
+/// initialisers below spell it out rather than using this.
+pub const LAG_HEALTHY: u8 = 1;
 
 /// Transfers a child will hold for its serial engine before dropping the
 /// oldest.
@@ -315,7 +323,7 @@ impl CableProto {
             child_input: VecDeque::new(),
             dropped: 0,
             version_mismatch: 0,
-            peer_lag: LAG_HEALTHY,
+            peer_lag: 0, // nothing reported yet, see LAG_HEALTHY
             peer_gave_up: false,
             outbox: VecDeque::new(),
         }
@@ -334,7 +342,7 @@ impl CableProto {
         self.child_input.clear();
         self.dropped = 0;
         self.version_mismatch = 0;
-        self.peer_lag = LAG_HEALTHY;
+        self.peer_lag = 0; // nothing reported yet, see LAG_HEALTHY
         self.peer_gave_up = false;
         self.outbox.clear();
     }
@@ -631,6 +639,29 @@ mod tests {
             w.proto[1].child_clock(),
             Some((0x8FFF, 0xB9A0)),
             "the child must see the parent's word and the word it answered with"
+        );
+    }
+
+    #[test]
+    fn a_child_that_is_keeping_up_reports_the_healthy_backlog() {
+        // The parent reads this to tell a child that is in step from one that is
+        // falling behind, so the value a healthy child sends has to be the one
+        // LAG_HEALTHY names. It was named as zero while the code sends one.
+        let mut w = Wire::new();
+        w.proto[1].set_output(0xB9A0);
+        let seq = w.proto[0].begin_exchange(0x8FFF);
+        w.deliver(0);
+        w.deliver(1);
+        assert_eq!(w.proto[0].take_reply(seq), Some(0xB9A0));
+        assert_eq!(
+            w.proto[1].child_clock(),
+            Some((0x8FFF, 0xB9A0)),
+            "the child drained the transfer, so it is as caught up as it can be"
+        );
+        assert_eq!(
+            w.proto[0].peer_lag(),
+            LAG_HEALTHY,
+            "a child in step must report the backlog LAG_HEALTHY calls healthy"
         );
     }
 
