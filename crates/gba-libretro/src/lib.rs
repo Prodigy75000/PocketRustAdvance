@@ -972,10 +972,19 @@ pub extern "C" fn retro_run() {
                         // The mean wait is the number that decides whether a
                         // blocking cable can hold 60 fps: nine transfers a frame
                         // against a 16.7 ms budget leaves 1.8 ms each.
+                        //
+                        // `stale_risk` is the odd one out: every other counter
+                        // here reports something the cable NOTICED, and a trade
+                        // can corrupt with all of them at zero. It counts clocks
+                        // answered while the previous transfer was still
+                        // uncollected, which is when a child hands back the word
+                        // armed for the transfer before it. Non-zero on a run
+                        // whose trade failed points at pacing rather than at the
+                        // wire.
                         let mean = if c.waits > 0 { c.wait_us / c.waits } else { 0 };
                         format!(
-                            " cable_done={} cable_lost={} cable_extra={} cable_badver={} cable_rtx={} cable_wait_mean_us={} cable_wait_max_us={}",
-                            c.done, c.lost, c.extra_peers, c.bad_version, c.rtx, mean, c.wait_max_us
+                            " cable_done={} cable_lost={} cable_extra={} cable_badver={} cable_rtx={} cable_wait_mean_us={} cable_wait_max_us={} cable_stale_risk={}",
+                            c.done, c.lost, c.extra_peers, c.bad_version, c.rtx, mean, c.wait_max_us, c.stale_risk
                         )
                     } else {
                         String::new()

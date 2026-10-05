@@ -288,6 +288,18 @@ pub struct CableProto {
     child_input: VecDeque<(u16, u16)>,
     /// Transfers dropped because the serial engine never collected them.
     pub dropped: u64,
+    /// Clocks accepted while a previous transfer was still uncollected.
+    ///
+    /// The precondition of the one cable failure no other instrument can see.
+    /// A clock is answered from `own_output`, which only the game refreshes, in
+    /// the serial interrupt of the PREVIOUS transfer. So a clock arriving
+    /// before that interrupt has been serviced is answered with the word armed
+    /// for the transfer before it, the parent reads the same word twice, and
+    /// the protocol frame's checksum fails while every other counter here says
+    /// the link is perfect. Counted rather than refused: a game is free to
+    /// present one word across several transfers, and gating on a dirty flag
+    /// would hang it.
+    pub stale_risk: u64,
     /// Packets from a peer speaking a cable version this build does not.
     ///
     /// Non-zero means the two devices are on different builds, and it latches:
@@ -322,6 +334,7 @@ impl CableProto {
             reply: None,
             child_input: VecDeque::new(),
             dropped: 0,
+            stale_risk: 0,
             version_mismatch: 0,
             peer_lag: 0, // nothing reported yet, see LAG_HEALTHY
             peer_gave_up: false,
@@ -341,6 +354,7 @@ impl CableProto {
         self.reply = None;
         self.child_input.clear();
         self.dropped = 0;
+        self.stale_risk = 0;
         self.version_mismatch = 0;
         self.peer_lag = 0; // nothing reported yet, see LAG_HEALTHY
         self.peer_gave_up = false;
@@ -502,6 +516,12 @@ impl CableProto {
                 self.seen[self.seen_pos] = Some(seq);
                 self.seen_pos = (self.seen_pos + 1) % SEEN_WINDOW;
                 let answered = self.own_output;
+                if !self.child_input.is_empty() {
+                    // The previous transfer has not reached the game's handler,
+                    // so `answered` is the word that handler would have
+                    // replaced. See the field's own doc.
+                    self.stale_risk += 1;
+                }
                 if self.child_input.len() >= CHILD_QUEUE_MAX {
                     self.child_input.pop_front();
                     self.dropped += 1;
@@ -640,6 +660,81 @@ mod tests {
             Some((0x8FFF, 0xB9A0)),
             "the child must see the parent's word and the word it answered with"
         );
+    }
+
+    /// The one cable failure no instrument could see: a child whose emulation is
+    /// not running answers two clocks with one word.
+    ///
+    /// This is the hazard the lockstep design exists to prevent, demonstrated
+    /// against today's code rather than described. `own_output` is refreshed
+    /// only when the child's GAME stores SIOMLT_SEND, which it does in the
+    /// serial interrupt of the previous transfer. A child that has emulated
+    /// nothing since the last clock therefore still holds the previous word,
+    /// and hands it back. The parent reads it as fresh data.
+    ///
+    /// What makes it the worst available shape: every other counter stays
+    /// perfect. Both ends complete two transfers, nothing is lost, nothing is
+    /// retransmitted, no version is refused. Only the game notices, as a
+    /// checksum failure it reports as a bad cable. `stale_risk` is the counter
+    /// that makes it visible; it is not a fix, and the pacing is what will
+    /// prevent the condition.
+    ///
+    /// This test stays true after the pacing lands, which is why it asserts the
+    /// stale answer rather than a corrected one: the fix removes the PARKED
+    /// CHILD, it does not change what this layer answers when asked while
+    /// parked. A protocol that could answer correctly here would need to know
+    /// what the game has not yet told it.
+    #[test]
+    fn a_parked_child_answers_two_clocks_with_the_word_armed_for_the_first() {
+        let mut w = Wire::new();
+
+        // The child's handler armed one word. Its core then stops: no further
+        // store to SIOMLT_SEND, and nothing collects what arrives.
+        w.proto[1].set_output(0xB9A0);
+
+        let first = w.proto[0].begin_exchange(0x8FFF);
+        w.deliver(0);
+        w.deliver(1);
+        assert_eq!(w.proto[0].take_reply(first), Some(0xB9A0));
+
+        let second = w.proto[0].begin_exchange(0x1234);
+        w.deliver(0);
+        w.deliver(1);
+        assert_eq!(
+            w.proto[0].take_reply(second),
+            Some(0xB9A0),
+            "the parked child answers the second clock with the first word,              which is the corruption this whole design is about"
+        );
+
+        assert_eq!(
+            w.proto[1].stale_risk, 1,
+            "and exactly one clock was answered while a transfer sat uncollected"
+        );
+        assert_eq!(w.proto[1].dropped, 0, "nothing was dropped: the queue is nowhere near full");
+        assert_eq!(w.proto[1].version_mismatch, 0, "and this is not a version problem");
+        assert_eq!(w.proto[1].lag(), 2, "both transfers are still waiting for the serial engine");
+    }
+
+    /// A child that is keeping up must NOT be counted as at risk.
+    ///
+    /// Without this the counter above would read as a fault on every healthy
+    /// link, which is worse than not having it: an instrument that cries wolf
+    /// gets ignored at exactly the moment it is right.
+    #[test]
+    fn a_child_that_collects_each_transfer_is_never_counted_as_at_risk() {
+        let mut w = Wire::new();
+        for i in 0..9u16 {
+            // The game's handler: arm the next word, then the engine collects
+            // the transfer before the next clock arrives.
+            w.proto[1].set_output(0x1000 + i);
+            let seq = w.proto[0].begin_exchange(0x8F00 + i);
+            w.deliver(0);
+            w.deliver(1);
+            assert_eq!(w.proto[0].take_reply(seq), Some(0x1000 + i), "transfer {i}");
+            assert_eq!(w.proto[1].child_clock(), Some((0x8F00 + i, 0x1000 + i)));
+        }
+        assert_eq!(w.proto[1].stale_risk, 0, "nine transfers, each collected, no risk");
+        assert_eq!(w.proto[1].lag(), 0, "and nothing left in the queue");
     }
 
     #[test]

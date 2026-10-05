@@ -382,6 +382,11 @@ pub struct CableStats {
     pub wait_us: u64,
     pub waits: u64,
     pub wait_max_us: u64,
+    /// Clocks a child answered while a previous transfer sat uncollected. The
+    /// precondition of a trade that corrupts while every other counter here
+    /// reads perfect, so this is the one number on the heartbeat that can be
+    /// non-zero while the link looks healthy.
+    pub stale_risk: u64,
 }
 
 pub fn cable_stats() -> CableStats {
@@ -394,6 +399,7 @@ pub fn cable_stats() -> CableStats {
         wait_us: n.cable_wait_us,
         waits: n.cable_waits,
         wait_max_us: n.cable_wait_max_us,
+        stale_risk: n.cable.stale_risk,
     })
 }
 
