@@ -973,6 +973,15 @@ pub extern "C" fn retro_run() {
                         // blocking cable can hold 60 fps: nine transfers a frame
                         // against a 16.7 ms budget leaves 1.8 ms each.
                         //
+                        // The pacing's three: `holds` is scanlines this child
+                        // waited for its parent, `starved` is times it stopped
+                        // waiting and ran free, and `skew` is how far ahead of
+                        // the peer this end was at the last reply. Holds without
+                        // starvation is the pacing working. Starvation is where a
+                        // desync begins, and reading the two together is what
+                        // separates "the link is slow" from "the link has come
+                        // apart", which no counter could say before.
+                        //
                         // `stale_risk` is the odd one out: every other counter
                         // here reports something the cable NOTICED, and a trade
                         // can corrupt with all of them at zero. It counts clocks
@@ -983,8 +992,9 @@ pub extern "C" fn retro_run() {
                         // wire.
                         let mean = if c.waits > 0 { c.wait_us / c.waits } else { 0 };
                         format!(
-                            " cable_done={} cable_lost={} cable_extra={} cable_badver={} cable_rtx={} cable_wait_mean_us={} cable_wait_max_us={} cable_stale_risk={}",
-                            c.done, c.lost, c.extra_peers, c.bad_version, c.rtx, mean, c.wait_max_us, c.stale_risk
+                            " cable_done={} cable_lost={} cable_extra={} cable_badver={} cable_rtx={} cable_wait_mean_us={} cable_wait_max_us={} cable_stale_risk={} cable_holds={} cable_starved={} cable_skew={}",
+                            c.done, c.lost, c.extra_peers, c.bad_version, c.rtx, mean, c.wait_max_us,
+                            c.stale_risk, c.holds, c.starved, c.skew
                         )
                     } else {
                         String::new()

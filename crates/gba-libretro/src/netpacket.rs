@@ -55,7 +55,7 @@ const RETRO_NETPACKET_FLUSH_HINT: i32 = 1 << 2;
 ///
 /// The Android side documents this core as advertising `-rfu-1`
 /// (`NetplayPlatformOverride.kt`), which this makes stale. Nothing reads it.
-static PROTOCOL: &[u8] = b"pocketrustadvance-link-2\0";
+static PROTOCOL: &[u8] = b"pocketrustadvance-link-3\0";
 
 /// How long a parent waits for a child's reply before giving up and reporting
 /// the transfer to the game as a failure.
@@ -292,7 +292,12 @@ fn is_cable_packet(bytes: &[u8]) -> bool {
     // to be recognised as ours so the mismatch can be named; matching the whole
     // magic would make it look like no peer at all and the session would
     // silently do nothing.
-    bytes.len() >= PACKET_LEN && bytes[..3] == gba_core::cable::FAMILY
+    // And the length bound is the FAMILY's, not ours. It used to be PACKET_LEN,
+    // which quietly undid the paragraph above the moment the layout grew: a
+    // 9-byte version-2 packet is shorter than a version-3 one, so it failed this
+    // test, went to the adapter's inbox, and the version mismatch was never
+    // counted. Two devices on different builds would have seen no peer at all.
+    bytes.len() >= 4 && bytes[..3] == gba_core::cable::FAMILY
 }
 
 /// Put everything the cable has queued on the wire.
@@ -387,6 +392,16 @@ pub struct CableStats {
     /// reads perfect, so this is the one number on the heartbeat that can be
     /// non-zero while the link looks healthy.
     pub stale_risk: u64,
+    /// Scanlines this child waited for its parent, and times it stopped waiting.
+    /// A trade with holds and no starvation is the pacing working; starvation
+    /// means it stopped trusting the parent and ran free, which is where a
+    /// desync starts.
+    pub holds: u64,
+    pub starved: u64,
+    /// This end's position minus the peer's, in emulated cycles, from the last
+    /// reply. One device's log can answer "how far apart were we" without the
+    /// other's.
+    pub skew: i32,
 }
 
 pub fn cable_stats() -> CableStats {
@@ -400,6 +415,9 @@ pub fn cable_stats() -> CableStats {
         waits: n.cable_waits,
         wait_max_us: n.cable_wait_max_us,
         stale_risk: n.cable.stale_risk,
+        holds: n.cable.holds,
+        starved: n.cable.starved,
+        skew: n.cable.skew().unwrap_or(0),
     })
 }
 
@@ -424,6 +442,36 @@ impl LinkCable for NetCable {
 
     fn set_output(&mut self, word: u16) {
         with_net(|n| n.cable.set_output(word));
+    }
+
+    /// Charge this core's progress to the cable, and put a parent's position on
+    /// the wire once a frame.
+    ///
+    /// The tick is sent from here rather than from the core because it is a
+    /// transport concern: the core only says how much time passed. A child's
+    /// `advance` sends nothing.
+    fn advance(&mut self, cycles: u32) {
+        let ticked = with_net(|n| {
+            n.cable.advance(cycles);
+            n.self_id == 0 && n.cable.maybe_tick()
+        });
+        if ticked {
+            flush_cable_outbox();
+        }
+    }
+
+    /// Wait for the parent to catch up, if this child has run ahead of it.
+    ///
+    /// Sleeps the same 250 us the parent's own wait uses, so a held child costs
+    /// one timer sleep per interval rather than a spin. The caller pumps the
+    /// transport between calls, and `CableProto::hold` bounds its own patience,
+    /// so a parent that has gone away cannot freeze this core.
+    fn hold(&mut self) -> bool {
+        if !with_net(|n| n.cable.hold()) {
+            return false;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+        true
     }
 
     fn parent_start(&mut self, own: u16) {
@@ -618,6 +666,27 @@ mod tests {
         assert_eq!(with_net(|n| n.inbox.len()), 1);
         assert_eq!(with_net(|n| n.cable.child_clock()), None);
         assert!(!is_cable_packet(&rfu));
+    }
+
+    /// The advertised protocol string has to name the wire version it speaks.
+    ///
+    /// These are two different refusals and they have to agree. The core refuses
+    /// a peer on another wire by the version byte in every packet, which works
+    /// and is tested. The string is the refusal the FRONTEND would perform, and
+    /// Trophy Hub's host currently throws it away, which is filed. A discarded
+    /// string is still not a licence to advertise something false: the day the
+    /// host compares it, a stale string would pair two builds that cannot talk.
+    /// Pinned together here so a wire bump that forgets the string fails on the
+    /// desk rather than on two phones.
+    #[test]
+    fn the_protocol_string_advertises_the_wire_version_it_speaks() {
+        let advertised = std::str::from_utf8(&PROTOCOL[..PROTOCOL.len() - 1]).unwrap();
+        let expected =
+            format!("pocketrustadvance-link-{}", gba_core::cable::WIRE_VERSION as char);
+        assert_eq!(
+            advertised, expected,
+            "the string and the wire version must name the same cable"
+        );
     }
 
     #[test]
