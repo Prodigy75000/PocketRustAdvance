@@ -3,7 +3,7 @@ name = "gba-runner"
 version = "0.1.0"
 edition = "2021"
 
-# Dev harnesses. `tomharte` is the CPU conformance runner and comes first — it
+# Dev harnesses. `tomharte` is the CPU conformance runner and comes first. It
 # is how we grind the ARM7TDMI to green before any window exists. The minifb
 # window / png `shot` / wav `rec` bins mirror the GB runner and land later.
 [[bin]]

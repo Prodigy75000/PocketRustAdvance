@@ -1,11 +1,11 @@
-# PocketRustAdvance — Reference Documentation
+# PocketRustAdvance reference documentation
 
 Official ARM specifications for the ARM7TDMI (the GBA's CPU core, an **ARMv4T**
 part), plus the community hardware reference for the rest of the console.
 These are the authoritative inputs for clean-room implementation: read behavior
 from the spec, never from another emulator's source.
 
-> **The document files themselves are not committed** — they are copyrighted by
+> **The document files themselves are not committed**, they are copyrighted by
 > ARM Ltd. / Martin Korth and only referenced here. Download them into this
 > `docs/` folder from the **Sources** links at the bottom if you want them
 > locally; the repository ships only this index.
@@ -23,9 +23,9 @@ from the spec, never from another emulator's source.
 
 | File | Provenance | What it's for |
 |------|-----------|---------------|
-| `GBATEK_gba_hardware_reference.htm` | GBATEK by Martin Korth (`problemkaputt.de/gbatek.htm`) | De-facto GBA hardware reference: memory map, PPU, DMA, timers, I/O registers, cart/BIOS. **Reverse-engineered documentation**, not an official Nintendo/ARM spec — there is no official GBA hardware doc. It describes observed hardware behavior (like a datasheet), not any emulator's implementation. Flagged here so provenance is explicit; treat it the way you treat the TomHarte vectors — a black-box description of the real chip, not source to copy. |
+| `GBATEK_gba_hardware_reference.htm` | GBATEK by Martin Korth (`problemkaputt.de/gbatek.htm`) | De-facto GBA hardware reference: memory map, PPU, DMA, timers, I/O registers, cart/BIOS. **Reverse-engineered documentation**, not an official Nintendo/ARM spec, and there is no official GBA hardware doc. It describes observed hardware behavior (like a datasheet), not any emulator's implementation. Flagged here so provenance is explicit; treat it the way you treat the TomHarte vectors, a black-box description of the real chip, not source to copy. |
 
-## The multiply carry flag — settled by the official spec
+## The multiply carry flag, settled by the official spec
 
 The architect's open question ("does any official doc specify the `MUL`/`MLA`
 carry precisely?") is answered directly and definitively by the ARM
@@ -45,7 +45,7 @@ pages:
 > unchanged in ARMv5 and above. In earlier versions of the architecture, the
 > value of the C flag was UNPREDICTABLE after an MLAS instruction."
 
-The GBA's ARM7TDMI is **ARMv4T** — an "earlier version." So the C flag after
+The GBA's ARM7TDMI is **ARMv4T**, an "earlier version." So the C flag after
 `MUL`/`MLA` is officially **UNPREDICTABLE**, with **no specified value**. The
 "leave C unchanged, documented as unpredictable" implementation is exactly
 spec-correct. The residual gap against NBA-generated vectors is not a bug: it is
@@ -53,8 +53,8 @@ the one implementation-specific, officially-undefined bit, and closing it would
 mean reverse-engineering NBA's internals through its outputs. Correctly left
 alone.
 
-(The DDI 0029 data sheet documents multiply *timing* — the m-cycle
-early-termination based on the multiplier operand — precisely, and that part is
+(The DDI 0029 data sheet documents multiply *timing*, the m-cycle
+early-termination based on the multiplier operand, precisely, and that part is
 worth implementing from the datasheet. It does not define the carry value; on
 this the ARM ARM above is the last word.)
 
