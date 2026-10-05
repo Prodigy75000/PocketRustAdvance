@@ -454,6 +454,8 @@ pub struct CableStats {
     /// `None` means the roles are not settled, which the game sees as no peer.
     pub role: Option<u8>,
     pub ties: u64,
+    /// Clocks held back while the child's game armed its next word.
+    pub deferrals: u64,
 }
 
 pub fn cable_stats() -> CableStats {
@@ -474,6 +476,7 @@ pub fn cable_stats() -> CableStats {
         answered: n.cable.answered,
         role: n.cable.role(),
         ties: n.cable.election_ties,
+        deferrals: n.cable.deferrals,
     })
 }
 

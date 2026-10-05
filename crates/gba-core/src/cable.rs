@@ -312,6 +312,23 @@ pub const TIME_OFF: usize = 9;
 /// the handshake, which must stay at 60 fps.
 pub const HORIZON: u32 = 280_896;
 
+/// Transfers between word-hash checkpoints.
+///
+/// 512, which at the measured seven transfers a frame is a checkpoint every few
+/// seconds: often enough to bracket a failure, rare enough to be one log line.
+pub const CABLE_MARK_EVERY: u64 = 512;
+
+/// How long a child may hold a clock back while its game arms the next word.
+///
+/// Eight scanlines. The window being closed runs from the serial interrupt to the
+/// handler's store, which is a vectoring plus a handful of instructions, so eight
+/// lines is generous for it and still only 9856 cycles: against a round trip of
+/// 10 ms it is a rounding error, and against the parent's 150 ms give-up it is
+/// nothing. Bounded rather than open because a game is allowed to present one
+/// word across several transfers, and waiting forever for a store that is never
+/// coming would hang a conforming game.
+pub const DEFER_MAX_CYCLES: u32 = 9856;
+
 /// Consecutive [`LinkCable::hold`] answers before a child stops waiting and runs
 /// free.
 ///
@@ -417,6 +434,20 @@ pub struct CableProto {
     pub answered: u64,
     /// Has the game stored SIOMLT_SEND since the last clock we answered?
     armed_since_answer: bool,
+    /// A clock held back because the game had not armed its next word yet, as
+    /// `(seq, the parent's word)`.
+    ///
+    /// Refusing to park an unarmed child took the cold answers from 297 in 5893
+    /// to 18 in 8460, and the rest land in a window parking cannot close: the
+    /// child is RUNNING, between the interrupt that told it a transfer landed and
+    /// the handler's store. Holding the answer for a few scanlines closes it. The
+    /// parent is blocked meanwhile, which costs the deferral's own length against
+    /// a round trip twenty times longer.
+    deferred: Option<(u8, u16)>,
+    /// Emulated cycles the current deferral has lasted.
+    deferred_cycles: u32,
+    /// Clocks held back while the game armed its next word.
+    pub deferrals: u64,
     /// Packets from a peer speaking a cable version this build does not.
     ///
     /// Non-zero means the two devices are on different builds, and it latches:
@@ -494,6 +525,9 @@ impl CableProto {
             answered_cold: 0,
             answered: 0,
             armed_since_answer: false,
+            deferred: None,
+            deferred_cycles: 0,
+            deferrals: 0,
             version_mismatch: 0,
             peer_lag: 0, // nothing reported yet, see LAG_HEALTHY
             peer_gave_up: false,
@@ -530,6 +564,9 @@ impl CableProto {
         self.answered_cold = 0;
         self.answered = 0;
         self.armed_since_answer = false;
+        self.deferred = None;
+        self.deferred_cycles = 0;
+        self.deferrals = 0;
         self.version_mismatch = 0;
         self.peer_lag = 0; // nothing reported yet, see LAG_HEALTHY
         self.peer_gave_up = false;
@@ -576,6 +613,9 @@ impl CableProto {
     pub fn set_output(&mut self, word: u16) {
         self.own_output = word;
         self.armed_since_answer = true;
+        // This is the store a held clock was waiting for, so answer it now rather
+        // than on the next scanline: the parent is blocked on it.
+        self.settle_deferred();
     }
 
     /// Begin a parent exchange of `out`. Returns the sequence number to wait on.
@@ -741,6 +781,15 @@ impl CableProto {
     /// child never asks.
     pub fn advance(&mut self, cycles: u32) {
         self.local_cycles = self.local_cycles.wrapping_add(cycles);
+        if self.deferred.is_some() {
+            self.deferred_cycles = self.deferred_cycles.saturating_add(cycles);
+            if self.deferred_cycles >= DEFER_MAX_CYCLES {
+                // The store never came. A game may legitimately present one word
+                // across several transfers, so answer with what it has rather
+                // than hang it, and let `answered_cold` record that we did.
+                self.settle_deferred();
+            }
+        }
         if !self.engaged {
             return;
         }
@@ -784,8 +833,8 @@ impl CableProto {
     /// second half is what keeps the stale-word hazard shut: a child is only ever
     /// parked with its queue empty, which means it has serviced the last transfer
     /// and its game has armed the next word. See
-    /// `a_parked_child_answers_two_clocks_with_the_word_armed_for_the_first` for
-    /// what the other case costs.
+    /// `a_clock_that_beats_the_handler_is_held_until_the_game_arms` for how that
+    /// case is closed now.
     ///
     /// Counts its own consecutive calls so a parent that has gone away releases
     /// the child instead of freezing it.
@@ -966,31 +1015,23 @@ impl CableProto {
                     }
                     return;
                 }
-                self.seen[self.seen_pos] = Some(seq);
-                self.seen_pos = (self.seen_pos + 1) % SEEN_WINDOW;
-                let answered = self.own_output;
-                if self.answered > 0 && !self.armed_since_answer {
-                    // The game has not stored a new word since the last clock we
-                    // answered, so this transfer carries the previous one.
-                    self.answered_cold += 1;
+                if self.answered > 0 && !self.armed_since_answer && self.deferred.is_none() {
+                    // The game has not stored its next word yet, so answering now
+                    // would hand back the previous one. Hold the clock instead and
+                    // let the handler run: `set_output` settles it, and
+                    // `advance` settles it anyway if the store never comes.
+                    // Deliberately not marked seen yet, so a retransmit of this
+                    // same clock is recognised below rather than answered from a
+                    // cache that does not exist.
+                    self.deferred = Some((seq, word));
+                    self.deferred_cycles = 0;
+                    self.deferrals += 1;
+                    return;
                 }
-                self.answered += 1;
-                self.armed_since_answer = false;
-                if !self.child_input.is_empty() {
-                    // The previous transfer has not reached the game's handler,
-                    // so `answered` is the word that handler would have
-                    // replaced. See the field's own doc.
-                    self.stale_risk += 1;
+                if self.deferred.map(|(d, _)| d) == Some(seq) {
+                    return; // a retransmit of the clock we are already holding
                 }
-                if self.child_input.len() >= CHILD_QUEUE_MAX {
-                    self.child_input.pop_front();
-                    self.dropped += 1;
-                }
-                self.child_input.push_back((word, answered));
-                let mut reply = [0u8; PACKET_LEN];
-                put(&mut reply, TAG_REPLY, seq, answered, self.lag(), self.local_cycles);
-                self.last_reply = reply;
-                self.outbox.push_back(reply);
+                self.accept_clock(seq, word);
             }
             TAG_REPLY => {
                 self.peer_lag = pkt[8];
@@ -1005,6 +1046,48 @@ impl CableProto {
                 self.peer_gave_up = true;
             }
             _ => {}
+        }
+    }
+
+    /// Queue the reply for a clock and hand the transfer to the serial engine.
+    ///
+    /// Split out of `on_packet` so a clock can be held back and accepted later:
+    /// from [`CableProto::set_output`] when the game arms its next word, or from
+    /// [`CableProto::advance`] when the wait runs out.
+    fn accept_clock(&mut self, seq: u8, word: u16) {
+        self.seen[self.seen_pos] = Some(seq);
+        self.seen_pos = (self.seen_pos + 1) % SEEN_WINDOW;
+        let answered = self.own_output;
+        if self.answered > 0 && !self.armed_since_answer {
+            // Answered cold: the handler never stored a word, so this transfer
+            // carries the previous one. Reached only when a deferral ran out of
+            // patience, which is why it is counted and not refused.
+            self.answered_cold += 1;
+        }
+        self.answered += 1;
+        self.armed_since_answer = false;
+        if !self.child_input.is_empty() {
+            // The previous transfer has not reached the game's handler, so
+            // `answered` is the word that handler would have replaced. See the
+            // field's own doc.
+            self.stale_risk += 1;
+        }
+        if self.child_input.len() >= CHILD_QUEUE_MAX {
+            self.child_input.pop_front();
+            self.dropped += 1;
+        }
+        self.child_input.push_back((word, answered));
+        let mut reply = [0u8; PACKET_LEN];
+        put(&mut reply, TAG_REPLY, seq, answered, self.lag(), self.local_cycles);
+        self.last_reply = reply;
+        self.outbox.push_back(reply);
+    }
+
+    /// Accept the clock being held back, if there is one.
+    fn settle_deferred(&mut self) {
+        if let Some((seq, word)) = self.deferred.take() {
+            self.deferred_cycles = 0;
+            self.accept_clock(seq, word);
         }
     }
 }
@@ -1681,74 +1764,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_parked_child_answers_two_clocks_with_the_word_armed_for_the_first() {
-        let mut w = Wire::new();
 
-        // The child's handler armed one word. Its core then stops: no further
-        // store to SIOMLT_SEND, and nothing collects what arrives.
-        w.proto[1].set_output(0xB9A0);
-
-        let first = w.proto[0].begin_exchange(0x8FFF);
-        w.deliver(0);
-        w.deliver(1);
-        assert_eq!(w.proto[0].take_reply(first), Some(0xB9A0));
-
-        let second = w.proto[0].begin_exchange(0x1234);
-        w.deliver(0);
-        w.deliver(1);
-        assert_eq!(
-            w.proto[0].take_reply(second),
-            Some(0xB9A0),
-            "the parked child answers the second clock with the first word,              which is the corruption this whole design is about"
-        );
-
-        assert_eq!(
-            w.proto[1].stale_risk, 1,
-            "and exactly one clock was answered while a transfer sat uncollected"
-        );
-        assert_eq!(w.proto[1].dropped, 0, "nothing was dropped: the queue is nowhere near full");
-        assert_eq!(w.proto[1].version_mismatch, 0, "and this is not a version problem");
-        assert_eq!(w.proto[1].lag(), 2, "both transfers are still waiting for the serial engine");
-    }
-
-    /// The hazard `stale_risk` cannot see: a cold answer with an empty queue.
-    ///
-    /// This is the case that makes the queue-depth proxy insufficient. The child
-    /// collects transfer N, so nothing is uncollected, and the next clock arrives
-    /// before its interrupt handler has stored the word for N+1. `stale_risk`
-    /// stays at zero and the parent still reads the previous word.
-    #[test]
-    fn a_clock_answered_before_the_game_rearmed_is_counted_even_with_an_empty_queue() {
-        let mut w = Wire::new();
-        w.proto[1].set_output(0xB9A0);
-
-        let first = w.proto[0].begin_exchange(0x8FFF);
-        w.deliver(0);
-        w.deliver(1);
-        assert_eq!(w.proto[0].take_reply(first), Some(0xB9A0));
-        // The child's serial engine collects it, so the queue is empty, but its
-        // game has not reached the handler that stores the next word.
-        assert_eq!(w.proto[1].child_clock(), Some((0x8FFF, 0xB9A0)));
-        assert_eq!(w.proto[1].lag(), 0);
-
-        let second = w.proto[0].begin_exchange(0x1234);
-        w.deliver(0);
-        w.deliver(1);
-        assert_eq!(
-            w.proto[0].take_reply(second),
-            Some(0xB9A0),
-            "the same word again, which is the corruption"
-        );
-        assert_eq!(
-            w.proto[1].stale_risk, 0,
-            "the queue was empty, so the older proxy sees nothing at all"
-        );
-        assert_eq!(
-            w.proto[1].answered_cold, 1,
-            "and the precise counter sees exactly one cold answer"
-        );
-    }
 
     /// A game that rearms between clocks is never counted cold, including the
     /// very first clock of a session.
@@ -1768,6 +1784,90 @@ mod tests {
             w.proto[1].answered_cold, 0,
             "nine armed answers, none of them cold, and the first is not counted"
         );
+    }
+
+    /// A clock that arrives before the game has armed is HELD, then answered with
+    /// the fresh word.
+    ///
+    /// This is the fix for the fault that survived everything else. The devices
+    /// showed 18 cold answers in 8460 transfers after an unarmed child stopped
+    /// parking, and those land in a window no pacing can close: the child is
+    /// running, between the interrupt that told it a transfer landed and its
+    /// handler's store. Holding the clock for a few scanlines closes it, and the
+    /// parent gets the word its peer meant to send rather than the one before it.
+    #[test]
+    fn a_clock_that_beats_the_handler_is_held_until_the_game_arms() {
+        let mut w = Wire::new();
+        w.proto[1].set_output(0xB9A0);
+
+        let first = w.proto[0].begin_exchange(0x8FFF);
+        w.deliver(0);
+        w.deliver(1);
+        assert_eq!(w.proto[0].take_reply(first), Some(0xB9A0));
+        assert_eq!(w.proto[1].child_clock(), Some((0x8FFF, 0xB9A0)));
+
+        // The next clock arrives while the handler has not run yet.
+        let second = w.proto[0].begin_exchange(0x1234);
+        w.deliver(0);
+        w.deliver(1);
+        assert_eq!(
+            w.proto[0].take_reply(second),
+            None,
+            "nothing may be answered yet: the only word available is the old one"
+        );
+        assert_eq!(w.proto[1].deferrals, 1, "the clock is held, not answered");
+        assert_eq!(w.proto[1].answered_cold, 0);
+
+        // The handler runs.
+        w.proto[1].set_output(0x5A5A);
+        w.deliver(1);
+        assert_eq!(
+            w.proto[0].take_reply(second),
+            Some(0x5A5A),
+            "and the parent reads the word the handler armed for THIS transfer"
+        );
+        assert_eq!(w.proto[1].answered_cold, 0, "no cold answer anywhere in this");
+        assert_eq!(w.proto[1].child_clock(), Some((0x1234, 0x5A5A)));
+    }
+
+    /// A game that never arms is answered anyway, with the old word, and counted.
+    ///
+    /// The bound on the deferral, and why it is a bound rather than a wait. A game
+    /// is allowed to present one word across several transfers, and holding a
+    /// clock forever for a store that is never coming would hang it. So the stale
+    /// answer still exists for that case; it is bounded, it is deliberate, and
+    /// `answered_cold` says it happened.
+    #[test]
+    fn a_held_clock_is_answered_anyway_once_the_wait_runs_out() {
+        let mut w = Wire::new();
+        w.proto[1].set_output(0xB9A0);
+
+        let first = w.proto[0].begin_exchange(0x8FFF);
+        w.deliver(0);
+        w.deliver(1);
+        assert_eq!(w.proto[0].take_reply(first), Some(0xB9A0));
+        w.proto[1].child_clock();
+
+        let second = w.proto[0].begin_exchange(0x1234);
+        w.deliver(0);
+        w.deliver(1);
+        assert_eq!(w.proto[0].take_reply(second), None, "held");
+
+        // Eight scanlines of 1232 cycles is 9856, the whole allowance. The child
+        // must not park while it holds a clock, so these cycles really do pass.
+        for line in 0..7 {
+            assert!(!w.proto[1].hold(), "line {line}: a child holding a clock must run");
+            w.proto[1].advance(1232);
+            assert_eq!(w.proto[1].deferrals, 1, "line {line}: still holding");
+        }
+        w.proto[1].advance(1232);
+        w.deliver(1);
+        assert_eq!(
+            w.proto[0].take_reply(second),
+            Some(0xB9A0),
+            "the allowance ran out, so the old word goes rather than nothing"
+        );
+        assert_eq!(w.proto[1].answered_cold, 1, "and it is recorded as a cold answer");
     }
 
     /// A child that is keeping up must NOT be counted as at risk.
@@ -1907,8 +2007,8 @@ mod tests {
     #[test]
     fn a_child_that_never_collects_reports_its_backlog_to_the_parent() {
         let mut w = Wire::new();
-        w.proto[1].set_output(0x3333);
         for _ in 0..3 {
+            w.proto[1].set_output(0x3333); // the handler, once per transfer
             let seq = w.proto[0].begin_exchange(0x4444);
             w.deliver(0);
             w.deliver(1);
@@ -1921,6 +2021,7 @@ mod tests {
             "the parent can only learn the child is behind if the child says so"
         );
         w.proto[1].child_clock();
+        w.proto[1].set_output(0x3333);
         let seq = w.proto[0].begin_exchange(0x5555);
         w.deliver(0);
         w.deliver(1);
@@ -1932,6 +2033,10 @@ mod tests {
     fn a_child_that_falls_far_behind_drops_the_oldest_rather_than_hoarding() {
         let mut w = Wire::new();
         for i in 0..(CHILD_QUEUE_MAX + 4) {
+            // The child's handler arms a word for each transfer, which is what
+            // keeps the clock from being held back; this test is about the QUEUE
+            // filling, not about the arming.
+            w.proto[1].set_output(0x7000 + i as u16);
             let seq = w.proto[0].begin_exchange(i as u16);
             w.deliver(0);
             w.deliver(1);

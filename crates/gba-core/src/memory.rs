@@ -113,6 +113,17 @@ pub struct GbaBus {
     /// logged could say whether the words themselves agreed. FNV-1a, and the
     /// order is part of it, so a pair delivered out of sequence diverges too.
     pub cable_wordsum: u64,
+    /// The hash snapshotted at an exact multiple of `CABLE_MARK_EVERY` transfers,
+    /// and the count it was taken at.
+    ///
+    /// The running hash alone turned out not to be comparable between devices: the
+    /// heartbeat fires on a timer, so the two ends print it at different transfer
+    /// counts, and an order-dependent hash at different counts must differ. In one
+    /// whole 8460-transfer run exactly ONE sample pair lined up, at zero. A
+    /// checkpoint at a fixed count is the same number on both ends or the data
+    /// diverged, with nothing to line up by hand.
+    pub cable_mark_at: u64,
+    pub cable_mark_sum: u64,
     /// `cycles` as of the last `step_serial`, so serial timing is a delta the
     /// same way the timers are.
     serial_cycles: u64,
@@ -457,6 +468,8 @@ impl GbaBus {
             cable_transfers: 0,
             cable_failures: 0,
             cable_wordsum: 0xcbf2_9ce4_8422_2325, // FNV-1a offset basis
+            cable_mark_at: 0,
+            cable_mark_sum: 0xcbf2_9ce4_8422_2325,
             serial_cycles: 0,
             serial_pending: 0,
             bios: b.into_boxed_slice(),
@@ -1717,6 +1730,10 @@ impl GbaBus {
         };
         if let Some(w) = words {
             self.cable_transfers += 1;
+            if self.cable_transfers % crate::cable::CABLE_MARK_EVERY == 0 {
+                self.cable_mark_at = self.cable_transfers;
+                self.cable_mark_sum = self.cable_wordsum;
+            }
             for half in w {
                 for byte in half.to_be_bytes() {
                     self.cable_wordsum ^= byte as u64;

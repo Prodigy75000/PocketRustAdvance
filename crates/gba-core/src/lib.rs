@@ -658,6 +658,12 @@ impl Gba {
         self.bus.cable_wordsum
     }
 
+    /// The hash at the last exact checkpoint, as `(transfer count, hash)`. The
+    /// pair both devices can be compared on without lining anything up by hand.
+    pub fn cable_mark(&self) -> (u64, u64) {
+        (self.bus.cable_mark_at, self.bus.cable_mark_sum)
+    }
+
     /// Tell the adapter which peer the frontend thinks we are. The device id
     /// it advertises is derived from this, so without it two devices running
     /// the same ROM advertise the same id and refuse to join each other.
@@ -1380,7 +1386,7 @@ mod tests {
             // Each game's serial interrupt handler: read the slots, arm the
             // next word. The child's store here is the one a parked child never
             // makes, which is the hazard
-            // a_parked_child_answers_two_clocks_with_the_word_armed_for_the_first
+            // a_clock_that_beats_the_handler_is_held_until_the_game_arms
             // pins down.
             if parent.bus.if_ & 0x80 != 0 {
                 parent.bus.if_ &= !0x80;
