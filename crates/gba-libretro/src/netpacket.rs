@@ -69,12 +69,29 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// Re-send an unanswered clock this often. Nothing beneath this protocol
 /// retransmits: the host's send ignores the reliable flag and calls sendto.
-const RETRANSMIT_AFTER: Duration = Duration::from_millis(10);
+///
+/// **Was 10 ms, which was below the round trip it was meant to outlast.**
+/// Measured between the owner's two devices on his own Wi-Fi: 6.0 ms min,
+/// 8.1 ms mean, 10.7 ms max. So a 10 ms timer fired on a large fraction of
+/// perfectly healthy transfers, sent a duplicate, and the reply that was
+/// already in flight arrived to find the parent had moved its expectations on.
+/// 40 ms sits clear of the jitter and still allows three attempts inside the
+/// timeout. A genuinely lost packet now costs 40 ms instead of 10, which is the
+/// right way round: loss measured 0% over the same link, spurious retransmits
+/// were happening constantly.
+const RETRANSMIT_AFTER: Duration = Duration::from_millis(40);
 
-/// Spin this many times before backing off to a real sleep, so a healthy
-/// exchange never pays for a timer and a stuck one never pins a core.
-const HOT_SPINS: u32 = 2_000;
-const BACKOFF: Duration = Duration::from_micros(100);
+/// How long to wait between polls while blocked.
+///
+/// **This replaces a 2000-iteration hot spin, which was actively harmful here.**
+/// Each spin called the frontend's `poll_receive`, which takes the host's receive
+/// queue lock, so the parent hammered that lock thousands of times per transfer
+/// while the host's rx thread was trying to take the same lock to deliver the
+/// reply the parent was waiting for. The spin was designed for a sub-millisecond
+/// round trip; against a real 8 ms one it buys nothing and contends with the
+/// thread it depends on. 250 us polls the reply in about 32 steps over a typical
+/// wait and bounds the latency this adds to a quarter of a millisecond.
+const POLL_INTERVAL: Duration = Duration::from_micros(250);
 
 /// Consecutive give-ups after which the cable stops waiting at all.
 ///
@@ -150,6 +167,19 @@ struct Net {
     /// Exchanges completed and exchanges abandoned, for the heartbeat.
     pub cable_done: u64,
     pub cable_lost: u64,
+    /// Clocks re-sent because no reply had arrived yet.
+    ///
+    /// The first device run put the parent at 16.6 ms per transfer against a
+    /// measured 8.1 ms round trip, so something was costing roughly a second
+    /// round trip and a spurious retransmit was the obvious suspect. Counted
+    /// rather than reasoned about, because that guess has been wrong before.
+    pub cable_rtx: u64,
+    /// Wall time a parent spent blocked, summed, counted and peaked. The sum and
+    /// the count give the mean per transfer, which is the number that decides
+    /// whether a blocking cable can hold 60 fps at all.
+    pub cable_wait_us: u64,
+    pub cable_waits: u64,
+    pub cable_wait_max_us: u64,
 }
 
 impl Net {
@@ -165,6 +195,10 @@ impl Net {
             cable_failures: 0,
             cable_done: 0,
             cable_lost: 0,
+            cable_rtx: 0,
+            cable_wait_us: 0,
+            cable_waits: 0,
+            cable_wait_max_us: 0,
         }
     }
 
@@ -339,14 +373,27 @@ pub fn send(to: u16, bytes: &[u8]) {
 /// could not carry. All three because a silent cable and a broken one look
 /// identical from outside, which is exactly how two adapter bugs stayed
 /// invisible for a whole device session.
-pub fn cable_stats() -> (u64, u64, usize, u64) {
-    with_net(|n| {
-        (
-            n.cable_done,
-            n.cable_lost,
-            n.cable_extra_peers(),
-            n.cable.version_mismatch,
-        )
+pub struct CableStats {
+    pub done: u64,
+    pub lost: u64,
+    pub extra_peers: usize,
+    pub bad_version: u64,
+    pub rtx: u64,
+    pub wait_us: u64,
+    pub waits: u64,
+    pub wait_max_us: u64,
+}
+
+pub fn cable_stats() -> CableStats {
+    with_net(|n| CableStats {
+        done: n.cable_done,
+        lost: n.cable_lost,
+        extra_peers: n.cable_extra_peers(),
+        bad_version: n.cable.version_mismatch,
+        rtx: n.cable_rtx,
+        wait_us: n.cable_wait_us,
+        waits: n.cable_waits,
+        wait_max_us: n.cable_wait_max_us,
     })
 }
 
@@ -402,17 +449,21 @@ impl LinkCable for NetCable {
             return None;
         }
 
-        let deadline = Instant::now() + EXCHANGE_TIMEOUT;
-        let mut next_retry = Instant::now() + RETRANSMIT_AFTER;
-        let mut spins: u32 = 0;
+        let began = Instant::now();
+        let deadline = began + EXCHANGE_TIMEOUT;
+        let mut next_retry = began + RETRANSMIT_AFTER;
         loop {
             // Short borrow, poll, short borrow: `poll_receive` re-enters us
             // through `np_receive`, which borrows the same global.
             poll_receive();
             if let Some(word) = with_net(|n| n.cable.take_reply(seq)) {
+                let waited = began.elapsed().as_micros() as u64;
                 let own = with_net(|n| {
                     n.cable_failures = 0;
                     n.cable_done += 1;
+                    n.cable_wait_us += waited;
+                    n.cable_waits += 1;
+                    n.cable_wait_max_us = n.cable_wait_max_us.max(waited);
                     // The word LATCHED when this exchange started, not whatever
                     // the register holds now: a game that writes SIOMLT_SEND
                     // again mid-transfer must not change what this transfer
@@ -430,25 +481,24 @@ impl LinkCable for NetCable {
                 break;
             }
             if now >= next_retry {
-                with_net(|n| n.cable.retry_exchange());
+                with_net(|n| {
+                    n.cable.retry_exchange();
+                    n.cable_rtx += 1;
+                });
                 flush_cable_outbox();
                 next_retry = now + RETRANSMIT_AFTER;
             }
-            // A healthy reply lands within one round trip, so spin hot at first.
-            // Past that the cable is in trouble and the timeout is coming, so
-            // back off rather than pin a core.
-            spins += 1;
-            if spins < HOT_SPINS {
-                std::thread::yield_now();
-            } else {
-                std::thread::sleep(BACKOFF);
-            }
+            std::thread::sleep(POLL_INTERVAL);
         }
 
+        let waited = began.elapsed().as_micros() as u64;
         with_net(|n| {
             n.cable.abandon(seq);
             n.cable_failures += 1;
             n.cable_lost += 1;
+            n.cable_wait_us += waited;
+            n.cable_waits += 1;
+            n.cable_wait_max_us = n.cable_wait_max_us.max(waited);
         });
         flush_cable_outbox(); // abandon only queues the give-up
         None

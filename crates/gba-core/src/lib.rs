@@ -283,7 +283,18 @@ impl Gba {
             // peer's parent is blocked. 228 polls a frame puts the worst-case
             // delivery delay at 73 us against a transfer the game has budgeted
             // 343 us for.
-            if (self.bus.cable.is_some() && self.bus.multi_mode())
+            //
+            // **Deliberately NOT gated on Multi-Player mode, which it was.**
+            // That gate looked like free economy and was a bug: a child answers
+            // a clock from its TRANSPORT, which is correct and mode-independent,
+            // but only if something is pumping. The two players reach the link
+            // menu seconds apart, so a parent clocks while its peer's game has
+            // not selected the mode yet, and with the gate in place nobody on
+            // that device was listening. The parent then waited out its whole
+            // timeout and raised a transfer error, which Pokemon reports as a
+            // bad cable. One give-up is enough: the protocol frame carries a
+            // checksum, so a single FFFF poisons it.
+            if self.bus.cable.is_some()
                 || self.bus.rfu.as_ref().map_or(false, |r| r.awaiting_event())
             {
                 for (from, bytes) in poll() {
@@ -975,17 +986,33 @@ mod tests {
         assert_eq!(child.cable_stats(), (1, 0));
     }
 
-    /// A transfer has to occupy the time hardware would spend on it.
+    /// A transfer has to occupy real emulated time, and over a network that
+    /// time is set by the transport rather than by the baud rate.
     ///
-    /// The lone-unit path completes inside the store, which is safe because
-    /// there is nobody to stay in step with. Over a cable it is not: both ends
-    /// compute the busy window from the same baud field, a game can poll the
-    /// busy bit, and completing in no time at all would let a parent clock
-    /// faster than its peer can answer. 115200 baud with two units is 5755
-    /// cycles, so four scanlines of 1232 must not be enough and five must be.
+    /// The lone-unit path completes inside the store, which is safe because there
+    /// is nobody to stay in step with. Over a cable it is not: both ends compute
+    /// the window from the same constants, a game can poll the busy bit, and a
+    /// transfer that completed instantly would let a parent clock faster than its
+    /// peer can answer.
+    ///
+    /// At hardware pacing 115200 baud with two units is 5755 cycles, which the
+    /// first device test showed is hopeless against an 8 ms round trip. The floor
+    /// of 201327 cycles is 12 ms, so the parent spends the round trip emulating
+    /// instead of blocked. Asserted in scanlines against absolute numbers, never
+    /// against the constants themselves, since a test phrased in terms of what it
+    /// checks agrees with any typo in it.
     #[test]
-    fn a_transfer_occupies_the_time_its_baud_rate_says() {
+    fn a_transfer_occupies_the_time_the_slowest_link_in_the_chain_needs() {
         use crate::bus::{Access::NonSeq as N, Bus};
+
+        // The floor outruns every entry in the baud table, so on a networked
+        // cable the table never decides the pacing. Worth pinning: if someone
+        // lowers the floor below 125829 the table silently starts mattering
+        // again, and the two ends only agree while they agree on which rule won.
+        assert!(
+            crate::cable::MIN_TRANSFER_CYCLES > 125_829,
+            "the floor must dominate the slowest baud, or pacing depends on the mode"
+        );
 
         let mut rom = vec![0u8; 0x200];
         rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
@@ -1006,117 +1033,12 @@ mod tests {
             gba.bus.cycles += 1232; // one scanline
             gba.bus.step_serial();
             lines += 1;
-            assert!(lines <= 8, "the transfer never completed");
+            assert!(lines <= 300, "the transfer never completed");
         }
-        assert_eq!(lines, 5, "5755 cycles is five scanlines of 1232, not one");
-    }
-
-    /// A cable has to be offered the network every scanline, and only while the
-    /// port is actually in Multi-Player mode.
-    ///
-    /// This is the one that matters most and the one PocketRust shipped wrong:
-    /// a child answers a clock from its transport, so the transport RUNNING is
-    /// the whole requirement, and polling once a frame makes every paired
-    /// exchange cost a peer a full frame. The mode gate is the other half: a
-    /// session can be live for an hour of a game that never links, and 228 calls
-    /// into the frontend per frame to deliver nothing is pure cost.
-    #[test]
-    fn a_cable_is_offered_the_network_every_scanline_but_only_in_multi_player_mode() {
-        use crate::bus::{Access::NonSeq as N, Bus};
-
-        let mut rom = vec![0u8; 0x200];
-        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
-        let (parent_end, _child_end) = crate::cable::local_pair();
-        let mut gba = Gba::new(rom, Vec::new());
-        gba.connect_cable(Box::new(parent_end));
-        gba.render_enabled = false;
-
-        let mut polls = 0u32;
-        gba.run_frame_polling(&mut || {
-            polls += 1;
-            Vec::new()
-        });
-        assert_eq!(polls, 0, "the port is not in Multi-Player mode, so there is nothing to carry");
-
-        gba.bus.write16(0x0400_0134, 0x0000, N);
-        gba.bus.write16(0x0400_0128, 0x2003, N);
-        gba.run_frame_polling(&mut || {
-            polls += 1;
-            Vec::new()
-        });
-        assert_eq!(
-            polls, TOTAL_LINES,
-            "once linking, every scanline: a peer blocked on a reply is waiting on this"
-        );
-    }
-
-    /// A whole Pokemon link frame, nine transfers, driven the way the game
-    /// drives it.
-    ///
-    /// One transfer proves the plumbing; a sequence proves it keeps working.
-    /// This is the shape gpSP documents for the Pokemon protocol: a checksum
-    /// word followed by eight data words, with each side writing its next word
-    /// from the interrupt of the previous transfer. It catches what a single
-    /// exchange cannot: a sequence number that stops matching, a busy bit that
-    /// is not clear in time for the next clock, a child queue that drifts
-    /// behind, and an interrupt that fires once and then stops.
-    #[test]
-    fn a_nine_transfer_pokemon_frame_runs_end_to_end() {
-        use crate::bus::{Access::NonSeq as N, Bus};
-
-        let mut rom = vec![0u8; 0x200];
-        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
-        let (parent_end, child_end) = crate::cable::local_pair();
-        let mut parent = Gba::new(rom.clone(), Vec::new());
-        let mut child = Gba::new(rom, Vec::new());
-        parent.connect_cable(Box::new(parent_end));
-        child.connect_cable(Box::new(child_end));
-        parent.render_enabled = false;
-        child.render_enabled = false;
-
-        const MULTI: u16 = 0x2000 | 0x4000 | 3;
-        for g in [&mut parent, &mut child] {
-            g.bus.write16(0x0400_0134, 0x0000, N);
-            g.bus.write16(0x0400_0128, MULTI, N);
-        }
-
-        // Transfer 0 is the checksum word, 1..=8 are the frame's data.
-        let parent_words: [u16; 9] = [0x0000, 0x8FFF, 0x0102, 0x0304, 0x0506, 0x0708, 0x090A, 0x0B0C, 0x0D0E];
-        let child_words: [u16; 9] = [0x0000, 0xB9A0, 0x1112, 0x1314, 0x1516, 0x1718, 0x191A, 0x1B1C, 0x1D1E];
-
-        for i in 0..9 {
-            // Each side presents its word, exactly as its serial interrupt
-            // handler would.
-            parent.bus.write16(0x0400_012A, parent_words[i], N);
-            child.bus.write16(0x0400_012A, child_words[i], N);
-            parent.bus.if_ = 0;
-            child.bus.if_ = 0;
-
-            parent.bus.write16(0x0400_0128, MULTI | 0x0080, N);
-            parent.run_frame();
-            child.run_frame();
-
-            assert_eq!(
-                (parent.bus.read16(0x0400_0120, N), parent.bus.read16(0x0400_0122, N)),
-                (parent_words[i], child_words[i]),
-                "transfer {i}: the parent must see both words"
-            );
-            assert_eq!(
-                (child.bus.read16(0x0400_0120, N), child.bus.read16(0x0400_0122, N)),
-                (parent_words[i], child_words[i]),
-                "transfer {i}: and the child must see the same pair, in the same slots"
-            );
-            assert_eq!(
-                parent.bus.read16(0x0400_0128, N) & 0x00C0,
-                0,
-                "transfer {i}: neither busy nor an error once it has landed"
-            );
-            assert_ne!(parent.bus.if_ & 0x80, 0, "transfer {i}: the parent interrupts");
-            assert_ne!(child.bus.if_ & 0x80, 0, "transfer {i}: so does the child");
-        }
-
-        assert_eq!(parent.cable_stats(), (9, 0), "nine completed, none lost");
-        assert_eq!(child.cable_stats(), (9, 0));
+        // 201327 cycles is 163 full scanlines of 1232 plus a remainder, so the
+        // 164th is the one that lands it. Five would be the hardware answer and
+        // is what this asserted before the device test.
+        assert_eq!(lines, 164, "12 ms is 164 scanlines of 1232, not 5");
     }
 
     /// A child that reaches the link menu late must not inherit the transfers

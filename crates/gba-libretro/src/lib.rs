@@ -968,9 +968,14 @@ pub extern "C" fn retro_run() {
                     // apart. `lost` is give-ups and `extra` is peers this cable
                     // cannot carry.
                     let cable = if g.cable_attached() {
-                        let (done, lost, extra, badver) = netpacket::cable_stats();
+                        let c = netpacket::cable_stats();
+                        // The mean wait is the number that decides whether a
+                        // blocking cable can hold 60 fps: nine transfers a frame
+                        // against a 16.7 ms budget leaves 1.8 ms each.
+                        let mean = if c.waits > 0 { c.wait_us / c.waits } else { 0 };
                         format!(
-                            " cable_done={done} cable_lost={lost} cable_extra={extra} cable_badver={badver}"
+                            " cable_done={} cable_lost={} cable_extra={} cable_badver={} cable_rtx={} cable_wait_mean_us={} cable_wait_max_us={}",
+                            c.done, c.lost, c.extra_peers, c.bad_version, c.rtx, mean, c.wait_max_us
                         )
                     } else {
                         String::new()

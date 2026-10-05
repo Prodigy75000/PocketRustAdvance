@@ -20,7 +20,10 @@ use crate::save::Save;
 /// games' idea of how long a transfer takes.
 fn multi_cycles(cnt: u16, units: u8) -> u32 {
     let slot = (units as usize).clamp(1, crate::cable::MAX_UNITS) - 1;
-    crate::cable::TRANSFER_CYCLES[(cnt & 3) as usize][slot]
+    // Never faster than the transport can answer. See MIN_TRANSFER_CYCLES: this
+    // is what turns a blocking network wait into overlapped emulation, and both
+    // ends have to arrive at the same number or their clocks drift.
+    crate::cable::TRANSFER_CYCLES[(cnt & 3) as usize][slot].max(crate::cable::MIN_TRANSFER_CYCLES)
 }
 
 const CYC_256KHZ_8BIT: u32 = 524;

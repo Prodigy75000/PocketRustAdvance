@@ -79,6 +79,36 @@ pub const TRANSFER_CYCLES: [[u32; MAX_UNITS]; 4] = [
     [3140, 5755, 8376, 10486],     // 115200 bps
 ];
 
+/// The shortest a cable transfer is allowed to take, in cycles.
+///
+/// **This is an emulation concession to transport latency, not hardware.** At the
+/// real 115200 baud a transfer is 5755 cycles, 343 us, and Pokemon issues nine of
+/// them per video frame. A networked cable cannot complete one without the peer's
+/// word, so nine round trips have to fit inside a 16.7 ms frame: 1.8 ms each.
+/// Measured between the owner's two devices on his own Wi-Fi, a round trip is
+/// 6.0 ms min, 8.1 ms mean, 10.7 ms max. Nine of those is 72 ms, which is four
+/// and a half frames, so at hardware pacing the parent CANNOT keep 60 fps and
+/// does not: measured 6.7 fps while the child sat at 59.7, and the two games'
+/// emulated clocks diverged ninefold until the link failed.
+///
+/// So the line is modelled as what it actually is, a slow one. Stretching a
+/// transfer to 12 ms of EMULATED time means the parent spends the round trip
+/// emulating rather than blocking, and the wait disappears into work it had to do
+/// anyway. Both ends derive the same floor from this same constant, which is why
+/// it is here and not in the transport: if the two disagreed on how long a
+/// transfer takes, their protocol clocks would drift apart, which is the failure
+/// this exists to prevent.
+///
+/// The cost is protocol throughput: about 1.4 transfers per frame instead of
+/// nine, so a trade takes several times longer in emulated time. That is a few
+/// extra seconds on a trade, against a link that does not work at all. Smoothness
+/// at 60 fps on both devices was the explicit requirement.
+///
+/// Above every entry in [`TRANSFER_CYCLES`], so the baud table currently never
+/// decides the pacing. It is still consulted, and still right, for a transport
+/// faster than Wi-Fi: two cores in one process, or a LAN worth the name.
+pub const MIN_TRANSFER_CYCLES: u32 = 201_327; // 12 ms at 16.78 MHz
+
 /// Units one Multi-Player bus can hold, which is also the number of SIOMULTI
 /// slots.
 pub const MAX_UNITS: usize = 4;
@@ -147,15 +177,21 @@ pub const FAMILY: [u8; 3] = *b"CBL";
 
 /// The cable wire version this build speaks, byte 3 of every packet.
 ///
-/// The ASCII digit rather than the number, so a packet dump reads "CBL1" and
-/// the family and version are one readable token on the wire. Bump it to `b'2'`
-/// whenever the layout or the meaning of a field changes. There is no
+/// The ASCII digit rather than the number, so a packet dump reads "CBL2" and
+/// the family and version are one readable token on the wire. Bump it whenever
+/// the layout or the MEANING of a field changes.
+///
+/// Went to `2` for a change with no layout in it at all: `MIN_TRANSFER_CYCLES`.
+/// Both ends derive the busy window from that constant and never send it, so two
+/// builds that disagree would quietly drift their protocol clocks apart, which is
+/// the exact silent-mismatch failure this version byte exists to prevent. A
+/// semantic agreement counts as the wire. There is no
 /// negotiation and there should not be: two devices come off the same APK, so a
 /// mismatch is a mis-install rather than a case to support.
-pub const WIRE_VERSION: u8 = b'1';
+pub const WIRE_VERSION: u8 = b'2';
 
-/// The full four-byte header of a packet this build will act on, "CBL1".
-pub const MAGIC: u32 = 0x4342_4C31;
+/// The full four-byte header of a packet this build will act on, "CBL2".
+pub const MAGIC: u32 = 0x4342_4C32;
 
 /// `[magic, 1, seq, word, 0]`: "I am clocking `word` into you as exchange
 /// `seq`."
