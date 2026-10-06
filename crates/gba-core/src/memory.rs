@@ -1595,6 +1595,33 @@ impl GbaBus {
         }
     }
 
+    /// Which serial mode the game has the port in, decoded the way
+    /// [`GbaBus::write_io`]'s trace decodes it.
+    ///
+    /// Worth a heartbeat field of its own, because "we linked game X and nothing
+    /// happened" has two completely different causes and no counter separates
+    /// them. The cable only carries Multi-Player transfers: a game that picks
+    /// NORMAL32 is asking for a mode nothing is attached to, which looks
+    /// identical from the counters to a game that never tried to link at all.
+    pub fn sio_mode(&self) -> &'static str {
+        let cnt = self.io_u16(0x128);
+        let rcnt = self.io_u16(0x134);
+        if rcnt & 0x8000 != 0 {
+            if rcnt & 0x4000 != 0 {
+                "JOYBUS"
+            } else {
+                "GPIO"
+            }
+        } else {
+            match cnt & 0x3000 {
+                0x0000 => "NORMAL8",
+                0x1000 => "NORMAL32",
+                0x2000 => "MULTI",
+                _ => "UART",
+            }
+        }
+    }
+
     /// Advance the serial port by the cycles since the last call.
     ///
     /// Two jobs. It completes a paced transfer, clearing the start bit and
@@ -2505,6 +2532,21 @@ mod tests {
             b.dma_src[0], 0x0300_0304,
             "the channel must have run exactly once: a store of 1 over an enable              bit that is already 1 is not an edge and starts nothing"
         );
+    }
+
+    /// The mode the heartbeat reports has to come from both registers, because
+    /// RCNT's bit 15 overrides SIOCNT entirely. Reading only SIOCNT would report
+    /// MULTI for a cartridge sitting on GPIO, which is every RTC and rumble game.
+    #[test]
+    fn the_serial_mode_is_decoded_from_both_registers() {
+        let mut b = bus();
+        b.write16(0x0400_0134, 0x0000, Access::NonSeq); // RCNT: serial pins
+        b.write16(0x0400_0128, 0x2000, Access::NonSeq);
+        assert_eq!(b.sio_mode(), "MULTI", "the one mode the cable carries");
+        b.write16(0x0400_0128, 0x1000, Access::NonSeq);
+        assert_eq!(b.sio_mode(), "NORMAL32", "and the one it does not");
+        b.write16(0x0400_0134, 0x8000, Access::NonSeq);
+        assert_eq!(b.sio_mode(), "GPIO", "RCNT bit 15 outranks SIOCNT's mode bits");
     }
 
     /// A cable whose parent transfers end however a test says they do.
