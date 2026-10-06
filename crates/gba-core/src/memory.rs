@@ -113,8 +113,14 @@ pub struct GbaBus {
     /// logged could say whether the words themselves agreed. FNV-1a, and the
     /// order is part of it, so a pair delivered out of sequence diverges too.
     pub cable_wordsum: u64,
-    /// The hash snapshotted at an exact multiple of `CABLE_MARK_EVERY` transfers,
-    /// and the count it was taken at.
+    /// The hash of the LAST window of `CABLE_MARK_EVERY` transfers, and the count
+    /// it closed at.
+    ///
+    /// Windowed rather than cumulative, because a cumulative hash answers the
+    /// wrong question: one bad word early makes every later checkpoint differ, so
+    /// 46 diverged checkpoints and 1 diverged checkpoint look identical. A window
+    /// says WHERE, and distinguishes a single corrupted transfer from two streams
+    /// that have been offset against each other since the start.
     ///
     /// The running hash alone turned out not to be comparable between devices: the
     /// heartbeat fires on a timer, so the two ends print it at different transfer
@@ -124,6 +130,10 @@ pub struct GbaBus {
     /// diverged, with nothing to line up by hand.
     pub cable_mark_at: u64,
     pub cable_mark_sum: u64,
+    /// The running hash of the window in progress.
+    cable_window_sum: u64,
+    /// The first few transfers' words, for printing once.
+    pub cable_trace: Vec<(u64, u16, u16)>,
     /// `cycles` as of the last `step_serial`, so serial timing is a delta the
     /// same way the timers are.
     serial_cycles: u64,
@@ -470,6 +480,8 @@ impl GbaBus {
             cable_wordsum: 0xcbf2_9ce4_8422_2325, // FNV-1a offset basis
             cable_mark_at: 0,
             cable_mark_sum: 0xcbf2_9ce4_8422_2325,
+            cable_window_sum: 0xcbf2_9ce4_8422_2325,
+            cable_trace: Vec::new(),
             serial_cycles: 0,
             serial_pending: 0,
             bios: b.into_boxed_slice(),
@@ -1732,13 +1744,24 @@ impl GbaBus {
             self.cable_transfers += 1;
             if self.cable_transfers % crate::cable::CABLE_MARK_EVERY == 0 {
                 self.cable_mark_at = self.cable_transfers;
-                self.cable_mark_sum = self.cable_wordsum;
+                self.cable_mark_sum = self.cable_window_sum;
+                self.cable_window_sum = 0xcbf2_9ce4_8422_2325; // basis again
             }
             for half in w {
                 for byte in half.to_be_bytes() {
                     self.cable_wordsum ^= byte as u64;
                     self.cable_wordsum = self.cable_wordsum.wrapping_mul(0x100_0000_01b3);
+                    self.cable_window_sum ^= byte as u64;
+                    self.cable_window_sum = self.cable_window_sum.wrapping_mul(0x100_0000_01b3);
                 }
+            }
+            // The head of the stream, verbatim, on both ends. A hash says the
+            // two disagree; these say what the words actually were, which is the
+            // only way to tell a shifted stream from a corrupted one.
+            if self.cable_transfers <= crate::cable::CABLE_TRACE_HEAD
+                && std::env::var_os("GBA_NOSIOTRACE").is_none()
+            {
+                self.cable_trace.push((self.cable_transfers, w[0], w[1]));
             }
         } else {
             self.cable_failures += 1;

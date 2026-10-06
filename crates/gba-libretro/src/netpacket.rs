@@ -75,11 +75,20 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(150);
 /// 8.1 ms mean, 10.7 ms max. So a 10 ms timer fired on a large fraction of
 /// perfectly healthy transfers, sent a duplicate, and the reply that was
 /// already in flight arrived to find the parent had moved its expectations on.
-/// 40 ms sits clear of the jitter and still allows three attempts inside the
-/// timeout. A genuinely lost packet now costs 40 ms instead of 10, which is the
-/// right way round: loss measured 0% over the same link, spurious retransmits
-/// were happening constantly.
-const RETRANSMIT_AFTER: Duration = Duration::from_millis(40);
+/// Then 40 ms, clear of the jitter, which allowed three attempts inside the
+/// timeout. **Three is not enough, and the reason is not performance.** A parent
+/// that gives up has told its game the transfer failed while the child has
+/// already run it, so the two ends' word streams are offset from that point and
+/// every protocol checksum after it fails. Three give-ups in 26720 transfers was
+/// measured on the devices, which is one session in three ruined by three
+/// unlucky datagrams.
+///
+/// 20 ms is above the 10.7 ms measured maximum round trip and gives seven
+/// attempts inside the same 150 ms stall, so an unrecoverable loss now needs a
+/// peer that has actually gone rather than a bad moment. Spurious duplicates are
+/// idempotent and counted in `cable_rtx`; a shifted stream is not recoverable at
+/// all, so the trade is the right way round.
+const RETRANSMIT_AFTER: Duration = Duration::from_millis(20);
 
 /// How long to wait between polls while blocked.
 ///
@@ -456,6 +465,19 @@ pub struct CableStats {
     pub ties: u64,
     /// Clocks held back while the child's game armed its next word.
     pub deferrals: u64,
+    /// Transfers the child's queue threw away because its serial engine never
+    /// collected them.
+    ///
+    /// The counter that was missing while I hunted a word divergence. A dropped
+    /// transfer is one the child's GAME never sees, so from that point on the two
+    /// ends are hashing different streams, and nothing else on the heartbeat
+    /// mentions it: the wire looks perfect because the wire did its job.
+    pub dropped: u64,
+    /// Transfers taken back because the parent gave up before the child's engine
+    /// had them, and transfers it was too late to take back. The second number
+    /// means the two word streams are offset from that point on.
+    pub taken_back: u64,
+    pub shifted: u64,
 }
 
 pub fn cable_stats() -> CableStats {
@@ -477,6 +499,9 @@ pub fn cable_stats() -> CableStats {
         role: n.cable.role(),
         ties: n.cable.election_ties,
         deferrals: n.cable.deferrals,
+        dropped: n.cable.dropped,
+        taken_back: n.cable.gave_up_in_time,
+        shifted: n.cable.shifted,
     })
 }
 

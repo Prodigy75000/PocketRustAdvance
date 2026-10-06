@@ -775,6 +775,15 @@ pub extern "C" fn retro_run() {
                 // the per-scanline charge only runs in Multi-Player mode, which
                 // the game will not enter until the election has given it a peer.
                 netpacket::cable_keepalive();
+                // The head of the word stream, printed once per transfer as it
+                // happens. Both devices print the same lines for the same
+                // transfers if the cable is carrying what it should, so these can
+                // be diffed directly rather than compared through a hash.
+                if !gba.bus.cable_trace.is_empty() {
+                    for (n, a, b) in std::mem::take(&mut gba.bus.cable_trace) {
+                        log_line(s.log, &format!("[cable] t={n} words={a:04X},{b:04X}"));
+                    }
+                }
             }
         }
 
@@ -1000,7 +1009,7 @@ pub extern "C" fn retro_run() {
                         // wire.
                         let mean = if c.waits > 0 { c.wait_us / c.waits } else { 0 };
                         format!(
-                            " cable_done={} cable_lost={} cable_extra={} cable_badver={} cable_rtx={} cable_wait_mean_us={} cable_wait_max_us={} cable_stale_risk={} cable_holds={} cable_starved={} cable_skew={} cable_cold={}/{} cable_wordsum={:016X} cable_role={} cable_ties={} cable_defer={} cable_mark={}@{:016X}",
+                            " cable_done={} cable_lost={} cable_extra={} cable_badver={} cable_rtx={} cable_wait_mean_us={} cable_wait_max_us={} cable_stale_risk={} cable_holds={} cable_starved={} cable_skew={} cable_cold={}/{} cable_wordsum={:016X} cable_role={} cable_ties={} cable_defer={} cable_dropped={} cable_taken_back={} cable_shifted={} cable_core={} cable_mark={}@{:016X}",
                             c.done, c.lost, c.extra_peers, c.bad_version, c.rtx, mean, c.wait_max_us,
                             c.stale_risk, c.holds, c.starved, c.skew, c.cold, c.answered,
                             g.cable_wordsum(),
@@ -1014,6 +1023,10 @@ pub extern "C" fn retro_run() {
                             },
                             c.ties,
                             c.deferrals,
+                            c.dropped,
+                            c.taken_back,
+                            c.shifted,
+                            g.cable_stats().0,
                             g.cable_mark().0,
                             g.cable_mark().1
                         )

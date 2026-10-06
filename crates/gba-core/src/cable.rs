@@ -318,6 +318,13 @@ pub const HORIZON: u32 = 280_896;
 /// seconds: often enough to bracket a failure, rare enough to be one log line.
 pub const CABLE_MARK_EVERY: u64 = 512;
 
+/// How many transfers at the head of a session to record verbatim.
+///
+/// Enough to see the first words of a link go past on both devices and diff them
+/// by eye. The hash tells you two streams differ; only the words tell you whether
+/// one is corrupt or merely offset against the other.
+pub const CABLE_TRACE_HEAD: u64 = 24;
+
 /// How long a child may hold a clock back while its game arms the next word.
 ///
 /// Eight scanlines. The window being closed runs from the serial interrupt to the
@@ -400,8 +407,13 @@ pub struct CableProto {
     /// The reply that matched `awaiting`.
     reply: Option<u16>,
     /// Transfers a parent clocked into us, awaiting pickup by the serial engine,
-    /// as `(parent's word, the word we answered with)`. Its depth is our lag.
-    child_input: VecDeque<(u16, u16)>,
+    /// as `(seq, parent's word, the word we answered with)`. Its depth is our lag.
+    ///
+    /// The sequence number is kept so a parent that gives up can take the
+    /// transfer back: a transfer the child ran and the parent did not shifts the
+    /// two word streams against each other for good, and every protocol checksum
+    /// after it fails.
+    child_input: VecDeque<(u8, u16, u16)>,
     /// Transfers dropped because the serial engine never collected them.
     pub dropped: u64,
     /// Clocks accepted while a previous transfer was still uncollected.
@@ -448,6 +460,15 @@ pub struct CableProto {
     deferred_cycles: u32,
     /// Clocks held back while the game armed its next word.
     pub deferrals: u64,
+    /// Transfers taken back off the queue because the parent gave up in time.
+    pub gave_up_in_time: u64,
+    /// Transfers the child had already handed its game when the parent gave up.
+    ///
+    /// Not recoverable, and the one number that means the protocol streams are
+    /// now offset: the child's Nth word pairs with the parent's N+1th and every
+    /// checksum fails from here. It was invisible before, which is why a word
+    /// hash that diverged at the first checkpoint had no explanation next to it.
+    pub shifted: u64,
     /// Packets from a peer speaking a cable version this build does not.
     ///
     /// Non-zero means the two devices are on different builds, and it latches:
@@ -528,6 +549,8 @@ impl CableProto {
             deferred: None,
             deferred_cycles: 0,
             deferrals: 0,
+            gave_up_in_time: 0,
+            shifted: 0,
             version_mismatch: 0,
             peer_lag: 0, // nothing reported yet, see LAG_HEALTHY
             peer_gave_up: false,
@@ -567,6 +590,8 @@ impl CableProto {
         self.deferred = None;
         self.deferred_cycles = 0;
         self.deferrals = 0;
+        self.gave_up_in_time = 0;
+        self.shifted = 0;
         self.version_mismatch = 0;
         self.peer_lag = 0; // nothing reported yet, see LAG_HEALTHY
         self.peer_gave_up = false;
@@ -711,7 +736,7 @@ impl CableProto {
 
     /// Take the oldest transfer a parent clocked into us.
     pub fn child_clock(&mut self) -> Option<(u16, u16)> {
-        self.child_input.pop_front()
+        self.child_input.pop_front().map(|(_, word, answered)| (word, answered))
     }
 
     /// Set this end's identity and announce it.
@@ -1044,6 +1069,22 @@ impl CableProto {
             }
             TAG_GAVE_UP => {
                 self.peer_gave_up = true;
+                // Take the transfer back if our serial engine has not had it yet.
+                // The parent has told its game this transfer failed, so a child
+                // that runs it anyway puts its Nth word against the parent's
+                // N+1th from here to the end of the session. Undoing it while it
+                // is still in the queue is the only moment that is possible.
+                let before = self.child_input.len();
+                self.child_input.retain(|&(s, _, _)| s != seq);
+                let taken = before - self.child_input.len();
+                if taken > 0 {
+                    self.gave_up_in_time += taken as u64;
+                } else if self.seen.contains(&Some(seq)) {
+                    // Already delivered. Nothing can be undone, so say so loudly:
+                    // from here the two streams are offset and every checksum the
+                    // protocol computes will fail.
+                    self.shifted += 1;
+                }
             }
             _ => {}
         }
@@ -1076,7 +1117,7 @@ impl CableProto {
             self.child_input.pop_front();
             self.dropped += 1;
         }
-        self.child_input.push_back((word, answered));
+        self.child_input.push_back((seq, word, answered));
         let mut reply = [0u8; PACKET_LEN];
         put(&mut reply, TAG_REPLY, seq, answered, self.lag(), self.local_cycles);
         self.last_reply = reply;
@@ -1228,6 +1269,249 @@ mod tests {
     /// CHILD, it does not change what this layer answers when asked while
     /// parked. A protocol that could answer correctly here would need to know
     /// what the game has not yet told it.
+    /// A give-up that arrives before the child's engine collects takes the
+    /// transfer back, and the streams stay aligned.
+    ///
+    /// The recoverable half of the same failure, and the reason the queue carries
+    /// sequence numbers. The parent has told its game this transfer failed; as
+    /// long as the child has not handed it to its own game, undoing it keeps both
+    /// ends counting the same transfers.
+    #[test]
+    fn a_give_up_in_time_takes_the_transfer_back_off_the_queue() {
+        let mut w = Wire::new();
+        w.proto[1].set_output(0xB9A0);
+
+        let seq = w.proto[0].begin_exchange(0x8FFF);
+        w.deliver(0); // the child runs it and queues it
+        assert_eq!(w.proto[1].lag(), 1, "queued, not yet collected");
+
+        // Its reply never arrives and the parent gives up.
+        w.drop_all(1);
+        w.proto[0].abandon(seq);
+        w.deliver(0);
+
+        assert_eq!(w.proto[1].lag(), 0, "the transfer is taken back off the queue");
+        assert_eq!(w.proto[1].gave_up_in_time, 1);
+        assert_eq!(w.proto[1].shifted, 0, "nothing was handed to the game, so nothing is offset");
+        assert_eq!(
+            w.proto[1].child_clock(),
+            None,
+            "and the child's game must never see a transfer its peer failed"
+        );
+    }
+
+    /// A transfer the child RAN and the parent gave up on shifts the two streams
+    /// against each other for good.
+    ///
+    /// The mechanism behind the diverged device checkpoints, isolated. Losing a
+    /// clock is harmless: the child never runs the transfer and neither end counts
+    /// it. Losing every copy of a REPLY is not, because the child has already run
+    /// it and told its game, while the parent gives up and tells its game the
+    /// transfer failed. From that point the parent's Nth transfer is the child's
+    /// N+1th, every protocol word is paired with the wrong partner, and every
+    /// checksum fails. The wire looks perfect throughout.
+    ///
+    /// Documented as the behaviour we have, not as the behaviour we want, so the
+    /// fix has something to turn red.
+    #[test]
+    fn a_reply_lost_beyond_recovery_shifts_the_streams_apart() {
+        let mut w = Wire::new();
+        let mut parent_stream: Vec<(u16, u16)> = Vec::new();
+        let mut child_stream: Vec<(u16, u16)> = Vec::new();
+
+        for i in 0..4u16 {
+            w.proto[1].set_output(0x1000 + i);
+            let seq = w.proto[0].begin_exchange(0x8000 + i);
+            w.deliver(0); // the clock always arrives, so the child always runs it
+            if i == 2 {
+                // Every copy of this reply is lost, and the parent runs out of
+                // patience rather than ever hearing it. The child has ALREADY
+                // collected this transfer below, so the give-up arrives too late
+                // to take anything back.
+                w.drop_all(1);
+                w.proto[0].abandon(seq);
+            } else {
+                w.deliver(1);
+                let got = w.proto[0].take_reply(seq).expect("reply arrived");
+                parent_stream.push((0x8000 + i, got));
+            }
+            if let Some(pair) = w.proto[1].child_clock() {
+                child_stream.push(pair);
+            }
+            w.deliver(0); // including the give-up, which is now too late
+        }
+
+        assert_eq!(
+            w.proto[1].shifted, 1,
+            "the one unrecoverable give-up has to be counted, because nothing else              on the heartbeat would say the streams are now offset"
+        );
+        assert_eq!(w.proto[1].gave_up_in_time, 0, "there was nothing left to take back");
+        assert_eq!(child_stream.len(), 4, "the child ran every transfer it was clocked");
+        assert_eq!(parent_stream.len(), 3, "the parent recorded one fewer");
+
+        // And the pairing is wrong from the gap onward, which is the whole damage.
+        assert_eq!(parent_stream[2], (0x8003, 0x1003), "the parent's third landed word");
+        assert_eq!(child_stream[2], (0x8002, 0x1002), "while the child's third is a transfer earlier");
+        assert_ne!(
+            parent_stream[2], child_stream[2],
+            "one give-up offsets the two streams permanently"
+        );
+    }
+
+    /// The two ends must land the SAME word stream, and a lossy wire must not
+    /// shift one against the other.
+    ///
+    /// The device checkpoints said the streams diverged from the first 512
+    /// transfers on, and the two mechanisms that can do that are both reachable
+    /// here. A parent that gives up does not count or hash the transfer, while
+    /// the child has already run it, so the child is one ahead from then on. A
+    /// child whose queue overflows drops a transfer its game never sees, so the
+    /// parent is one ahead from then on. Either way every later pairing is off by
+    /// one and every protocol checksum fails, which is the game's own complaint.
+    ///
+    /// Drives 200 transfers over a wire that loses every 37th packet, which is
+    /// heavier loss than the devices showed (3 give-ups in 26720) and therefore a
+    /// strictly harder test than the measurement that prompted it.
+    #[test]
+    fn the_two_ends_land_the_same_word_stream_over_a_lossy_wire() {
+        const ONE_WAY_TICKS: u32 = 55;
+        const LOSE_EVERY: u64 = 37;
+        const TRANSFERS: usize = 200;
+
+        struct Lossy {
+            proto: [CableProto; 2],
+            flight: Vec<(u32, usize, [u8; PACKET_LEN])>,
+            tick: u32,
+            sent: u64,
+            lost: u64,
+        }
+        impl Lossy {
+            fn send_all(&mut self, from: usize) {
+                let at = self.tick + ONE_WAY_TICKS;
+                for pkt in self.proto[from].take_outbox() {
+                    self.sent += 1;
+                    if self.sent % LOSE_EVERY == 0 {
+                        self.lost += 1;
+                        continue; // the datagram never arrives
+                    }
+                    self.flight.push((at, 1 - from, pkt));
+                }
+            }
+            fn deliver_due(&mut self) {
+                let now = self.tick;
+                let mut still = Vec::new();
+                for (at, to, pkt) in std::mem::take(&mut self.flight) {
+                    if at <= now {
+                        self.proto[to].on_packet(&pkt);
+                    } else {
+                        still.push((at, to, pkt));
+                    }
+                }
+                self.flight = still;
+            }
+        }
+
+        let mut w = Lossy {
+            proto: [CableProto::new(), CableProto::new()],
+            flight: Vec::new(),
+            tick: 0,
+            sent: 0,
+            lost: 0,
+        };
+
+        // What each end believes landed, in its own order. These are the two
+        // streams the device checkpoints hash.
+        let mut parent_stream: Vec<(u16, u16)> = Vec::new();
+        let mut child_stream: Vec<(u16, u16)> = Vec::new();
+
+        let mut issued = 0usize;
+        let mut awaiting: Option<(u8, u16, u32)> = None; // seq, our word, tick begun
+        let mut parent_since_clock = 0u32;
+        let mut parent_gave_up = 0u64;
+
+        w.proto[1].set_output(0x1000);
+
+        for tick in 0..200_000u32 {
+            w.tick = tick;
+            w.deliver_due();
+
+            // ---- parent ----
+            if let Some((seq, own, began)) = awaiting {
+                if let Some(word) = w.proto[0].take_reply(seq) {
+                    parent_stream.push((own, word));
+                    awaiting = None;
+                    parent_since_clock = 0;
+                } else if tick - began > ONE_WAY_TICKS * 6 {
+                    // Out of patience. This is the give-up path: the parent hands
+                    // its game a transfer error and does NOT record a transfer.
+                    w.proto[0].abandon(seq);
+                    parent_gave_up += 1;
+                    awaiting = None;
+                    parent_since_clock = 0;
+                } else if (tick - began) % (ONE_WAY_TICKS * 2) == 0 {
+                    w.proto[0].retry_exchange();
+                }
+            } else {
+                w.proto[0].advance(1232);
+                parent_since_clock += 1232;
+                w.proto[0].maybe_tick();
+                if issued < TRANSFERS && parent_since_clock >= 28672 {
+                    let word = 0x8000 + issued as u16;
+                    let seq = w.proto[0].begin_exchange(word);
+                    awaiting = Some((seq, word, tick));
+                    issued += 1;
+                }
+            }
+            w.send_all(0);
+
+            // ---- child ----
+            if !w.proto[1].hold() {
+                w.proto[1].advance(1232);
+                if let Some((parent_word, answered)) = w.proto[1].child_clock() {
+                    child_stream.push((parent_word, answered));
+                    // Its handler arms the next word, as a real one always does.
+                    w.proto[1].set_output(0x1000 + child_stream.len() as u16);
+                }
+            }
+            w.send_all(1);
+
+            if issued == TRANSFERS && awaiting.is_none() && w.flight.is_empty() {
+                // Let the child drain whatever it still holds.
+                if w.proto[1].lag() == 0 {
+                    break;
+                }
+            }
+        }
+
+        assert!(w.lost > 0, "the wire has to have actually lost something");
+        assert!(
+            parent_stream.len() > TRANSFERS / 2,
+            "the parent only completed {} of {TRANSFERS}, so this proves little",
+            parent_stream.len()
+        );
+
+        // The real assertion. Compare the streams the two ends would hash.
+        let common = parent_stream.len().min(child_stream.len());
+        let first_bad = (0..common).find(|&i| parent_stream[i] != child_stream[i]);
+        assert_eq!(
+            first_bad, None,
+            "the streams diverge at transfer {:?}: parent saw {:04X?} and child saw {:04X?} \
+             (gave up {parent_gave_up}, dropped {}, lost {} datagrams)",
+            first_bad,
+            first_bad.map(|i| parent_stream[i]),
+            first_bad.map(|i| child_stream[i]),
+            w.proto[1].dropped,
+            w.lost
+        );
+        assert_eq!(
+            parent_stream.len(),
+            child_stream.len(),
+            "and neither end may be left holding transfers the other never had \
+             (gave up {parent_gave_up}, dropped {})",
+            w.proto[1].dropped
+        );
+    }
+
     /// A parent crawling at the round trip, a child that would run at 60, and the
     /// child ends up at the parent's pace with nothing stale.
     ///
