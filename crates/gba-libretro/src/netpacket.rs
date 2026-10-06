@@ -25,7 +25,7 @@
 //! state is a `CableProto` in this module's own global and never touches
 //! `State`.
 
-use gba_core::cable::{CableProto, LinkCable, MAX_UNITS, PACKET_LEN};
+use gba_core::cable::{CableProto, LinkCable, MultiResult, MAX_UNITS, PACKET_LEN};
 use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void};
 use std::time::{Duration, Instant};
@@ -578,14 +578,18 @@ impl LinkCable for NetCable {
         flush_cable_outbox();
     }
 
-    fn parent_result(&mut self) -> Option<[u16; MAX_UNITS]> {
+    fn parent_result(&mut self) -> MultiResult {
         let (seq, open_circuit) = with_net(|n| {
             (
                 n.cable.awaiting(),
                 n.cable_failures >= FAILURES_BEFORE_OPEN_CIRCUIT,
             )
         });
-        let seq = seq?;
+        // No exchange outstanding at all: nothing was ever put on the wire for
+        // this transfer, so there is no peer to be late.
+        let Some(seq) = seq else {
+            return MultiResult::Gone;
+        };
         if open_circuit {
             // The peer has not answered three exchanges running. Fail this one
             // at once instead of spending the timeout on it: nine transfers a
@@ -596,7 +600,9 @@ impl LinkCable for NetCable {
                 n.cable_lost += 1;
             });
             flush_cable_outbox();
-            return None;
+            // Three exchanges missed running. The peer is not merely slow, so
+            // this is the case where ABSENT and the error flag are both true.
+            return MultiResult::Gone;
         }
 
         let began = Instant::now();
@@ -621,10 +627,17 @@ impl LinkCable for NetCable {
                     // child was told.
                     n.cable.pending_out()
                 });
-                return Some([own, word, gba_core::cable::ABSENT, gba_core::cable::ABSENT]);
+                return MultiResult::Landed([
+                    own,
+                    word,
+                    gba_core::cable::ABSENT,
+                    gba_core::cable::ABSENT,
+                ]);
             }
             if !with_net(|n| n.active) {
-                break; // the session was torn down under us
+                // Torn down under us, so there is genuinely nothing there.
+                with_net(|n| n.cable.abandon(seq));
+                return MultiResult::Gone;
             }
             let now = Instant::now();
             if now >= deadline {
@@ -651,7 +664,10 @@ impl LinkCable for NetCable {
             n.cable_wait_max_us = n.cable_wait_max_us.max(waited);
         });
         flush_cable_outbox(); // abandon only queues the give-up
-        None
+        // One deadline missed by a peer that is still in the session: late, not
+        // gone. The next transfer may well land, and three in a row turn into
+        // `Gone` above.
+        MultiResult::Late
     }
 
     fn flush(&mut self) {

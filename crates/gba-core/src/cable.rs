@@ -138,6 +138,35 @@ pub const ABSENT: u16 = 0xFFFF;
 /// One instance per core. Everything that can block or touch a socket is behind
 /// this trait, so the register model in `memory.rs` is the same code on a desk
 /// and on a phone.
+/// What a parent's transfer came back with.
+///
+/// This was an `Option` until 2026-10-06, and collapsing both failures into
+/// `None` was a real bug rather than a loss of detail: the register model filled
+/// every slot with [`ABSENT`] and raised SIOCNT's error flag, so a peer that was
+/// present and answering, with one word merely late, was reported to the game as
+/// a cable that had been unplugged. Ruby acts on that immediately, which is the
+/// "transmission error" every failed device run ended on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MultiResult {
+    /// Every unit's word, this unit's own included.
+    Landed([u16; MAX_UNITS]),
+    /// The peer is in the session and answering; its word for THIS transfer did
+    /// not arrive before the deadline.
+    ///
+    /// A transport artifact, not an emulated cable fault: on hardware the clock
+    /// cannot outrun the wire, so there is no truthful register state for it and
+    /// we are choosing which fiction to tell. The benign one is zeros with no
+    /// error flag, which a protocol that checksums its frames rejects and
+    /// retries.
+    Late,
+    /// There is nothing on the far end any more: the session went away, or the
+    /// peer has missed several transfers running.
+    ///
+    /// Here [`ABSENT`] and the error flag are both TRUE, so this is the case the
+    /// old unconditional behaviour described correctly.
+    Gone,
+}
+
 pub trait LinkCable {
     /// Units on the bus including this one. 1 means the peer has gone.
     fn units(&self) -> u8;
@@ -155,9 +184,9 @@ pub trait LinkCable {
     /// Parent: every unit's word for the transfer [`LinkCable::parent_start`]
     /// began, blocking until the children answer.
     ///
-    /// `None` means the cable gave up waiting, which the register model reports
-    /// to the game as a transfer error rather than as made up data.
-    fn parent_result(&mut self) -> Option<[u16; MAX_UNITS]>;
+    /// Not an `Option`, because the two ways of not answering need opposite
+    /// reports to the game. See [`MultiResult`].
+    fn parent_result(&mut self) -> MultiResult;
     /// Child: the parent clocked a transfer into us, as `(parent's word, the
     /// word we answered with)`.
     ///
@@ -1182,12 +1211,14 @@ impl LinkCable for LocalCable {
         w.pending = Some(own);
     }
 
-    fn parent_result(&mut self) -> Option<[u16; MAX_UNITS]> {
+    fn parent_result(&mut self) -> MultiResult {
         let mut w = self.wire.borrow_mut();
-        let own = w.pending.take()?;
+        let Some(own) = w.pending.take() else {
+            return MultiResult::Gone;
+        };
         let peer = w.out[1 - self.side];
         w.to_child.push_back((own, peer));
-        Some([own, peer, ABSENT, ABSENT])
+        MultiResult::Landed([own, peer, ABSENT, ABSENT])
     }
 
     fn child_clock(&mut self) -> Option<(u16, u16)> {
@@ -2431,7 +2462,10 @@ mod tests {
         assert_eq!(child.id(), 1);
         child.set_output(0xB9A0);
         parent.parent_start(0x8FFF);
-        assert_eq!(parent.parent_result(), Some([0x8FFF, 0xB9A0, ABSENT, ABSENT]));
+        assert_eq!(
+            parent.parent_result(),
+            MultiResult::Landed([0x8FFF, 0xB9A0, ABSENT, ABSENT])
+        );
         assert_eq!(child.child_clock(), Some((0x8FFF, 0xB9A0)));
     }
 

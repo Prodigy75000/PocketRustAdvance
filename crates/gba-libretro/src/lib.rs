@@ -1009,7 +1009,7 @@ pub extern "C" fn retro_run() {
                         // wire.
                         let mean = if c.waits > 0 { c.wait_us / c.waits } else { 0 };
                         format!(
-                            " cable_done={} cable_lost={} cable_extra={} cable_badver={} cable_rtx={} cable_wait_mean_us={} cable_wait_max_us={} cable_stale_risk={} cable_holds={} cable_starved={} cable_skew={} cable_cold={}/{} cable_wordsum={:016X} cable_role={} cable_ties={} cable_defer={} cable_dropped={} cable_taken_back={} cable_shifted={} cable_core={} cable_mark={}@{:016X}",
+                            " cable_done={} cable_lost={} cable_extra={} cable_badver={} cable_rtx={} cable_wait_mean_us={} cable_wait_max_us={} cable_stale_risk={} cable_holds={} cable_starved={} cable_skew={} cable_cold={}/{} cable_wordsum={:016X} cable_role={} cable_ties={} cable_defer={} cable_dropped={} cable_taken_back={} cable_shifted={} cable_core={} cable_gaveup={}/{} cable_mark={}@{:016X}",
                             c.done, c.lost, c.extra_peers, c.bad_version, c.rtx, mean, c.wait_max_us,
                             c.stale_risk, c.holds, c.starved, c.skew, c.cold, c.answered,
                             g.cable_wordsum(),
@@ -1027,6 +1027,8 @@ pub extern "C" fn retro_run() {
                             c.taken_back,
                             c.shifted,
                             g.cable_stats().0,
+                            g.cable_gaveup().0,
+                            g.cable_gaveup().1,
                             g.cable_mark().0,
                             g.cable_mark().1
                         )

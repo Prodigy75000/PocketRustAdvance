@@ -651,6 +651,14 @@ impl Gba {
         (self.bus.cable_transfers, self.bus.cable_failures)
     }
 
+    /// Give-ups where the peer was still in the session, against give-ups in
+    /// total. The first number is ours to fix and the second is not: a late word
+    /// is our transport missing a deadline, where a peer that has gone is the
+    /// player closing the game or leaving the network.
+    pub fn cable_gaveup(&self) -> (u64, u64) {
+        (self.bus.cable_late, self.bus.cable_failures)
+    }
+
     /// Rolling hash of the words every completed transfer landed. Both ends must
     /// agree at an equal transfer count, which is the only way to tell a healthy
     /// wire carrying the wrong data from one carrying the right data.
@@ -1241,8 +1249,8 @@ mod tests {
             }
             fn set_output(&mut self, _word: u16) {}
             fn parent_start(&mut self, _own: u16) {}
-            fn parent_result(&mut self) -> Option<[u16; crate::cable::MAX_UNITS]> {
-                None
+            fn parent_result(&mut self) -> crate::cable::MultiResult {
+                crate::cable::MultiResult::Gone
             }
             fn child_clock(&mut self) -> Option<(u16, u16)> {
                 None

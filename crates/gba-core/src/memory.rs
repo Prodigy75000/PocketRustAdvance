@@ -104,6 +104,19 @@ pub struct GbaBus {
     /// whole device session.
     pub cable_transfers: u64,
     pub cable_failures: u64,
+    /// Give-ups where the peer was still present, the subset of
+    /// `cable_failures` that is ours rather than the player's. A late word is a
+    /// network artifact and the game is handed zeros for it; a peer that has
+    /// gone is told the truth instead.
+    pub cable_late: u64,
+    /// What this unit presented when the in-flight transfer STARTED.
+    ///
+    /// Latched, because a game may write SIOMLT_SEND again while the transfer
+    /// runs and hardware would not carry the new value. It also means a parent
+    /// always knows its own slot, so a give-up never has to make one up: the
+    /// old code overwrote it with FFFF, claiming the unit running the transfer
+    /// was not there.
+    cable_own: u16,
     /// Rolling hash of every word every completed transfer landed, in order.
     ///
     /// The two ends see the SAME four words for the same transfer, so at an equal
@@ -477,6 +490,8 @@ impl GbaBus {
             cable_words: None,
             cable_transfers: 0,
             cable_failures: 0,
+            cable_late: 0,
+            cable_own: 0,
             cable_wordsum: 0xcbf2_9ce4_8422_2325, // FNV-1a offset basis
             cable_mark_at: 0,
             cable_mark_sum: 0xcbf2_9ce4_8422_2325,
@@ -1719,6 +1734,7 @@ impl GbaBus {
             return;
         }
         let own = self.io_u16(0x12A);
+        self.cable_own = own;
         self.cable.as_mut().unwrap().parent_start(own);
         // Every slot reads FFFF while the transfer is in flight, which is what
         // a game polling mid-transfer sees on hardware.
@@ -1733,12 +1749,22 @@ impl GbaBus {
     /// Land a Multi-Player transfer: every unit's word, the IDs, and the IRQ.
     fn multi_finish(&mut self) {
         self.cable_busy = false;
-        let words = match self.cable_words.take() {
-            Some(w) => Some(w),
+        use crate::cable::MultiResult;
+        let outcome = match self.cable_words.take() {
+            Some(w) => MultiResult::Landed(w),
             // A parent collects the children's words HERE rather than at the
             // start, so the network round trip overlaps the transfer's own
-            // duration instead of being added to it.
-            None => self.cable.as_mut().and_then(|c| c.parent_result()),
+            // duration instead of being added to it. Only a parent gets here
+            // with nothing in hand: a child's transfer is created BY the arriving
+            // clock, so it always already holds the words.
+            None => match self.cable.as_mut() {
+                Some(c) => c.parent_result(),
+                None => MultiResult::Gone,
+            },
+        };
+        let words = match outcome {
+            MultiResult::Landed(w) => Some(w),
+            _ => None,
         };
         if let Some(w) = words {
             self.cable_transfers += 1;
@@ -1766,15 +1792,42 @@ impl GbaBus {
         } else {
             self.cable_failures += 1;
         }
-        let landed = words.unwrap_or([crate::cable::ABSENT; crate::cable::MAX_UNITS]);
+        let units = self.cable.as_ref().map_or(1, |c| c.units()) as usize;
+        let own_slot = self.cable.as_ref().map_or(0, |c| c.id()) as usize;
+        let mut landed = match outcome {
+            MultiResult::Landed(w) => w,
+            // A late word is not an absent unit, and this is where we used to
+            // say it was. ABSENT is FFFF, which every game reads as "no GBA in
+            // that slot", so filling with it because one word missed its
+            // deadline tells a game whose partner is sitting right there that
+            // the cable came out. Zeros instead, the filler gpSP has shipped on
+            // this exact path for years: a protocol that checksums its frames
+            // rejects them and retries, where FFFF ends the link on the spot.
+            MultiResult::Late => {
+                self.cable_late += 1;
+                let mut w = [crate::cable::ABSENT; crate::cable::MAX_UNITS];
+                for word in w.iter_mut().take(units) {
+                    *word = 0;
+                }
+                w
+            }
+            MultiResult::Gone => [crate::cable::ABSENT; crate::cable::MAX_UNITS],
+        };
+        // Our own word is never unknown: we latched it when the transfer
+        // started, and hardware shows every unit its own slot whatever the far
+        // end did.
+        landed[own_slot] = match outcome {
+            MultiResult::Landed(w) => w[own_slot],
+            _ => self.cable_own,
+        };
         for (slot, word) in landed.iter().enumerate() {
             self.set_io16(0x120 + slot as u32 * 2, *word);
         }
-        // Clear busy, and raise the error flag only when the cable gave up: a
-        // game that is told the transfer worked will trust FFFF as data, where
-        // one that is told it failed runs its own link-error path.
+        // Clear busy, and raise the error flag only when there is nothing on the
+        // far end any more. It used to go up for a late word too, which sends a
+        // game down its link-error path when its own retry path was available.
         let mut cnt = self.io_u16(0x128) & !0x00C0;
-        if words.is_none() {
+        if outcome == MultiResult::Gone {
             cnt |= 0x0040;
         }
         self.set_io16(0x128, cnt);
@@ -1782,7 +1835,11 @@ impl GbaBus {
         if std::env::var_os("GBA_SIOLOG").is_some() {
             eprintln!(
                 "  CABLE {} {:04X} {:04X} {:04X} {:04X}{}",
-                if words.is_some() { "ok " } else { "ERR" },
+                match outcome {
+                    MultiResult::Landed(_) => "ok  ",
+                    MultiResult::Late => "late",
+                    MultiResult::Gone => "gone",
+                },
                 landed[0], landed[1], landed[2], landed[3],
                 if cnt & 0x4000 != 0 { "  irq" } else { "" },
             );
@@ -2448,6 +2505,111 @@ mod tests {
             b.dma_src[0], 0x0300_0304,
             "the channel must have run exactly once: a store of 1 over an enable              bit that is already 1 is not an edge and starts nothing"
         );
+    }
+
+    /// A cable whose parent transfers end however a test says they do.
+    struct Scripted(crate::cable::MultiResult, u16);
+
+    impl crate::cable::LinkCable for Scripted {
+        fn units(&self) -> u8 {
+            2 // the peer is in the session in BOTH cases; only answering differs
+        }
+        fn id(&self) -> u8 {
+            0 // the parent: the only end that can give up on a transfer
+        }
+        fn set_output(&mut self, word: u16) {
+            self.1 = word;
+        }
+        fn parent_start(&mut self, _own: u16) {}
+        fn parent_result(&mut self) -> crate::cable::MultiResult {
+            self.0
+        }
+        fn child_clock(&mut self) -> Option<(u16, u16)> {
+            None
+        }
+        fn flush(&mut self) {}
+    }
+
+    /// Run one Multi-Player transfer to completion against `outcome`, and give
+    /// back the four slots and SIOCNT.
+    fn one_transfer(outcome: crate::cable::MultiResult) -> ([u16; 4], u16) {
+        let mut b = bus();
+        b.cable = Some(Box::new(Scripted(outcome, 0)));
+        b.write16(0x0400_012A, 0xBEEF, Access::NonSeq); // our word for this transfer
+        // Multi-Player at 115200, which is the baud Pokemon links at, plus start.
+        b.write16(0x0400_0128, 0x2000 | 0x0080 | 0x0003, Access::NonSeq);
+        // The slots read FFFF while it is in flight, so a test that forgot to let
+        // the transfer finish would see absence for a different reason.
+        assert!(b.cable_busy, "the transfer must still be running here");
+        b.cycles += 40_000; // longer than any entry in the transfer table
+        b.step_serial();
+        assert!(!b.cable_busy, "and finished after its duration");
+        (
+            [
+                b.io_u16(0x120),
+                b.io_u16(0x122),
+                b.io_u16(0x124),
+                b.io_u16(0x126),
+            ],
+            b.io_u16(0x128),
+        )
+    }
+
+    /// A word that misses its deadline must NOT be reported as an absent unit.
+    ///
+    /// This is the bug the first device sessions ended on. `ABSENT` is FFFF,
+    /// which a game reads as "no GBA in that slot", so filling every slot with it
+    /// AND raising the error flag told Ruby twice over that the cable had come
+    /// out, when the peer was present, answering, and one word was late. Ruby
+    /// goes straight to "transmission error" on that.
+    #[test]
+    fn a_late_peer_is_not_reported_as_an_absent_one() {
+        let (slots, cnt) = one_transfer(crate::cable::MultiResult::Late);
+        assert_eq!(slots[0], 0xBEEF, "our own word is never unknown: we latched it");
+        assert_ne!(
+            slots[1], crate::cable::ABSENT,
+            "the peer is in the session, so its slot must not claim it is gone"
+        );
+        assert_eq!(slots[1], 0, "zeros, which a protocol that checksums rejects");
+        assert_eq!(
+            slots[2], crate::cable::ABSENT,
+            "slots past the unit count are genuinely empty"
+        );
+        assert_eq!(slots[3], crate::cable::ABSENT);
+        assert_eq!(cnt & 0x0040, 0, "and no error flag: the game keeps its retry path");
+        assert_eq!(cnt & 0x0080, 0, "busy clears either way");
+    }
+
+    /// A peer that has actually stopped answering gets the opposite treatment,
+    /// because here both signals are true.
+    #[test]
+    fn a_peer_that_has_gone_is_reported_absent_with_the_error_flag() {
+        let (slots, cnt) = one_transfer(crate::cable::MultiResult::Gone);
+        assert_eq!(slots[0], 0xBEEF, "the parent still knows its own word");
+        assert_eq!(slots[1], crate::cable::ABSENT, "nothing on the far end");
+        assert_eq!(cnt & 0x0040, 0x0040, "error flag: the link really has failed");
+    }
+
+    /// The counters have to separate the two, because one is our transport
+    /// missing a deadline and the other is the player's cable or app going away.
+    #[test]
+    fn late_and_gone_are_counted_apart() {
+        let mut b = bus();
+        b.cable = Some(Box::new(Scripted(crate::cable::MultiResult::Late, 0)));
+        b.write16(0x0400_0128, 0x2000 | 0x0080 | 0x0003, Access::NonSeq);
+        b.cycles += 40_000;
+        b.step_serial();
+        assert_eq!(b.cable_late, 1);
+        assert_eq!(b.cable_failures, 1, "a late transfer is still a transfer we lost");
+        assert_eq!(b.cable_transfers, 0, "and never counted as one that landed");
+
+        let mut b = bus();
+        b.cable = Some(Box::new(Scripted(crate::cable::MultiResult::Gone, 0)));
+        b.write16(0x0400_0128, 0x2000 | 0x0080 | 0x0003, Access::NonSeq);
+        b.cycles += 40_000;
+        b.step_serial();
+        assert_eq!(b.cable_late, 0, "a peer that has gone is not late");
+        assert_eq!(b.cable_failures, 1);
     }
 
     #[test]
