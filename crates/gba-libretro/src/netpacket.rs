@@ -55,7 +55,7 @@ const RETRO_NETPACKET_FLUSH_HINT: i32 = 1 << 2;
 ///
 /// The Android side documents this core as advertising `-rfu-1`
 /// (`NetplayPlatformOverride.kt`), which this makes stale. Nothing reads it.
-static PROTOCOL: &[u8] = b"pocketrustadvance-link-4\0";
+static PROTOCOL: &[u8] = b"pocketrustadvance-link-5\0";
 
 /// How long a parent waits for a child's reply before giving up and reporting
 /// the transfer to the game as a failure.
@@ -239,6 +239,9 @@ struct Net {
     /// unlocked a third of an achievement set out of it. The parent-side fix
     /// made the same morning does nothing for this end.
     cable_heard_at: Option<Instant>,
+    /// When we last put anything on the wire, so the ping only fires when the
+    /// link has actually gone quiet.
+    cable_spoke_at: Option<Instant>,
 }
 
 /// How long a peer may say nothing before the bus reports it gone.
@@ -250,6 +253,12 @@ struct Net {
 /// Pokemon trade runs at, which leaves room for a slow device without leaving a
 /// game to be told for minutes that a partner is present when it is not.
 const PEER_SILENT: Duration = Duration::from_millis(1500);
+
+/// How long this end may put nothing on the wire before it sends an empty packet.
+///
+/// Six of these fit inside `PEER_SILENT`, so the peer has to lose six in a row
+/// before it believes we have gone. Four packets a second on an idle link.
+const PING_EVERY: Duration = Duration::from_millis(250);
 
 /// Upper bounds of the wait histogram's buckets, in microseconds. One extra
 /// bucket above the last catches everything past the deadline.
@@ -278,6 +287,7 @@ impl Net {
             cable_late_max_us: 0,
             cable_late_seen: 0,
             cable_heard_at: None,
+            cable_spoke_at: None,
         }
     }
 
@@ -307,6 +317,7 @@ impl Net {
         self.cable_late_max_us = 0;
         self.cable_late_seen = 0;
         self.cable_heard_at = None;
+        self.cable_spoke_at = None;
     }
 
     /// Bucket a completed or abandoned wait.
@@ -483,7 +494,12 @@ fn is_cable_packet(bytes: &[u8]) -> bool {
 
 /// Put everything the cable has queued on the wire.
 fn flush_cable_outbox() {
-    for pkt in with_net(|n| n.cable.take_outbox()) {
+    let out = with_net(|n| n.cable.take_outbox());
+    if out.is_empty() {
+        return;
+    }
+    with_net(|n| n.cable_spoke_at = Some(Instant::now()));
+    for pkt in out {
         send(RETRO_NETPACKET_BROADCAST, &pkt);
     }
 }
@@ -509,8 +525,24 @@ unsafe extern "C" fn np_stop() {
 /// has told it there is a partner. So the front-end's own frame is the only clock
 /// that works, and `retro_run` is where libretro says a core may send.
 pub fn cable_keepalive() {
-    let said_hello = with_net(|n| n.active && n.cable.hello_tick());
-    let _ = said_hello;
+    with_net(|n| {
+        if !n.active {
+            return;
+        }
+        n.cable.hello_tick();
+        // And an empty packet if we have said nothing lately, WHATEVER our role.
+        // A parent ticks once an emulated frame on its own, but a child never
+        // speaks unless it is clocked, so without this a parent hears silence
+        // from a healthy child, reports one unit, and tells its game to plug the
+        // cable in. It then never clocks, so the child stays silent: a deadlock
+        // made out of a timeout, and it reached the owner's devices.
+        let quiet = n
+            .cable_spoke_at
+            .is_none_or(|at| at.elapsed() >= PING_EVERY);
+        if quiet {
+            n.cable.say_ping();
+        }
+    });
     flush_cable_outbox();
 }
 
@@ -936,6 +968,54 @@ mod tests {
                 "a peer that has said nothing for 1.6 seconds is not, and the game              has to be told that rather than being told it is ready"
             );
         });
+    }
+
+    /// A quiet end must still be heard, or its peer's liveness test fires on a
+    /// link that is perfectly healthy.
+    ///
+    /// This is the regression that reached the owner's devices within minutes of
+    /// shipping the liveness test: both games said "insert the Game Boy Advance
+    /// game link cable and turn the power on" while connected. After the election
+    /// a parent ticks once an emulated frame, but a child never speaks unless it
+    /// is clocked, so the parent heard 1.5 seconds of silence from a healthy
+    /// child, reported one unit, and told its game there was no partner. It then
+    /// never clocked, so the child stayed silent. A deadlock made out of a
+    /// timeout, and the end that starts it is the one that was working.
+    #[test]
+    fn an_end_with_nothing_to_say_still_says_something() {
+        let _g = locked();
+        let elected = with_net(|n| {
+            n.active = true;
+            n.cable.reset();
+            // The election must already be SETTLED, because that is when hellos
+            // stop and an idle end goes quiet. A test run before the election
+            // measures the hello and passes whatever the ping does.
+            n.cable.set_identity(10);
+            let mut hello = [0u8; PACKET_LEN];
+            hello[..4].copy_from_slice(&gba_core::cable::MAGIC.to_be_bytes());
+            hello[4] = gba_core::cable::TAG_HELLO;
+            hello[9..13].copy_from_slice(&5u32.to_be_bytes());
+            n.cable.on_packet(&hello);
+            n.cable.take_outbox();
+            n.cable_spoke_at = None;
+            n.cable.elected()
+        });
+        assert!(elected, "the regression is about an end that has stopped saying hello");
+
+        cable_keepalive();
+        // `flush_cable_outbox` drains the queue, so the evidence it ran is the
+        // timestamp it stamps. Without a ping there is nothing to send and
+        // nothing to stamp, which is exactly the silence the peer was reading.
+        let spoke = with_net(|n| n.cable_spoke_at);
+        assert!(spoke.is_some(), "an idle end has to put something on the wire");
+
+        // And not on every frame: six pings fit inside the silence window, which
+        // is the margin that makes a lost packet harmless.
+        with_net(|n| n.cable.take_outbox());
+        cable_keepalive();
+        let queued = with_net(|n| n.cable.take_outbox().len());
+        assert_eq!(queued, 0, "a second ping 0 ms later would be four a frame, not four a second");
+        assert!(PING_EVERY * 6 <= PEER_SILENT, "six pings must fit inside the silence window");
     }
 
     #[test]

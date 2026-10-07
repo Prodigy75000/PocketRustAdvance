@@ -270,10 +270,10 @@ pub const FAMILY: [u8; 3] = *b"CBL";
 /// the leader menu, and both clocked at each other. A v4 peer paired with a v3
 /// one must refuse rather than have one end elect while the other trusts its
 /// frontend. See [`TAG_HELLO`].
-pub const WIRE_VERSION: u8 = b'4';
+pub const WIRE_VERSION: u8 = b'5';
 
 /// The full four-byte header of a packet this build will act on, "CBL4".
-pub const MAGIC: u32 = 0x4342_4C34;
+pub const MAGIC: u32 = 0x4342_4C35;
 
 /// `[magic, 1, seq, word, 0]`: "I am clocking `word` into you as exchange
 /// `seq`."
@@ -317,6 +317,21 @@ pub const TAG_TICK: u8 = 4;
 /// reads SD low, concludes it has no partner, and never offers to link: the
 /// failure direction is a link that will not start rather than two leaders.
 pub const TAG_HELLO: u8 = 5;
+
+/// A packet that carries nothing, sent on a timer so that SILENCE MEANS
+/// SOMETHING.
+///
+/// Added in wire 5, immediately after wire 4 shipped a liveness test with
+/// nothing to satisfy it. After the election a parent puts a tick on the wire
+/// every frame, but a CHILD never speaks unless it is clocked, so a parent heard
+/// silence from a perfectly healthy child, reported one unit, and told its game
+/// to plug the cable in. Which meant it never clocked, which meant the child
+/// stayed silent: a deadlock built out of a timeout.
+///
+/// Both ends send this, whatever their role, whenever they have put nothing on
+/// the wire recently. It is deliberately empty: a tick carries a parent's
+/// position and feeds the peer's pacing budget, so a child must not send one.
+pub const TAG_PING: u8 = 6;
 
 /// Every cable packet is this long: magic, tag, seq, word, lag, time.
 pub const PACKET_LEN: usize = 13;
@@ -838,6 +853,16 @@ impl CableProto {
     ///
     /// It repeats because the first announcement can go out while the peer's
     /// session is still coming up, and a lost one must not leave the pair silent.
+    /// Queue an empty packet, so a peer that is listening hears something.
+    ///
+    /// Any inbound cable packet refreshes the transport's liveness clock, so what
+    /// this carries does not matter and it carries nothing.
+    pub fn say_ping(&mut self) {
+        let mut pkt = [0u8; PACKET_LEN];
+        put(&mut pkt, TAG_PING, 0, 0, 0, self.local_cycles);
+        self.outbox.push_back(pkt);
+    }
+
     pub fn hello_tick(&mut self) -> bool {
         if self.peer_identity.is_some() || self.identity == 0 {
             return false;
