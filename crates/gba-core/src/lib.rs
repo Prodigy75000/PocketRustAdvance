@@ -264,16 +264,32 @@ impl Gba {
             // tested is the one this scanline will spend, not the one the last
             // one did. A parent's `advance` never holds; it is how a parent knows
             // when to put its position on the wire.
-            if self.bus.cable.is_some() && self.bus.multi_mode() {
+            if self.bus.cable.is_some() {
                 let per_line = ppu::CYCLES_PER_LINE as u32;
+                // Charged whatever mode the port is in, and that is a FIX, not
+                // generosity. This used to sit inside the Multi-Player test below,
+                // and `advance` is the only thing that settles a clock held back
+                // waiting for the game to arm its next word. Mario Kart steps out
+                // of Multi-Player mode between menus, measured on both devices on
+                // 2026-10-07: a clock arriving in that window was deferred, never
+                // settled, and never answered, so the peer saw a child that
+                // ignored seven retransmits and gave up at 150 ms. Worse, when the
+                // game came back the deferral settled and the child RAN a transfer
+                // its peer had already discarded, which offsets the two word
+                // streams for good. That is `shifted=5` on the tablet against
+                // nineteen give-ups the peer never got any answer to at all.
                 self.bus.cable.as_mut().unwrap().advance(per_line);
-                // The transport only receives when something pumps it, and while
-                // this core is held nothing else will: the packet that releases
-                // it arrives through `poll`.
-                while self.bus.cable.as_mut().unwrap().hold() {
-                    for (from, bytes) in poll() {
-                        if let Some(rfu) = self.bus.rfu.as_mut() {
-                            rfu.net_receive(&bytes, from);
+                // Pacing itself stays gated: there is nothing to stay in step with
+                // when the game is not using the cable.
+                if self.bus.multi_mode() {
+                    // The transport only receives when something pumps it, and
+                    // while this core is held nothing else will: the packet that
+                    // releases it arrives through `poll`.
+                    while self.bus.cable.as_mut().unwrap().hold() {
+                        for (from, bytes) in poll() {
+                            if let Some(rfu) = self.bus.rfu.as_mut() {
+                                rfu.net_receive(&bytes, from);
+                            }
                         }
                     }
                 }
@@ -1314,6 +1330,72 @@ mod tests {
         assert_eq!(
             cycles, control_cycles,
             "and holding costs wall time, never emulated time"
+        );
+    }
+
+    /// A clock held back for the game must still be answered when the game has
+    /// stepped OUT of Multi-Player mode.
+    ///
+    /// The failure that ended every Mario Kart race, and the counters named it
+    /// before the code did. `advance` is the only thing that settles a deferred
+    /// clock, it used to be called only while the port was in Multi-Player mode,
+    /// and both games step out of that mode between menu screens (measured: the
+    /// heartbeat's own mode field flips MULTI to JOYBUS and back during normal
+    /// play). A clock arriving in that window was deferred forever: no reply to
+    /// the clock, none to any of the seven retransmits, and the peer gave up at
+    /// 150 ms having heard nothing. Then the game came back, the deferral
+    /// settled, and the child ran a transfer its peer had already thrown away,
+    /// which offsets the two word streams permanently.
+    ///
+    /// Phrased against the CABLE's view rather than the register file, because
+    /// what broke was whether the cable's clock runs at all.
+    #[test]
+    fn a_cable_keeps_being_charged_when_the_game_leaves_multi_player_mode() {
+        use crate::bus::{Access::NonSeq as N, Bus};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct Charges(u32);
+
+        struct CountingCable(Rc<RefCell<Charges>>);
+
+        impl crate::cable::LinkCable for CountingCable {
+            fn units(&self) -> u8 {
+                2
+            }
+            fn id(&self) -> u8 {
+                1
+            }
+            fn set_output(&mut self, _word: u16) {}
+            fn parent_start(&mut self, _own: u16) {}
+            fn parent_result(&mut self) -> crate::cable::MultiResult {
+                crate::cable::MultiResult::Gone
+            }
+            fn child_clock(&mut self) -> Option<(u16, u16)> {
+                None
+            }
+            fn flush(&mut self) {}
+            fn advance(&mut self, _cycles: u32) {
+                self.0.borrow_mut().0 += 1;
+            }
+        }
+
+        let charges = Rc::new(RefCell::new(Charges::default()));
+        let mut rom = vec![0u8; 0x200];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        let mut gba = Gba::new(rom, Vec::new());
+        gba.render_enabled = false;
+        gba.connect_cable(Box::new(CountingCable(Rc::clone(&charges))));
+        // JOYBUS: RCNT bit 15 and 14, which is where Mario Kart parks the port
+        // between screens. Deliberately NOT Multi-Player.
+        gba.bus.write16(0x0400_0134, 0xC000, N);
+        assert_eq!(gba.bus.sio_mode(), "JOYBUS", "the port is not on the cable");
+
+        gba.run_frame_polling(&mut Vec::new);
+        assert_eq!(
+            charges.borrow().0, 228,
+            "the cable's clock has to run every scanline whatever the port is doing,              or a clock held for the game is never answered and the peer gives up"
         );
     }
 
