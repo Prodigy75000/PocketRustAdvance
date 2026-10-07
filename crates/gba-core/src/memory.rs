@@ -1850,11 +1850,20 @@ impl GbaBus {
         for (slot, word) in landed.iter().enumerate() {
             self.set_io16(0x120 + slot as u32 * 2, *word);
         }
-        // Clear busy, and raise the error flag only when there is nothing on the
-        // far end any more. It used to go up for a late word too, which sends a
-        // game down its link-error path when its own retry path was available.
+        // Clear busy, and raise the error flag only for a transfer that failed
+        // while a unit was supposed to BE there. It used to go up for a late word
+        // too, which sends a game down its link-error path when its own retry path
+        // was available.
+        //
+        // The `units` test is the other half of the fix for the achievement
+        // corruption on 2026-10-07. Once the bus reports a single unit, a transfer
+        // is not failing at all: a lone GBA in Multi-Player mode clocks, reads
+        // FFFF for the slots nobody is driving, and raises nothing. Holding the
+        // error flag up sixty times a second for minutes is not a state hardware
+        // can be in, and the game kept being driven through a path it was never
+        // written for.
         let mut cnt = self.io_u16(0x128) & !0x00C0;
-        if outcome == MultiResult::Gone {
+        if outcome == MultiResult::Gone && units >= 2 {
             cnt |= 0x0040;
         }
         self.set_io16(0x128, cnt);
@@ -2532,6 +2541,53 @@ mod tests {
             b.dma_src[0], 0x0300_0304,
             "the channel must have run exactly once: a store of 1 over an enable              bit that is already 1 is not an edge and starts nothing"
         );
+    }
+
+    /// A peer that has gone leaves a LONE GBA, not a broken one.
+    ///
+    /// The second half of the 2026-10-07 achievement corruption. While a peer was
+    /// gone the bus went on reporting two units, so SD said a partner was present
+    /// and ready while every transfer came back FFFF with the error flag, sixty
+    /// times a second. No cable can do that: pull one out and SD drops. Mario Kart
+    /// Super Circuit, driven through that impossible state for four minutes, wrote
+    /// enough nonsense into its own tables to unlock a third of its achievement
+    /// set in one go.
+    ///
+    /// So once the bus is down to one unit, a transfer is an ordinary lone-unit
+    /// transfer: absent slots, and nothing raised.
+    #[test]
+    fn a_transfer_with_no_peer_left_is_lone_not_failed() {
+        struct Lone;
+        impl crate::cable::LinkCable for Lone {
+            fn units(&self) -> u8 {
+                1 // the peer stopped answering, so the bus is down to us
+            }
+            fn id(&self) -> u8 {
+                0
+            }
+            fn set_output(&mut self, _word: u16) {}
+            fn parent_start(&mut self, _own: u16) {}
+            fn parent_result(&mut self) -> crate::cable::MultiResult {
+                crate::cable::MultiResult::Gone
+            }
+            fn child_clock(&mut self) -> Option<(u16, u16)> {
+                None
+            }
+            fn flush(&mut self) {}
+        }
+
+        let mut b = bus();
+        b.cable = Some(Box::new(Lone));
+        b.write16(0x0400_012A, 0xBEEF, Access::NonSeq);
+        b.write16(0x0400_0128, 0x2000 | 0x0080 | 0x0003, Access::NonSeq);
+        b.cycles += 40_000;
+        b.step_serial();
+
+        let cnt = b.io_u16(0x128);
+        assert_eq!(cnt & 0x0040, 0, "a lone unit's transfer is not an error");
+        assert_eq!(cnt & 0x0008, 0, "and SD is low: there is no partner to be ready");
+        assert_eq!(b.io_u16(0x120), 0xBEEF, "our own word still lands in our slot");
+        assert_eq!(b.io_u16(0x122), crate::cable::ABSENT, "and nobody drives the rest");
     }
 
     /// The mode the heartbeat reports has to come from both registers, because

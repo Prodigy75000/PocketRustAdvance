@@ -331,7 +331,23 @@ impl Net {
         // link. The alternative is what the second device session did, where both
         // ends believed they were the parent and both games offered the leader
         // menu.
-        if self.active && !self.cable.refusing() && self.cable.elected() {
+        //
+        // **And it has to stop being two when the peer stops answering.** This
+        // read 2 for as long as the SESSION was alive, whatever the peer was
+        // doing, which put a game into a state hardware cannot produce: SD high,
+        // meaning a second unit is present and ready, while every transfer came
+        // back FFFF with the error flag. On 2026-10-07 a phone dropped off the
+        // Wi-Fi mid-race and its partner sat in that state at sixty transfers a
+        // second for four minutes, and Mario Kart Super Circuit wrote enough
+        // nonsense into its own tables to unlock a third of its achievement set.
+        // A real cable pulled out of a real GBA drops SD, and the game runs its
+        // own partner-lost path instead.
+        //
+        // Tied to the open circuit rather than to a timer because that is already
+        // the measure of "has not answered for a while", and any inbound packet
+        // clears it, so a peer that comes back is a peer again.
+        let answering = self.cable_failures < FAILURES_BEFORE_OPEN_CIRCUIT;
+        if self.active && !self.cable.refusing() && self.cable.elected() && answering {
             2
         } else {
             1
