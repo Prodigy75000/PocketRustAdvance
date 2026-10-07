@@ -229,7 +229,27 @@ struct Net {
     pub cable_late_max_us: u64,
     /// Baseline for spotting that the cable has counted another late reply.
     cable_late_seen: u64,
+    /// When a packet last arrived from the peer, whatever it carried.
+    ///
+    /// A CHILD'S ONLY LIVENESS MEASURE, and it had none at all until 2026-10-07.
+    /// `cable_failures` is incremented in `parent_result`, which a child never
+    /// calls, so a child went on reporting two units for as long as the session
+    /// object lived, however long its parent had been gone. That is the state a
+    /// phone was left in when it dropped off the Wi-Fi mid-race, and its game
+    /// unlocked a third of an achievement set out of it. The parent-side fix
+    /// made the same morning does nothing for this end.
+    cable_heard_at: Option<Instant>,
 }
+
+/// How long a peer may say nothing before the bus reports it gone.
+///
+/// An elected parent puts a TICK on the wire once per emulated frame, and since
+/// the cable's clock now runs whatever mode the port is in, that keeps coming
+/// even while its game is between screens. So silence really is silence. 1.5
+/// seconds is about ninety ticks at full speed and still twenty at the 15 fps a
+/// Pokemon trade runs at, which leaves room for a slow device without leaving a
+/// game to be told for minutes that a partner is present when it is not.
+const PEER_SILENT: Duration = Duration::from_millis(1500);
 
 /// Upper bounds of the wait histogram's buckets, in microseconds. One extra
 /// bucket above the last catches everything past the deadline.
@@ -257,6 +277,7 @@ impl Net {
             cable_late_arrivals: 0,
             cable_late_max_us: 0,
             cable_late_seen: 0,
+            cable_heard_at: None,
         }
     }
 
@@ -285,6 +306,7 @@ impl Net {
         self.cable_late_arrivals = 0;
         self.cable_late_max_us = 0;
         self.cable_late_seen = 0;
+        self.cable_heard_at = None;
     }
 
     /// Bucket a completed or abandoned wait.
@@ -346,8 +368,20 @@ impl Net {
         // Tied to the open circuit rather than to a timer because that is already
         // the measure of "has not answered for a while", and any inbound packet
         // clears it, so a peer that comes back is a peer again.
+        self.cable_units_at(Instant::now())
+    }
+
+    /// Split out so the silence test can be made without sleeping for it.
+    fn cable_units_at(&self, now: Instant) -> u8 {
+        // A parent measures a silent peer by its own give-ups; a child has no
+        // give-ups to count, so both ends also measure plain silence. Roles
+        // cannot be elected without having heard from the peer, so a `None` here
+        // means nothing has ever arrived.
         let answering = self.cable_failures < FAILURES_BEFORE_OPEN_CIRCUIT;
-        if self.active && !self.cable.refusing() && self.cable.elected() && answering {
+        let heard = self
+            .cable_heard_at
+            .is_some_and(|at| now.duration_since(at) < PEER_SILENT);
+        if self.active && !self.cable.refusing() && self.cable.elected() && answering && heard {
             2
         } else {
             1
@@ -421,6 +455,7 @@ unsafe extern "C" fn np_receive(buf: *const c_void, len: usize, client_id: u16) 
             // Hearing anything at all means the peer is alive, so a cable that
             // had stopped waiting starts waiting again.
             n.cable_failures = 0;
+            n.cable_heard_at = Some(Instant::now());
             n.cable.on_packet(&bytes);
         });
         // A reply leaves now rather than at the end of the frame: the peer that
@@ -857,6 +892,50 @@ mod tests {
             n.active = false;
         });
         g
+    }
+
+    /// A child whose parent has gone must report ONE unit, so its game is told
+    /// the partner left instead of being told it is present and ready forever.
+    ///
+    /// The hole that cost a real achievement set on 2026-10-07. The open circuit
+    /// that measures a silent peer is incremented in `parent_result`, which a
+    /// CHILD never calls, so the fix made that morning covered only the end that
+    /// did not need it. The phone was the child, its parent dropped off the
+    /// Wi-Fi, and its bus went on saying a second player was present and ready.
+    ///
+    /// Written against an injected instant rather than a sleep, so it costs
+    /// nothing to run and pins the threshold in absolute time.
+    #[test]
+    fn a_child_whose_parent_has_gone_silent_reports_one_unit() {
+        let _g = locked();
+        let elected = with_net(|n| {
+            n.active = true;
+            // Elect: our identity against a peer's, which is the state a child is
+            // in for the whole of a session.
+            n.cable.set_identity(10);
+            let mut hello = [0u8; PACKET_LEN];
+            hello[..4].copy_from_slice(&gba_core::cable::MAGIC.to_be_bytes());
+            hello[4] = gba_core::cable::TAG_HELLO;
+            hello[9..13].copy_from_slice(&5u32.to_be_bytes());
+            n.cable.on_packet(&hello);
+            n.cable.elected()
+        });
+        assert!(elected, "the test needs a settled role to be about anything else");
+
+        let heard = Instant::now();
+        with_net(|n| n.cable_heard_at = Some(heard));
+        with_net(|n| {
+            assert_eq!(
+                n.cable_units_at(heard + Duration::from_millis(1400)),
+                2,
+                "a peer that spoke 1.4 seconds ago is still there"
+            );
+            assert_eq!(
+                n.cable_units_at(heard + Duration::from_millis(1600)),
+                1,
+                "a peer that has said nothing for 1.6 seconds is not, and the game              has to be told that rather than being told it is ready"
+            );
+        });
     }
 
     #[test]
