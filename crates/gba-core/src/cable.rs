@@ -1167,11 +1167,22 @@ impl CableProto {
                     }
                     return;
                 }
-                if self.answered > 0 && !self.armed_since_answer && self.deferred.is_none() {
+                if self.on_bus
+                    && self.answered > 0
+                    && !self.armed_since_answer
+                    && self.deferred.is_none()
+                {
                     // The game has not stored its next word yet, so answering now
                     // would hand back the previous one. Hold the clock instead and
                     // let the handler run: `set_output` settles it, and
                     // `advance` settles it anyway if the store never comes.
+                    //
+                    // Only while we are ON the bus. A game that has parked the
+                    // port is never going to arm anything, so holding its clocks
+                    // just spends the whole deferral on every one of them before
+                    // answering ABSENT regardless. Measured: deferrals climbed in
+                    // lockstep with off-bus answers, 25 a second, each one
+                    // delaying a peer that was waiting on it, for nothing.
                     // Deliberately not marked seen yet, so a retransmit of this
                     // same clock is recognised below rather than answered from a
                     // cache that does not exist.
@@ -1456,6 +1467,44 @@ mod tests {
         w.deliver(1);
         assert_eq!(w.proto[0].take_reply(seq), Some(0xB9A0), "and it is back");
         assert_eq!(w.proto[1].child_clock(), Some((0x8FFE, 0xB9A0)));
+    }
+
+    /// A parked game is never going to arm a word, so its clocks must not be
+    /// held waiting for one.
+    ///
+    /// Measured on the owner's devices 2026-10-08: while one player sat on a menu
+    /// with the port parked, deferrals climbed at exactly the rate of off-bus
+    /// answers, twenty-five a second. Every one of those spent the full deferral
+    /// before answering ABSENT, which it was always going to answer, while the
+    /// peer sat blocked on the reply. The waiting bought nothing and was paid by
+    /// the end that was still running.
+    #[test]
+    fn a_parked_game_does_not_hold_its_peers_clocks() {
+        let mut w = Wire::new();
+        // One accepted transfer first, so `answered > 0` and the deferral path is
+        // live: without that the test proves nothing about deferring.
+        w.proto[1].set_output(0x1111);
+        let seq = w.proto[0].begin_exchange(0x8000);
+        w.deliver(0);
+        w.deliver(1);
+        assert_eq!(w.proto[0].take_reply(seq), Some(0x1111));
+        w.proto[1].child_clock();
+        let deferrals_before = w.proto[1].deferrals;
+
+        w.proto[1].set_on_bus(false);
+        let seq = w.proto[0].begin_exchange(0x8001);
+        w.deliver(0);
+        w.deliver(1);
+
+        assert_eq!(
+            w.proto[1].deferrals, deferrals_before,
+            "a parked game must not hold the clock at all"
+        );
+        assert_eq!(
+            w.proto[0].take_reply(seq),
+            Some(ABSENT),
+            "and the answer is available at once, not a deferral later"
+        );
     }
 
     /// The one cable failure no instrument could see: a child whose emulation is
