@@ -60,12 +60,24 @@ static PROTOCOL: &[u8] = b"pocketrustadvance-link-4\0";
 /// How long a parent waits for a child's reply before giving up and reporting
 /// the transfer to the game as a failure.
 ///
-/// Deliberately shorter than PocketRust's 500 ms. A Game Boy cable moves one
-/// byte per transfer; this one runs up to nine transfers an emulated frame, so
-/// the same timeout would stall for over a second of wall clock per frame with
-/// a dead peer. 150 ms still allows fifteen retransmits, which is generous
-/// against a LAN round trip under a millisecond and a WAN one of tens.
-const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(150);
+/// **400 ms, raised from 150 on 2026-10-07, and the measurement that says so is
+/// `late_arrivals`: ELEVEN of twelve give-ups had a reply that arrived anyway,
+/// the worst at 223 ms.** So eleven of those twelve were not failures at all,
+/// they were us being impatient, and each one cost the session: the child had
+/// already run the transfer, so the two word streams came apart and the child's
+/// game reported a communication error. `shifted=11` against `lost=12`.
+///
+/// Patience is the right answer HERE and not in PocketRust's Game Boy cable
+/// because this transport is `RETRO_NETPACKET_RELIABLE`. A reply that has been
+/// sent will be delivered; it cannot be dropped, only delayed. Giving up on a
+/// reliable channel therefore throws away a word that is still coming, which is
+/// the one failure this protocol cannot recover from.
+///
+/// The cost is bounded and visible rather than silent: a peer that has genuinely
+/// gone stalls for 400 ms three times before `FAILURES_BEFORE_OPEN_CIRCUIT`
+/// stops the waiting altogether. A 1.2 second hitch and then the game's own
+/// link-error screen beats a race that desynchronises at 46 seconds.
+const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(400);
 
 /// Re-send an unanswered clock this often. Nothing beneath this protocol
 /// retransmits: the host's send ignores the reliable flag and calls sendto.
@@ -83,12 +95,20 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(150);
 /// measured on the devices, which is one session in three ruined by three
 /// unlucky datagrams.
 ///
-/// 20 ms is above the 10.7 ms measured maximum round trip and gives seven
-/// attempts inside the same 150 ms stall, so an unrecoverable loss now needs a
-/// peer that has actually gone rather than a bad moment. Spurious duplicates are
-/// idempotent and counted in `cable_rtx`; a shifted stream is not recoverable at
-/// all, so the trade is the right way round.
-const RETRANSMIT_AFTER: Duration = Duration::from_millis(20);
+/// 20 ms was above the 10.7 ms measured maximum round trip and gave seven
+/// attempts inside the old 150 ms stall, so an unrecoverable loss needed a peer
+/// that had actually gone rather than a bad moment.
+///
+/// **Then 120 ms, on 2026-10-07, because the premise was wrong.** Retransmitting
+/// recovers a LOST datagram, and this transport is
+/// `RETRO_NETPACKET_RELIABLE`: nothing is lost. Every retransmit was therefore
+/// a duplicate the peer answered again for no gain, and the measured cost was
+/// real. Mario Kart clocks once an emulated frame and the counters went from 398
+/// retransmits in 6284 transfers to 4104 in 11601 as soon as waits grew past
+/// 20 ms, with the 20 to 50 ms bucket swelling from 131 to 3597 in the same run.
+/// A retransmit is now a safety net in case the frontend's reliability is
+/// weaker than it claims, not the recovery mechanism.
+const RETRANSMIT_AFTER: Duration = Duration::from_millis(120);
 
 /// How long to wait between polls while blocked.
 ///
@@ -773,6 +793,32 @@ impl LinkCable for NetCable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child has to be more patient than its parent, and the two numbers live
+    /// in different crates.
+    ///
+    /// Asserted in absolute milliseconds rather than as one constant plus a
+    /// margin, so the test cannot agree with a typo in either of them. The
+    /// failure it guards against is quiet: a child that stops waiting first runs
+    /// free while its parent is still blocked on it, and then answers the next
+    /// clock from the wrong place in its own stream, which no counter reports as
+    /// anything but a checksum the game did not like.
+    #[test]
+    fn a_child_waits_longer_than_its_parent() {
+        let child_patience = POLL_INTERVAL * gba_core::cable::HOLD_SPINS_MAX;
+        assert_eq!(child_patience, Duration::from_millis(500), "the child gives up at 500 ms");
+        assert_eq!(EXCHANGE_TIMEOUT, Duration::from_millis(400), "the parent at 400 ms");
+        assert!(
+            child_patience > EXCHANGE_TIMEOUT,
+            "a child that gives up on its parent first will run free while the              parent is still waiting for its reply"
+        );
+        // And a retransmit has to be able to happen at all inside the deadline,
+        // or the safety net is decorative.
+        assert!(
+            RETRANSMIT_AFTER < EXCHANGE_TIMEOUT,
+            "at least one retransmit must fit inside the wait"
+        );
+    }
 
     /// Session state is a process global, and cargo runs tests on parallel
     /// threads, so anything that touches it has to be serialized here.

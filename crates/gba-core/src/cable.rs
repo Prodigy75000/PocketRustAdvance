@@ -368,14 +368,23 @@ pub const DEFER_MAX_CYCLES: u32 = 9856;
 /// Consecutive [`LinkCable::hold`] answers before a child stops waiting and runs
 /// free.
 ///
-/// The fail-open bound. The transport waits about 250 us between calls, so this
-/// is roughly 300 ms: comfortably past the parent's own 150 ms give-up timeout,
-/// so a child does not start free-running while its parent is merely slow, and
-/// short enough that a parent which has gone away releases the child in a third
-/// of a second rather than freezing the screen. A frozen emulator is a worse
-/// failure than a desynchronised one, because the player cannot even quit the
-/// link from inside the game.
-pub const HOLD_SPINS_MAX: u32 = 1200;
+/// The fail-open bound, and HALF OF AN INVARIANT: a child must be more patient
+/// than its parent. The transport waits about 250 us between calls, so 2000
+/// spins is roughly 500 ms, against the parent's 400 ms give-up. If this were
+/// the shorter of the two, a child would start free-running while its parent was
+/// still waiting for it, and then answer the clock it eventually sees with a word
+/// from the wrong place in its own stream.
+///
+/// It was 1200 spins against a 150 ms deadline, which held the same invariant
+/// with the same margin; both moved together on 2026-10-07 when the deadline grew
+/// to let a late reply land. The pairing is asserted in `netpacket`, where both
+/// numbers are visible at once.
+///
+/// The upper bound on the value is that a parent which has gone away must release
+/// the child in a fraction of a second rather than freezing the screen. A frozen
+/// emulator is a worse failure than a desynchronised one, because the player
+/// cannot even quit the link from inside the game.
+pub const HOLD_SPINS_MAX: u32 = 2000;
 
 /// Recently answered sequence numbers kept for duplicate suppression. One
 /// exchange is outstanding at a time, so anything past a couple is slack;
@@ -2092,13 +2101,16 @@ mod tests {
         c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 500));
         c.advance(280_896); // spend the frame of slack
 
-        // 1200 answers of "wait", at the transport's 250 us poll, is about 300 ms:
-        // past the parent's own 150 ms give-up timeout, so a merely slow parent
-        // does not lose its child.
-        for i in 0..1200 {
+        // 2000 answers of "wait", at the transport's 250 us poll, is about 500 ms:
+        // past the parent's own 400 ms give-up, so a merely slow parent does not
+        // lose its child. The loop is written against the constant on purpose,
+        // because what is being pinned is that the bound EXISTS and fails open;
+        // the value itself is asserted in absolute milliseconds next to the
+        // parent's deadline, in `netpacket`, where both are visible at once.
+        for i in 0..HOLD_SPINS_MAX {
             assert!(c.hold(), "hold {i} should still be waiting");
         }
-        assert!(!c.hold(), "the 1201st answer has to let the child run");
+        assert!(!c.hold(), "one past the bound has to let the child run");
         assert_eq!(c.starved, 1);
         assert!(!c.pacing(), "and the pacing is off until the parent comes back");
 
