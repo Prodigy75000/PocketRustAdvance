@@ -682,6 +682,42 @@ impl Gba {
         self.bus.cable_wordsum
     }
 
+    /// A fingerprint of work RAM in sixteen chunks, for diffing two devices
+    /// running the same linked game.
+    ///
+    /// The instrument the Mario Kart failure needed and no counter could give. A
+    /// Grand Prix with computer racers is a DETERMINISTIC simulation: both
+    /// machines run the whole race from the two players' inputs, so if their
+    /// states drift apart the game notices and reports it as a communication
+    /// error. On 2026-10-08 a race ran 50 seconds at a clean 60 fps with every
+    /// cable counter frozen (`lost=0 shifted=0 dropped=0 stale_risk=0`, cold and
+    /// deferrals unchanged throughout) and then ended anyway, which is what a
+    /// desync looks like from the transport's side: nothing.
+    ///
+    /// Chunked rather than one hash, because the two ends are NOT expected to
+    /// match everywhere: each holds its own input history, audio buffers and link
+    /// scratch. What matters is a chunk that matched for a minute and then stops,
+    /// and when. Whole-RAM equality would be false from the first frame and say
+    /// nothing at all.
+    pub fn ram_fingerprint(&self) -> [u32; 18] {
+        let mut out = [0u32; 18];
+        let chunk = 16 * 1024;
+        for (i, slot) in out.iter_mut().enumerate() {
+            let (mem, off) = if i < 2 {
+                (&self.bus.iwram, i * chunk)
+            } else {
+                (&self.bus.ewram, (i - 2) * chunk)
+            };
+            let mut h: u32 = 0x811c_9dc5; // FNV-1a, 32 bits is enough to spot a drift
+            for b in mem.iter().skip(off).take(chunk) {
+                h ^= *b as u32;
+                h = h.wrapping_mul(0x0100_0193);
+            }
+            *slot = h;
+        }
+        out
+    }
+
     /// The hash at the last exact checkpoint, as `(transfer count, hash)`. The
     /// pair both devices can be compared on without lining anything up by hand.
     pub fn cable_mark(&self) -> (u64, u64) {
@@ -1330,6 +1366,35 @@ mod tests {
         assert_eq!(
             cycles, control_cycles,
             "and holding costs wall time, never emulated time"
+        );
+    }
+
+    /// The fingerprint has to localise a difference, not just notice one.
+    ///
+    /// A single hash over all of work RAM would be useless here: two linked
+    /// devices differ from the first frame in their input history, audio buffers
+    /// and link scratch, so whole-RAM equality is false immediately and says
+    /// nothing. What has to survive is "these fourteen chunks agreed for a minute
+    /// and then chunk nine stopped", which is what a desync looks like.
+    #[test]
+    fn the_ram_fingerprint_localises_a_difference() {
+        use crate::bus::{Access::NonSeq as N, Bus};
+        let mut rom = vec![0u8; 0x200];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        let mut gba = Gba::new(rom, Vec::new());
+        let before = gba.ram_fingerprint();
+
+        // One byte, in the third 16 KB of EWRAM, which is chunk 2 + 2 = 4.
+        gba.bus.write8(0x0200_8000 + 0x10, 0x5A, N);
+        let after = gba.ram_fingerprint();
+
+        assert_ne!(before[4], after[4], "the chunk holding the byte must change");
+        let unchanged: Vec<usize> =
+            (0..18).filter(|&i| i != 4 && before[i] == after[i]).collect();
+        assert_eq!(
+            unchanged.len(),
+            17,
+            "and every other chunk must be untouched, or the fingerprint cannot              say WHERE two devices diverged"
         );
     }
 

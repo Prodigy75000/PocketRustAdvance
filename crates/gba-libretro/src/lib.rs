@@ -1061,6 +1061,17 @@ pub extern "C" fn retro_run() {
             // so the same build appeared to print different counters.
             if !cable.is_empty() {
                 log_line(s.log, &format!("[cable] frames={}{cable}", s.frames));
+                // And a fingerprint of work RAM, only while a cable is attached,
+                // because its whole purpose is diffing two devices that are
+                // meant to be running the same simulation.
+                if let Some(g) = s.gba.as_ref() {
+                    let fp = g.ram_fingerprint();
+                    let hex: Vec<String> = fp.iter().map(|h| format!("{h:08X}")).collect();
+                    log_line(
+                        s.log,
+                        &format!("[ram] frames={} chunks={}", s.frames, hex.join(",")),
+                    );
+                }
             }
         }
         if let Some(video) = s.video {
