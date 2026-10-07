@@ -1009,8 +1009,11 @@ pub extern "C" fn retro_run() {
                         // wire.
                         let mean = if c.waits > 0 { c.wait_us / c.waits } else { 0 };
                         format!(
-                            " cable_done={} cable_lost={} cable_extra={} cable_badver={} cable_rtx={} cable_wait_mean_us={} cable_wait_max_us={} cable_stale_risk={} cable_holds={} cable_starved={} cable_skew={} cable_cold={}/{} cable_wordsum={:016X} cable_role={} cable_ties={} cable_defer={} cable_dropped={} cable_taken_back={} cable_shifted={} cable_mode={} cable_core={} cable_gaveup={}/{} cable_mark={}@{:016X}",
+                            " done={} lost={} extra={} badver={} rtx={} wait_mean_us={} wait_max_us={} rtt_us={:?} late_arrivals={} late_max_us={} stale_risk={} holds={} starved={} skew={} cold={}/{} wordsum={:016X} role={} ties={} defer={} dropped={} taken_back={} shifted={} mode={} core={} gaveup={}/{} mark={}@{:016X}",
                             c.done, c.lost, c.extra_peers, c.bad_version, c.rtx, mean, c.wait_max_us,
+                            c.wait_bucket,
+                            c.late_arrivals,
+                            c.late_max_us,
                             c.stale_risk, c.holds, c.starved, c.skew, c.cold, c.answered,
                             g.cable_wordsum(),
                             match c.role {
@@ -1036,17 +1039,28 @@ pub extern "C" fn retro_run() {
                     } else {
                         String::new()
                     };
-                    format!(
-                        " idle_pc={:08X} skips={} skipped_cycles={} ds_pops={} ds_underruns={}{cable}",
-                        g.idle.probe_r15.wrapping_sub(4),
-                        g.idle.skips,
-                        g.idle.skipped_cycles,
-                        g.bus.apu.dbg_pops,
-                        g.bus.apu.dbg_underruns
+                    (
+                        format!(
+                            " idle_pc={:08X} skips={} skipped_cycles={} ds_pops={} ds_underruns={}",
+                            g.idle.probe_r15.wrapping_sub(4),
+                            g.idle.skips,
+                            g.idle.skipped_cycles,
+                            g.bus.apu.dbg_pops,
+                            g.bus.apu.dbg_underruns
+                        ),
+                        cable,
                     )
                 })
                 .unwrap_or_default();
+            let (idle, cable) = idle;
             log_line(s.log, &format!("[perf] emulated_frames={}{idle}", s.frames));
+            // A SECOND line, because the host's log callback truncates one
+            // message at 580 characters. On 2026-10-07 the two fields added that
+            // morning sat past the cut on one device and inside it on the other,
+            // so the same build appeared to print different counters.
+            if !cable.is_empty() {
+                log_line(s.log, &format!("[cable] frames={}{cable}", s.frames));
+            }
         }
         if let Some(video) = s.video {
             unsafe {

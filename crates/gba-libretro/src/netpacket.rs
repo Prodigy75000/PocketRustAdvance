@@ -189,7 +189,31 @@ struct Net {
     pub cable_wait_us: u64,
     pub cable_waits: u64,
     pub cable_wait_max_us: u64,
+    /// Waits by size, so the SHAPE of the jitter is readable and not just its
+    /// mean and worst case.
+    ///
+    /// Mean 8.9 ms with a 150 ms maximum fits two different worlds: a smooth
+    /// distribution with one bad moment, or a clean 8 ms link losing datagrams
+    /// outright. The first wants a longer deadline and the second wants a better
+    /// retransmit, and the device run on 2026-10-07 could not tell them apart.
+    pub cable_wait_bucket: [u64; WAIT_BUCKETS.len() + 1],
+    /// The exchange most recently given up on, and when it STARTED.
+    cable_abandoned_at: Option<(u8, Instant)>,
+    /// Replies that arrived after their deadline, and the worst one, measured
+    /// from the clock going out.
+    ///
+    /// The number that decides whether a longer deadline would help at all. A
+    /// late reply means the child answered and we were impatient; no late reply
+    /// means the datagram was lost and waiting longer only freezes for longer.
+    pub cable_late_arrivals: u64,
+    pub cable_late_max_us: u64,
+    /// Baseline for spotting that the cable has counted another late reply.
+    cable_late_seen: u64,
 }
+
+/// Upper bounds of the wait histogram's buckets, in microseconds. One extra
+/// bucket above the last catches everything past the deadline.
+pub const WAIT_BUCKETS: [u64; 6] = [2_000, 5_000, 10_000, 20_000, 50_000, 150_000];
 
 impl Net {
     const fn new() -> Net {
@@ -208,6 +232,11 @@ impl Net {
             cable_wait_us: 0,
             cable_waits: 0,
             cable_wait_max_us: 0,
+            cable_wait_bucket: [0; WAIT_BUCKETS.len() + 1],
+            cable_abandoned_at: None,
+            cable_late_arrivals: 0,
+            cable_late_max_us: 0,
+            cable_late_seen: 0,
         }
     }
 
@@ -218,6 +247,50 @@ impl Net {
         self.cable.reset();
         self.cable_peers = [false; MAX_UNITS];
         self.cable_failures = 0;
+        // The MEASUREMENTS reset with the session too, and that is a fix rather
+        // than tidiness. They used to survive it, so on 2026-10-07 the tablet
+        // opened a fresh link already reading cable_lost=15235 from the attempts
+        // before it, and the first reading of that log was that this session had
+        // lost a third of its transfers. The core's own counters reset on ROM
+        // load, so the two halves of one heartbeat line were describing different
+        // spans of time.
+        self.cable_done = 0;
+        self.cable_lost = 0;
+        self.cable_rtx = 0;
+        self.cable_wait_us = 0;
+        self.cable_waits = 0;
+        self.cable_wait_max_us = 0;
+        self.cable_wait_bucket = [0; WAIT_BUCKETS.len() + 1];
+        self.cable_abandoned_at = None;
+        self.cable_late_arrivals = 0;
+        self.cable_late_max_us = 0;
+        self.cable_late_seen = 0;
+    }
+
+    /// Bucket a completed or abandoned wait.
+    fn note_wait(&mut self, us: u64) {
+        let slot = WAIT_BUCKETS.iter().position(|&b| us < b).unwrap_or(WAIT_BUCKETS.len());
+        self.cable_wait_bucket[slot] += 1;
+        self.cable_wait_us += us;
+        self.cable_waits += 1;
+        self.cable_wait_max_us = self.cable_wait_max_us.max(us);
+    }
+
+    /// Fold a reply that turned up after its deadline into the measurement.
+    ///
+    /// Measured from the clock going OUT, not from the give-up, so it compares
+    /// directly against `EXCHANGE_TIMEOUT` and answers the only question that
+    /// matters about a give-up: would waiting longer have worked?
+    fn note_late_arrival(&mut self) {
+        if self.cable.late_replies <= self.cable_late_seen {
+            return;
+        }
+        self.cable_late_seen = self.cable.late_replies;
+        if let Some((_, began)) = self.cable_abandoned_at.take() {
+            self.cable_late_arrivals += 1;
+            let us = began.elapsed().as_micros() as u64;
+            self.cable_late_max_us = self.cable_late_max_us.max(us);
+        }
     }
 
     /// Units on the bus including us: 2 while a session is live, 1 otherwise.
@@ -478,6 +551,14 @@ pub struct CableStats {
     /// means the two word streams are offset from that point on.
     pub taken_back: u64,
     pub shifted: u64,
+    /// Waits by size, smallest bucket first, with everything past the deadline
+    /// in the last one. See [`WAIT_BUCKETS`].
+    pub wait_bucket: [u64; WAIT_BUCKETS.len() + 1],
+    /// Replies that arrived after the parent had given up, and the worst one
+    /// measured from the clock going out. Non-zero means the deadline is the
+    /// problem; zero with give-ups means datagrams are being lost outright.
+    pub late_arrivals: u64,
+    pub late_max_us: u64,
 }
 
 pub fn cable_stats() -> CableStats {
@@ -500,6 +581,9 @@ pub fn cable_stats() -> CableStats {
         ties: n.cable.election_ties,
         deferrals: n.cable.deferrals,
         dropped: n.cable.dropped,
+        wait_bucket: n.cable_wait_bucket,
+        late_arrivals: n.cable_late_arrivals,
+        late_max_us: n.cable_late_max_us,
         taken_back: n.cable.gave_up_in_time,
         shifted: n.cable.shifted,
     })
@@ -612,14 +696,13 @@ impl LinkCable for NetCable {
             // Short borrow, poll, short borrow: `poll_receive` re-enters us
             // through `np_receive`, which borrows the same global.
             poll_receive();
+            with_net(|n| n.note_late_arrival());
             if let Some(word) = with_net(|n| n.cable.take_reply(seq)) {
                 let waited = began.elapsed().as_micros() as u64;
                 let own = with_net(|n| {
                     n.cable_failures = 0;
                     n.cable_done += 1;
-                    n.cable_wait_us += waited;
-                    n.cable_waits += 1;
-                    n.cable_wait_max_us = n.cable_wait_max_us.max(waited);
+                    n.note_wait(waited);
                     // The word LATCHED when this exchange started, not whatever
                     // the register holds now: a game that writes SIOMLT_SEND
                     // again mid-transfer must not change what this transfer
@@ -659,9 +742,10 @@ impl LinkCable for NetCable {
             n.cable.abandon(seq);
             n.cable_failures += 1;
             n.cable_lost += 1;
-            n.cable_wait_us += waited;
-            n.cable_waits += 1;
-            n.cable_wait_max_us = n.cable_wait_max_us.max(waited);
+            n.note_wait(waited);
+            // Remember when this exchange started, so a reply that arrives after
+            // we stopped waiting can say how long it would have taken.
+            n.cable_abandoned_at = Some((seq, began));
         });
         flush_cable_outbox(); // abandon only queues the give-up
         // One deadline missed by a peer that is still in the session: late, not

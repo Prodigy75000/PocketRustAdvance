@@ -491,6 +491,24 @@ pub struct CableProto {
     pub deferrals: u64,
     /// Transfers taken back off the queue because the parent gave up in time.
     pub gave_up_in_time: u64,
+    /// Sequence numbers this parent gave up on, newest last.
+    ///
+    /// Kept so a reply that turns up AFTER the deadline can be recognised rather
+    /// than silently dropped. The difference decides what to do about a give-up:
+    /// a reply that arrives at 200 ms means the deadline is too short, where a
+    /// reply that never arrives at all means a packet was lost and waiting longer
+    /// would only freeze for longer.
+    abandoned: VecDeque<u8>,
+    /// Replies that arrived for a transfer already given up on.
+    pub late_replies: u64,
+    /// The last sequence number [`CableProto::accept_clock`] let through.
+    ///
+    /// Replaces a `seen` lookup that could not answer the question it was asked.
+    /// `seen` holds eight entries, and a parent's give-up arrives a whole timeout
+    /// later: nine transfers an emulated frame means eighty have gone past by
+    /// then, so a stream that HAD been offset looked identical to one that had
+    /// not, and `shifted` read zero either way.
+    last_accepted: Option<u8>,
     /// Transfers the child had already handed its game when the parent gave up.
     ///
     /// Not recoverable, and the one number that means the protocol streams are
@@ -579,6 +597,9 @@ impl CableProto {
             deferred_cycles: 0,
             deferrals: 0,
             gave_up_in_time: 0,
+            abandoned: VecDeque::new(),
+            late_replies: 0,
+            last_accepted: None,
             shifted: 0,
             version_mismatch: 0,
             peer_lag: 0, // nothing reported yet, see LAG_HEALTHY
@@ -620,6 +641,9 @@ impl CableProto {
         self.deferred_cycles = 0;
         self.deferrals = 0;
         self.gave_up_in_time = 0;
+        self.abandoned.clear();
+        self.late_replies = 0;
+        self.last_accepted = None;
         self.shifted = 0;
         self.version_mismatch = 0;
         self.peer_lag = 0; // nothing reported yet, see LAG_HEALTHY
@@ -734,6 +758,10 @@ impl CableProto {
             let mut pkt = [0u8; PACKET_LEN];
             put(&mut pkt, TAG_GAVE_UP, seq, 0, 0, self.local_cycles);
             self.outbox.push_back(pkt);
+            if self.abandoned.len() >= SEEN_WINDOW {
+                self.abandoned.pop_front();
+            }
+            self.abandoned.push_back(seq);
         }
     }
 
@@ -1092,9 +1120,14 @@ impl CableProto {
                 self.peer_time = Some(time);
                 if self.awaiting == Some(seq) {
                     self.reply = Some(word);
+                } else if let Some(at) = self.abandoned.iter().position(|&s| s == seq) {
+                    // The child DID answer, after we told our game the transfer
+                    // failed. Nothing can be done with the word now, but the fact
+                    // that it came is the measurement that sizes the deadline.
+                    self.abandoned.remove(at);
+                    self.late_replies += 1;
                 }
-                // A reply for any other seq is stale by definition: the parent
-                // has already moved on or given up. Drop it.
+                // Any other seq is stale by definition: the parent has moved on.
             }
             TAG_GAVE_UP => {
                 self.peer_gave_up = true;
@@ -1108,7 +1141,10 @@ impl CableProto {
                 let taken = before - self.child_input.len();
                 if taken > 0 {
                     self.gave_up_in_time += taken as u64;
-                } else if self.seen.contains(&Some(seq)) {
+                } else if self
+                    .last_accepted
+                    .is_some_and(|last| last.wrapping_sub(seq) < 128)
+                {
                     // Already delivered. Nothing can be undone, so say so loudly:
                     // from here the two streams are offset and every checksum the
                     // protocol computes will fail.
@@ -1147,6 +1183,7 @@ impl CableProto {
             self.dropped += 1;
         }
         self.child_input.push_back((seq, word, answered));
+        self.last_accepted = Some(seq);
         let mut reply = [0u8; PACKET_LEN];
         put(&mut reply, TAG_REPLY, seq, answered, self.lag(), self.local_cycles);
         self.last_reply = reply;
@@ -1257,6 +1294,21 @@ mod tests {
         fn drop_all(&mut self, from: usize) {
             self.proto[from].take_outbox();
         }
+        /// Take side `from`'s packets off the wire to be delivered later.
+        ///
+        /// Needed for anything about a give-up, because a give-up is sent after a
+        /// timeout as long as dozens of transfers: delivering it on the next call
+        /// models a wire nothing like the one on the devices, and a test that does
+        /// cannot see a window rotate.
+        fn hold_back(&mut self, from: usize) -> Vec<[u8; PACKET_LEN]> {
+            self.proto[from].take_outbox()
+        }
+        /// Deliver packets taken earlier by [`Wire::hold_back`].
+        fn deliver_held(&mut self, to: usize, held: Vec<[u8; PACKET_LEN]>) {
+            for pkt in held {
+                self.proto[to].on_packet(&pkt);
+            }
+        }
     }
 
     #[test]
@@ -1328,6 +1380,78 @@ mod tests {
             w.proto[1].child_clock(),
             None,
             "and the child's game must never see a transfer its peer failed"
+        );
+    }
+
+    /// The same damage, but with the give-up arriving a realistic amount of time
+    /// later, which is the case the counter used to miss entirely.
+    ///
+    /// A parent waits 150 ms before it gives up. Pokemon clocks nine transfers an
+    /// emulated frame, so about eighty go past in that time, and the `seen` window
+    /// this test's predecessor relied on holds eight. So on the devices the
+    /// give-up always arrived with its sequence number already forgotten,
+    /// `shifted` stayed at zero through every failed session, and a reading of
+    /// zero meant nothing at all. Twelve give-ups on 2026-10-07 produced zero
+    /// shifts and zero take-backs, which is arithmetically impossible: a give-up
+    /// is one or the other.
+    #[test]
+    fn a_give_up_that_arrives_much_later_is_still_counted() {
+        let mut w = Wire::new();
+        let seq = w.proto[0].begin_exchange(0x8000);
+        w.deliver(0);
+        let ran = w.proto[1].child_clock();
+        assert!(ran.is_some(), "the child ran the transfer, so it cannot be undone");
+        w.drop_all(1); // every copy of the reply is lost
+        w.proto[0].abandon(seq);
+        // The give-up comes off the wire and is delivered at the END, which is
+        // what a 150 ms timeout looks like from the child's side.
+        let give_up = w.hold_back(0);
+
+        // Twenty more transfers go past before the give-up is delivered, which is
+        // more than the eight-entry seen window and fewer than one Pokemon frame.
+        for i in 1..21u16 {
+            // Armed before each clock, so the child accepts it at once instead of
+            // deferring: a deferred clock is never entered in `seen` at all, and a
+            // test that let that happen would not touch the window it is about.
+            w.proto[1].set_output(0x1000 + i);
+            let s = w.proto[0].begin_exchange(0x8000 + i);
+            w.deliver(0);
+            w.proto[1].child_clock();
+            w.deliver(1);
+            w.proto[0].take_reply(s).expect("a healthy transfer in between");
+        }
+        assert_eq!(
+            w.proto[1].answered, 21,
+            "all twenty-one were accepted, so the eight-entry seen window has              rotated past the first one twice over"
+        );
+        w.deliver_held(1, give_up); // and now the give-up for the first one lands
+
+        assert_eq!(
+            w.proto[1].shifted, 1,
+            "the streams are offset and the heartbeat has to say so, however long              the give-up took to arrive"
+        );
+        assert_eq!(w.proto[1].gave_up_in_time, 0, "far too late to take anything back");
+    }
+
+    /// A reply that arrives after the deadline is the measurement that sizes the
+    /// deadline, so it must not be dropped in silence.
+    #[test]
+    fn a_reply_that_arrives_after_the_give_up_is_counted() {
+        let mut w = Wire::new();
+        let seq = w.proto[0].begin_exchange(0x8000);
+        w.deliver(0);
+        w.proto[1].child_clock();
+        // The child answered; the parent's patience simply ran out first.
+        w.proto[0].abandon(seq);
+        assert_eq!(w.proto[0].late_replies, 0, "nothing has come back yet");
+        w.deliver(1); // the reply, too late to be used
+        assert_eq!(
+            w.proto[0].late_replies, 1,
+            "the child DID answer: the deadline was short, the packet was not lost"
+        );
+        assert_eq!(
+            w.proto[0].take_reply(seq), None,
+            "and it still must not be handed to the game, which was told it failed"
         );
     }
 
