@@ -1009,11 +1009,12 @@ pub extern "C" fn retro_run() {
                         // wire.
                         let mean = if c.waits > 0 { c.wait_us / c.waits } else { 0 };
                         format!(
-                            " done={} lost={} extra={} badver={} rtx={} wait_mean_us={} wait_max_us={} rtt_us={:?} late_arrivals={} late_max_us={} stale_risk={} holds={} starved={} skew={} cold={}/{} wordsum={:016X} role={} ties={} defer={} dropped={} taken_back={} shifted={} mode={} core={} gaveup={}/{} mark={}@{:016X}",
+                            " done={} lost={} extra={} badver={} rtx={} wait_mean_us={} wait_max_us={} rtt_us={:?} late_arrivals={} late_max_us={} off_bus={} stale_risk={} holds={} starved={} skew={} cold={}/{} wordsum={:016X} role={} ties={} defer={} dropped={} taken_back={} shifted={} mode={} core={} gaveup={}/{} mark={}@{:016X}",
                             c.done, c.lost, c.extra_peers, c.bad_version, c.rtx, mean, c.wait_max_us,
                             c.wait_bucket,
                             c.late_arrivals,
                             c.late_max_us,
+                            c.off_bus,
                             c.stale_risk, c.holds, c.starved, c.skew, c.cold, c.answered,
                             g.cable_wordsum(),
                             match c.role {

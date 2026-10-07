@@ -662,6 +662,10 @@ pub struct CableStats {
     /// problem; zero with give-ups means datagrams are being lost outright.
     pub late_arrivals: u64,
     pub late_max_us: u64,
+    /// Clocks answered ABSENT because our game had the port parked. Expected
+    /// during the handshake, where one player has reached the link menu and the
+    /// other has not. Non-zero DURING a race means something else.
+    pub off_bus: u64,
 }
 
 pub fn cable_stats() -> CableStats {
@@ -685,6 +689,7 @@ pub fn cable_stats() -> CableStats {
         deferrals: n.cable.deferrals,
         dropped: n.cable.dropped,
         wait_bucket: n.cable_wait_bucket,
+        off_bus: n.cable.off_bus_answers,
         late_arrivals: n.cable_late_arrivals,
         late_max_us: n.cable_late_max_us,
         taken_back: n.cable.gave_up_in_time,
@@ -715,6 +720,10 @@ impl LinkCable for NetCable {
     /// the election completes, so the game sees no partner and never clocks.
     fn id(&self) -> u8 {
         with_net(|n| n.cable.role().unwrap_or(0))
+    }
+
+    fn set_on_bus(&mut self, on: bool) {
+        with_net(|n| n.cable.set_on_bus(on));
     }
 
     fn set_output(&mut self, word: u16) {

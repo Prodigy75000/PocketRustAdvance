@@ -1655,6 +1655,13 @@ impl GbaBus {
         // than being asked for. Collected once per scanline: that adds at most
         // 73 us to the parent's wait, against a transfer the game has budgeted
         // 343 us for, and costs one test per scanline when no cable is attached.
+        // Tell the cable whether our game is on the bus at all, every step. A
+        // parked port is not a slow unit, it is an absent one, and the peer has to
+        // be able to see the difference.
+        if self.cable.is_some() {
+            let on_bus = self.multi_mode();
+            self.cable.as_mut().unwrap().set_on_bus(on_bus);
+        }
         if self.cable.is_some() && self.multi_mode() {
             // Hardware drives SI, SD and the ID continuously, not only when the
             // game writes SIOCNT. A game that set up Multi-Player mode before

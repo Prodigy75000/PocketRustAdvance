@@ -195,6 +195,17 @@ pub trait LinkCable {
     /// with, not whatever SIOMLT_SEND holds by the time its emulation catches
     /// up.
     fn child_clock(&mut self) -> Option<(u16, u16)>;
+    /// Is this unit's game actually on the Multi-Player bus right now?
+    ///
+    /// Called every time the serial port is stepped. A game parks the port
+    /// between screens (Mario Kart writes RCNT=C000, JOY BUS, measured), and a
+    /// unit whose port is parked does not drive the bus at all: its peer reads
+    /// FFFF for that slot, which is precisely the "waiting for players" signal a
+    /// link handshake is built on. Answering with the last word the game happened
+    /// to leave in SIOMLT_SEND instead tells the peer a partner is there and
+    /// sending data, which is a lie its protocol then has to make sense of.
+    fn set_on_bus(&mut self, _on: bool) {}
+
     /// Throw away transfers in flight, because the game just selected
     /// Multi-Player mode and anything from before that is not addressed to the
     /// protocol it is about to run.
@@ -469,6 +480,15 @@ pub struct CableProto {
     child_input: VecDeque<(u8, u16, u16)>,
     /// Transfers dropped because the serial engine never collected them.
     pub dropped: u64,
+    /// Is our game on the Multi-Player bus? False while it has the port parked.
+    ///
+    /// A unit that is off the bus answers ABSENT and hands its serial engine
+    /// nothing, because there is no engine listening: measured on the owner's
+    /// devices, a child spent half a session with the port in JOY BUS while its
+    /// peer clocked at it, and 1860 transfers were answered with a stale word and
+    /// then dropped. The peer counted every one of those as a transfer that
+    /// landed.
+    on_bus: bool,
     /// Clocks accepted while a previous transfer was still uncollected.
     ///
     /// The precondition of the one cable failure no other instrument can see.
@@ -540,6 +560,13 @@ pub struct CableProto {
     /// checksum fails from here. It was invisible before, which is why a word
     /// hash that diverged at the first checkpoint had no explanation next to it.
     pub shifted: u64,
+    /// Clocks answered with ABSENT because our game had the port parked.
+    ///
+    /// Not a fault: it is the handshake window, where one player has reached the
+    /// link menu and the other has not. Counted because it used to be invisible,
+    /// and because a non-zero value DURING a race would mean something quite
+    /// different.
+    pub off_bus_answers: u64,
     /// Packets from a peer speaking a cable version this build does not.
     ///
     /// Non-zero means the two devices are on different builds, and it latches:
@@ -614,12 +641,14 @@ impl CableProto {
             child_input: VecDeque::new(),
             dropped: 0,
             stale_risk: 0,
+            on_bus: true,
             answered_cold: 0,
             answered: 0,
             armed_since_answer: false,
             deferred: None,
             deferred_cycles: 0,
             deferrals: 0,
+            off_bus_answers: 0,
             gave_up_in_time: 0,
             abandoned: VecDeque::new(),
             late_replies: 0,
@@ -658,12 +687,14 @@ impl CableProto {
         self.child_input.clear();
         self.dropped = 0;
         self.stale_risk = 0;
+        self.on_bus = true;
         self.answered_cold = 0;
         self.answered = 0;
         self.armed_since_answer = false;
         self.deferred = None;
         self.deferred_cycles = 0;
         self.deferrals = 0;
+        self.off_bus_answers = 0;
         self.gave_up_in_time = 0;
         self.abandoned.clear();
         self.late_replies = 0;
@@ -712,6 +743,11 @@ impl CableProto {
     }
 
     /// Present `word` on the bus. A child's reply is answered from this.
+    /// Record whether our game currently has the port on the Multi-Player bus.
+    pub fn set_on_bus(&mut self, on: bool) {
+        self.on_bus = on;
+    }
+
     pub fn set_output(&mut self, word: u16) {
         self.own_output = word;
         self.armed_since_answer = true;
@@ -1197,6 +1233,18 @@ impl CableProto {
     fn accept_clock(&mut self, seq: u8, word: u16) {
         self.seen[self.seen_pos] = Some(seq);
         self.seen_pos = (self.seen_pos + 1) % SEEN_WINDOW;
+        if !self.on_bus {
+            // Our game has the port parked, so this unit is not on the bus. Say
+            // so, and hand the serial engine nothing: there is nothing listening
+            // to deliver it to, and queueing it only overflows and drops later.
+            self.answered += 1;
+            self.off_bus_answers += 1;
+            let mut reply = [0u8; PACKET_LEN];
+            put(&mut reply, TAG_REPLY, seq, ABSENT, self.lag(), self.local_cycles);
+            self.last_reply = reply;
+            self.outbox.push_back(reply);
+            return;
+        }
         let answered = self.own_output;
         if self.answered > 0 && !self.armed_since_answer {
             // Answered cold: the handler never stored a word, so this transfer
@@ -1362,6 +1410,52 @@ mod tests {
             Some((0x8FFF, 0xB9A0)),
             "the child must see the parent's word and the word it answered with"
         );
+    }
+
+    /// A unit whose game has the port parked is ABSENT, not slow.
+    ///
+    /// Measured on the owner's devices 2026-10-08: a child spent half a session
+    /// with the port in JOY BUS, which its game writes between screens
+    /// (RCNT=C000, seen in the register trace), while its peer clocked at it.
+    /// Every one of those clocks was answered with whatever word the game had
+    /// last left in SIOMLT_SEND and then dropped when the queue overflowed, 1860
+    /// of them. The peer counted all 1860 as transfers that landed, so one end
+    /// believed it had exchanged data with a partner that was not listening.
+    ///
+    /// On hardware a parked port does not drive the bus and the peer reads FFFF,
+    /// which is exactly the signal a link handshake waits for: one player has
+    /// reached the menu and the other has not.
+    #[test]
+    fn a_unit_with_its_port_parked_answers_absent_and_queues_nothing() {
+        let mut w = Wire::new();
+        w.proto[1].set_output(0xB9A0); // the word its game left behind
+        w.proto[1].set_on_bus(false);
+
+        let seq = w.proto[0].begin_exchange(0x8FFF);
+        w.deliver(0);
+        w.deliver(1);
+
+        assert_eq!(
+            w.proto[0].take_reply(seq),
+            Some(ABSENT),
+            "the peer must read an absent unit, not the stale word"
+        );
+        assert_eq!(
+            w.proto[1].child_clock(),
+            None,
+            "and nothing is handed to a serial engine that is not listening"
+        );
+        assert_eq!(w.proto[1].off_bus_answers, 1);
+        assert_eq!(w.proto[1].dropped, 0, "nothing was queued, so nothing is dropped");
+
+        // Back on the bus, it answers with its word again.
+        w.proto[1].set_on_bus(true);
+        w.proto[1].set_output(0xB9A0);
+        let seq = w.proto[0].begin_exchange(0x8FFE);
+        w.deliver(0);
+        w.deliver(1);
+        assert_eq!(w.proto[0].take_reply(seq), Some(0xB9A0), "and it is back");
+        assert_eq!(w.proto[1].child_clock(), Some((0x8FFE, 0xB9A0)));
     }
 
     /// The one cable failure no instrument could see: a child whose emulation is
