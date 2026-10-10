@@ -1113,9 +1113,20 @@ impl CableProto {
     pub fn lead(&self) -> Option<i32> {
         let (ours0, theirs0) = self.anchor?;
         let theirs = self.parent_time?;
-        let ours_gone = self.local_cycles.wrapping_sub(ours0) as i32;
-        let theirs_gone = theirs.wrapping_sub(theirs0) as i32;
-        Some(ours_gone - theirs_gone)
+        // ONE wrapping subtraction, cast ONCE at the end. Casting each side to
+        // i32 first and subtracting overflows: both counters pass 2^31 cycles
+        // about 128 seconds after the anchor, which is two minutes eight seconds
+        // of emulated time, and around that boundary the two casts land on
+        // opposite sides of the sign and the difference comes out wrong by 2^32.
+        // A child that suddenly believes it is wildly ahead parks until its
+        // patience runs out, which is half a second, mid-race.
+        //
+        // The owner's report is what found it: failures "right away as it starts
+        // or about 2 minutes into the lap". 2 minutes 8 seconds is not a race
+        // length, it is 2^31 cycles.
+        let ours_gone = self.local_cycles.wrapping_sub(ours0);
+        let theirs_gone = theirs.wrapping_sub(theirs0);
+        Some(ours_gone.wrapping_sub(theirs_gone) as i32)
     }
 
     /// Credit a child's budget with the parent's progress.
@@ -2328,6 +2339,58 @@ mod tests {
         assert_eq!(c.holds, 0, "a level link must never hold");
         assert_eq!(c.starved, 0, "and never give up on a parent that is talking");
         assert!(c.pacing(), "while staying engaged the whole time");
+    }
+
+    /// The lead has to stay correct across the counters' own wrap, 2^31 cycles
+    /// after the anchor, which is 128 seconds of emulated time.
+    ///
+    /// **Not the cause of anything observed, and the honest version of that
+    /// matters.** The owner's report of failures "about 2 minutes into the lap"
+    /// looked like a perfect match for 2^31 cycles at 16777216 a second, and it
+    /// is not: in a release build the i32 subtraction wraps, and wrapping gives
+    /// back exactly the right difference. The two forms agree in the shipped
+    /// build. What the old form really does is PANIC on overflow in a debug
+    /// build, inside a window as narrow as the lead itself.
+    ///
+    /// Kept because a panic in the pacing is worth closing, and because the first
+    /// version of this test stepped a quarter frame at a time, jumped clean over
+    /// that window, and passed against the broken code.
+    #[test]
+    fn the_lead_survives_the_cycle_counter_wrapping() {
+        // Anchor near the top of the u32 range so the wrap happens during the
+        // test rather than after it.
+        let base = u32::MAX - 100_000;
+        let mut c = CableProto::new();
+        c.advance(base);
+        c.on_packet(&parent_pkt(TAG_TICK, 0, 0, base));
+        assert_eq!(c.lead(), Some(0), "level at the anchor");
+
+        // Run the whole 128 seconds a quarter frame at a time, ticking all the
+        // way, because that is what a live link does: one enormous advance would
+        // trip the silence timeout, disengage the pacing and re-anchor, which
+        // hides the very thing under test.
+        // Stepped so that one sample lands INSIDE the narrow window where our
+        // elapsed count has passed 2^31 and the parent's has not. That window is
+        // only as wide as the lead itself, so a coarse step jumps straight over
+        // it and proves nothing: the first version of this test did exactly that
+        // and passed against the broken code.
+        let step = 616u32; // half a scanline, so the window cannot be skipped
+        let mut gone: u64 = 0;
+        let target: u64 = 2_147_483_648 + 3_000;
+        while gone < target {
+            c.advance(step);
+            gone += step as u64;
+            // The parent stays exactly one scanline behind us the whole way.
+            let theirs = base.wrapping_add(gone as u32).wrapping_sub(1232);
+            c.on_packet(&parent_pkt(TAG_TICK, 0, 0, theirs));
+            assert_eq!(
+                c.lead(),
+                Some(1232),
+                "one scanline ahead, {gone} cycles past the anchor"
+            );
+        }
+        assert!(gone > 2_147_483_648, "the test has to actually cross 2^31");
+        assert!(!c.hold(), "a scanline of lead is nowhere near the slack");
     }
 
     /// A child that has fallen BEHIND must never park. This is the death spiral.
