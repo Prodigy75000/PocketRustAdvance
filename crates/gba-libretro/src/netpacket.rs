@@ -681,7 +681,7 @@ pub fn cable_stats() -> CableStats {
         stale_risk: n.cable.stale_risk,
         holds: n.cable.holds,
         starved: n.cable.starved,
-        skew: n.cable.skew().unwrap_or(0),
+        skew: n.cable.lead().unwrap_or(0),
         cold: n.cable.answered_cold,
         answered: n.cable.answered,
         role: n.cable.role(),

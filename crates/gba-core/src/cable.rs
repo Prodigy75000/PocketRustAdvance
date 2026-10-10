@@ -488,6 +488,22 @@ pub struct CableProto {
     child_input: VecDeque<(u8, u16, u16)>,
     /// Transfers dropped because the serial engine never collected them.
     pub dropped: u64,
+    /// Where the two clocks were when pacing engaged, as (ours, the parent's).
+    ///
+    /// **The budget alone could not represent being BEHIND, and that was the
+    /// whole bug.** It was an allowance, topped up by each parent report and
+    /// capped at one frame, so a child seven frames behind had exactly the same
+    /// budget as one a frame ahead: zero. It parked either way, 250 us at a time,
+    /// which put it further behind, which made it park more. Measured on the
+    /// owner's tablet on 2026-10-10: 60 emulated frames in 6.9 seconds, 8.7 fps,
+    /// 11450 parks, seven transfers arriving per frame, and then the game quit.
+    ///
+    /// With an anchor the comparison is a signed position difference instead of
+    /// an allowance, so "behind" is negative and a child that is behind never
+    /// parks at all. The two cores still share no epoch, which is what the
+    /// differences were for; the anchor supplies one at first contact and is
+    /// dropped whenever pacing disengages.
+    anchor: Option<(u32, u32)>,
     /// Is our game on the Multi-Player bus? False while it has the port parked.
     ///
     /// A unit that is off the bus answers ABSENT and hands its serial engine
@@ -649,6 +665,7 @@ impl CableProto {
             child_input: VecDeque::new(),
             dropped: 0,
             stale_risk: 0,
+            anchor: None,
             on_bus: true,
             answered_cold: 0,
             answered: 0,
@@ -695,6 +712,7 @@ impl CableProto {
         self.child_input.clear();
         self.dropped = 0;
         self.stale_risk = 0;
+        self.anchor = None;
         self.on_bus = true;
         self.answered_cold = 0;
         self.answered = 0;
@@ -1013,7 +1031,14 @@ impl CableProto {
         // one-frame horizon, and it makes "parked implies armed" true by
         // construction instead of by appeal to what the game ought to do.
         let unarmed = self.answered > 0 && !self.armed_since_answer;
-        if !self.engaged || self.budget > 0 || !self.child_input.is_empty() || unarmed {
+        // Ahead by more than a frame, measured as a POSITION DIFFERENCE. A child
+        // that is behind reads negative here and runs flat out, which is the
+        // whole point: it has catching up to do.
+        // `>=`, not `>`: the budget it replaces started at exactly one frame and
+        // held once spent, so a child could gain at most HORIZON. Anything looser
+        // lets it overshoot by a scanline and the bound test says so.
+        let ahead = self.lead().is_some_and(|l| l >= HORIZON as i32);
+        if !self.engaged || !ahead || !self.child_input.is_empty() || unarmed {
             self.hold_spins = 0;
             return false;
         }
@@ -1032,6 +1057,7 @@ impl CableProto {
     fn disengage(&mut self) {
         self.engaged = false;
         self.budget = 0;
+        self.anchor = None;
         self.parent_time = None;
         self.since_parent = 0;
         self.hold_spins = 0;
@@ -1054,6 +1080,16 @@ impl CableProto {
             .map(|t| self.local_cycles.wrapping_sub(t) as i32)
     }
 
+    /// How far ahead of the parent this child has emulated, in cycles. Negative
+    /// means behind, which is the case the budget could not express.
+    pub fn lead(&self) -> Option<i32> {
+        let (ours0, theirs0) = self.anchor?;
+        let theirs = self.parent_time?;
+        let ours_gone = self.local_cycles.wrapping_sub(ours0) as i32;
+        let theirs_gone = theirs.wrapping_sub(theirs0) as i32;
+        Some(ours_gone - theirs_gone)
+    }
+
     /// Credit a child's budget with the parent's progress.
     ///
     /// Differences, not absolutes: the two cores share no epoch. A duplicate or
@@ -1074,6 +1110,9 @@ impl CableProto {
                 }
             }
         };
+        if self.anchor.is_none() {
+            self.anchor = Some((self.local_cycles, parent_time));
+        }
         self.parent_time = Some(parent_time);
         self.engaged = true;
         self.since_parent = 0;
@@ -2264,6 +2303,59 @@ mod tests {
         assert_eq!(c.holds, 0, "a level link must never hold");
         assert_eq!(c.starved, 0, "and never give up on a parent that is talking");
         assert!(c.pacing(), "while staying engaged the whole time");
+    }
+
+    /// A child that has fallen BEHIND must never park. This is the death spiral.
+    ///
+    /// The budget this replaced was an allowance: topped up by each parent
+    /// report, capped at one frame, spent as the child emulated. It could say "I
+    /// have run my frame's worth" but it could not say "I am seven frames behind",
+    /// because both are a budget of zero. So a child that fell behind parked, 250
+    /// us at a time, which put it further behind, which made it park more.
+    ///
+    /// Measured on the owner's tablet on 2026-10-10: one heartbeat covering 6.9
+    /// seconds of wall clock for 60 emulated frames, 8.7 fps, 11450 parks, seven
+    /// transfers arriving per emulated frame, and then the game gave up. The link
+    /// had two speeds all along and this is the slow one, which never recovered
+    /// once entered.
+    #[test]
+    fn a_child_that_is_behind_never_parks() {
+        let mut c = CableProto::new();
+        c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 1_000)); // engage and anchor
+
+        // The parent gets ten frames further on while we manage one.
+        c.advance(280_896);
+        c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 1_000 + 10 * 280_896));
+        assert_eq!(
+            c.lead(),
+            Some(280_896 - 10 * 280_896),
+            "nine frames behind, and the sign is the whole point"
+        );
+        assert!(!c.hold(), "a child that is behind has catching up to do");
+
+        // And it keeps running while it closes the gap, rather than parking its
+        // way further back. The parent keeps reporting, a quarter frame at a
+        // time, because two frames of silence legitimately stop the pacing and
+        // this test is not about that.
+        let mut parent_at = 1_000 + 10 * 280_896;
+        for frame in 0..8 {
+            c.advance(280_896);
+            parent_at += 280_896 / 4;
+            c.on_packet(&parent_pkt(TAG_TICK, 0, 0, parent_at));
+            assert!(!c.hold(), "frame {frame}: still behind, still must not park");
+        }
+        assert_eq!(c.holds, 0, "not one park while behind");
+
+        // Once it has actually overtaken by a frame, the old behaviour returns.
+        // Each round gains three quarters of a frame on the parent, so this is
+        // the point where nine frames of deficit has turned into one of lead.
+        for _ in 0..6 {
+            c.advance(280_896);
+            parent_at += 280_896 / 4;
+            c.on_packet(&parent_pkt(TAG_TICK, 0, 0, parent_at));
+        }
+        assert!(c.lead().unwrap() >= 280_896, "now genuinely ahead");
+        assert!(c.hold(), "and a child that is ahead still waits");
     }
 
     /// A parent that goes away releases the child instead of freezing it.
