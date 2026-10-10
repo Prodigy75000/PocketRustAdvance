@@ -369,8 +369,22 @@ pub const HORIZON: u32 = 280_896;
 
 /// How far ahead of its parent a child may emulate before it waits.
 ///
-/// Half a frame, and SEPARATE from [`HORIZON`] on purpose: that one is the tick
-/// interval and the basis of the silence timeout, which want a whole frame.
+/// **One frame, after half a frame was tried on device and throttled the child
+/// to 20-30 fps.** Separate from [`HORIZON`] so the tick interval can be finer
+/// than the slack, which it now is.
+///
+/// The constraint, which the failed attempt made explicit: a child advances
+/// (SLACK minus the STALENESS of the position it is compared against) per
+/// update, and the parent's reported position is already about 7 ms old in
+/// flight, which is 0.4 of a frame. A half-frame slack leaves 0.1 of a frame of
+/// headroom per update, and four updates a frame means the child can only
+/// advance 0.4 frames per frame: it is throttled to 40% of its parent's speed
+/// and can never catch up. Measured exactly that way, 60 fps dropping to 20-30
+/// with the child parking 2000 times a second.
+///
+/// So the slack has to comfortably EXCEED the one-way latency, not approach it.
+/// A whole frame against 0.4 leaves 0.6 of headroom per update, which is more
+/// than the 0.25 needed to keep pace at four updates a frame.
 ///
 /// Measured 2026-10-10, with both ends exchanging bit-identical words at 60 fps:
 /// the child saw 146 two-frame gaps between transfers against the parent's 5.
@@ -384,7 +398,7 @@ pub const HORIZON: u32 = 280_896;
 /// parent's report is already about 5 ms old in flight, a third of a frame, so a
 /// slack below that would park a child permanently. Half a frame is the tightest
 /// value with room above that floor.
-pub const PACE_SLACK: u32 = HORIZON / 2;
+pub const PACE_SLACK: u32 = HORIZON;
 
 /// How often a parent puts its position on the wire when it is not clocking.
 ///
@@ -2246,7 +2260,7 @@ mod tests {
     /// position advances at about 14 fps, and this is what makes the child match
     /// it instead of running nine protocol frames into the future.
     #[test]
-    fn the_child_never_runs_more_than_half_a_frame_past_the_parent() {
+    fn the_child_never_runs_more_than_one_frame_past_the_parent() {
         let mut c = CableProto::new();
 
         // Before any parent packet there is nothing to pace against, and a child
@@ -2261,23 +2275,23 @@ mod tests {
         assert!(c.pacing(), "a parent packet engages the pacing");
         assert_eq!(c.lead(), Some(0), "level with the parent at first contact");
 
-        // 113 scanlines of 1232 cycles is 139216, one scanline short of half a
-        // frame. Absolute numbers, so the test cannot agree with a typo in the
-        // constant it is checking.
-        for _ in 0..113 {
+        // 227 scanlines of 1232 cycles is 279664, one scanline short of a frame.
+        // Absolute numbers, so the test cannot agree with a typo in the constant
+        // it is checking.
+        for _ in 0..227 {
             c.advance(1232);
             assert!(!c.hold(), "a child inside the slack must never be held");
         }
-        assert_eq!(c.lead(), Some(139_216));
+        assert_eq!(c.lead(), Some(279_664));
 
         c.advance(1232);
-        assert_eq!(c.lead(), Some(140_448), "which is half of 280896");
-        assert!(c.hold(), "a child half a frame ahead has to wait");
+        assert_eq!(c.lead(), Some(280_896), "a whole frame");
+        assert!(c.hold(), "a child a frame ahead has to wait");
         assert_eq!(c.holds, 1);
 
         // The parent moving is what releases it, and nothing else.
         c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 1_000_000 + 280_896));
-        assert_eq!(c.lead(), Some(140_448 - 280_896), "now behind, by the frame it gained");
+        assert_eq!(c.lead(), Some(0), "the parent's frame cancels the one we gained");
         assert!(!c.hold(), "and it is released by the parent moving, nothing else");
     }
 
