@@ -367,6 +367,38 @@ pub const TIME_OFF: usize = 9;
 /// the handshake, which must stay at 60 fps.
 pub const HORIZON: u32 = 280_896;
 
+/// How far ahead of its parent a child may emulate before it waits.
+///
+/// Half a frame, and SEPARATE from [`HORIZON`] on purpose: that one is the tick
+/// interval and the basis of the silence timeout, which want a whole frame.
+///
+/// Measured 2026-10-10, with both ends exchanging bit-identical words at 60 fps:
+/// the child saw 146 two-frame gaps between transfers against the parent's 5.
+/// That asymmetry is the lead itself. A child that may run a WHOLE frame ahead
+/// spends that frame emulating with nothing landing, so a transfer the parent
+/// issued one frame after the last reaches the child two frames after the last,
+/// in the only clock the game has. The parent blocks on the network and so never
+/// gets ahead, which is why it sees almost none.
+///
+/// The floor on this is the staleness of the position it is compared against: a
+/// parent's report is already about 5 ms old in flight, a third of a frame, so a
+/// slack below that would park a child permanently. Half a frame is the tightest
+/// value with room above that floor.
+pub const PACE_SLACK: u32 = HORIZON / 2;
+
+/// How often a parent puts its position on the wire when it is not clocking.
+///
+/// A quarter frame, and it MUST be finer than [`PACE_SLACK`], because the
+/// position a child compares itself against is only as fresh as the last report.
+/// Ticking once a frame against a half-frame slack would force a child to sit
+/// half a frame behind a position already a frame old, which is lagging, not
+/// pacing: the first attempt at this made exactly that mistake and the level
+/// handshake test caught it.
+///
+/// A clock carries a position too, so sending one defers the next tick. During a
+/// race, where the game clocks every frame anyway, this costs nothing.
+pub const TICK_EVERY: u32 = HORIZON / 4;
+
 /// Transfers between word-hash checkpoints.
 ///
 /// 512, which at the measured seven transfers a frame is a checkpoint every few
@@ -617,7 +649,6 @@ pub struct CableProto {
     /// Cycles this child may still emulate before it is a whole frame ahead of
     /// the parent's last reported position. Signed because a long scanline can
     /// overshoot, and the overshoot has to be paid back rather than forgiven.
-    budget: i64,
     /// Is this end pacing itself against a parent at all? False on a parent, on
     /// a child before first contact, and on a child whose parent went silent.
     engaged: bool,
@@ -687,9 +718,8 @@ impl CableProto {
             peer_gave_up: false,
             outbox: VecDeque::new(),
             local_cycles: 0,
-            next_tick_at: HORIZON,
+            next_tick_at: TICK_EVERY,
             parent_time: None,
-            budget: 0,
             engaged: false,
             since_parent: 0,
             hold_spins: 0,
@@ -734,9 +764,8 @@ impl CableProto {
         self.peer_gave_up = false;
         self.outbox.clear();
         self.local_cycles = 0;
-        self.next_tick_at = HORIZON;
+        self.next_tick_at = TICK_EVERY;
         self.parent_time = None;
-        self.budget = 0;
         self.engaged = false;
         self.since_parent = 0;
         self.hold_spins = 0;
@@ -796,6 +825,9 @@ impl CableProto {
         let mut pkt = [0u8; PACKET_LEN];
         put(&mut pkt, TAG_CLOCK, seq, out, 0, self.local_cycles);
         self.outbox.push_back(pkt);
+        // A clock carries this parent's position, so it IS a tick. Deferring the
+        // next one keeps a game that clocks every frame from paying for both.
+        self.next_tick_at = self.local_cycles.wrapping_add(TICK_EVERY);
         seq
     }
 
@@ -874,7 +906,7 @@ impl CableProto {
         // packet, which is the safe direction: a child that is briefly too fast
         // catches a clock late, where a child wrongly held sees no clocks at all.
         self.parent_time = None;
-        self.budget = 0;
+        self.anchor = None;
         self.engaged = false;
         self.since_parent = 0;
         self.hold_spins = 0;
@@ -974,7 +1006,6 @@ impl CableProto {
         if !self.engaged {
             return;
         }
-        self.budget -= cycles as i64;
         self.since_parent = self.since_parent.saturating_add(cycles);
         if self.since_parent >= HORIZON * 2 {
             // Two frames with nothing from the parent. It is not slow, it is
@@ -1001,7 +1032,7 @@ impl CableProto {
         if (self.local_cycles.wrapping_sub(self.next_tick_at) as i32) < 0 {
             return false;
         }
-        self.next_tick_at = self.local_cycles.wrapping_add(HORIZON);
+        self.next_tick_at = self.local_cycles.wrapping_add(TICK_EVERY);
         let mut pkt = [0u8; PACKET_LEN];
         put(&mut pkt, TAG_TICK, 0, 0, 0, self.local_cycles);
         self.outbox.push_back(pkt);
@@ -1040,7 +1071,7 @@ impl CableProto {
         // `>=`, not `>`: the budget it replaces started at exactly one frame and
         // held once spent, so a child could gain at most HORIZON. Anything looser
         // lets it overshoot by a scanline and the bound test says so.
-        let ahead = self.lead().is_some_and(|l| l >= HORIZON as i32);
+        let ahead = self.lead().is_some_and(|l| l >= PACE_SLACK as i32);
         if !self.engaged || !ahead || !self.child_input.is_empty() || unarmed {
             self.hold_spins = 0;
             return false;
@@ -1059,7 +1090,6 @@ impl CableProto {
     /// cannot tell where its parent is must keep emulating.
     fn disengage(&mut self) {
         self.engaged = false;
-        self.budget = 0;
         self.anchor = None;
         self.parent_time = None;
         self.since_parent = 0;
@@ -1069,11 +1099,6 @@ impl CableProto {
     /// Is this end pacing itself against a parent?
     pub fn pacing(&self) -> bool {
         self.engaged
-    }
-
-    /// Cycles this child may still emulate before it must wait.
-    pub fn budget(&self) -> i64 {
-        self.budget
     }
 
     /// How far this end is ahead of the peer's last reported position, in cycles.
@@ -1100,19 +1125,6 @@ impl CableProto {
     /// which is why the retransmit path replaying a cached reply verbatim is
     /// correct rather than merely harmless: a retransmit is not new progress.
     fn credit(&mut self, parent_time: u32) {
-        let delta = match self.parent_time {
-            // First contact: one frame of slack, so a child that connects
-            // mid-frame is not held before it has heard anything.
-            None => HORIZON as i64,
-            Some(prev) => {
-                let d = parent_time.wrapping_sub(prev) as i32;
-                if d <= 0 {
-                    0
-                } else {
-                    (d as i64).min(HORIZON as i64)
-                }
-            }
-        };
         if self.anchor.is_none() {
             self.anchor = Some((self.local_cycles, parent_time));
         }
@@ -1120,7 +1132,6 @@ impl CableProto {
         self.engaged = true;
         self.since_parent = 0;
         self.hold_spins = 0;
-        self.budget = (self.budget + delta).min(HORIZON as i64);
     }
 
     /// Packets the transport should put on the wire.
@@ -2224,7 +2235,7 @@ mod tests {
     /// position advances at about 14 fps, and this is what makes the child match
     /// it instead of running nine protocol frames into the future.
     #[test]
-    fn the_child_never_runs_more_than_one_frame_past_the_parent() {
+    fn the_child_never_runs_more_than_half_a_frame_past_the_parent() {
         let mut c = CableProto::new();
 
         // Before any parent packet there is nothing to pace against, and a child
@@ -2233,27 +2244,29 @@ mod tests {
         assert!(!c.hold(), "a child that has heard nothing from a parent runs free");
         assert!(!c.pacing());
 
-        // First contact grants one frame of slack. The absolute position is
-        // arbitrary on purpose: the two cores share no epoch, only differences.
+        // First contact anchors the two clocks. The absolute position is
+        // arbitrary on purpose: the two cores share no epoch, only the anchor.
         c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 1_000_000));
         assert!(c.pacing(), "a parent packet engages the pacing");
-        assert_eq!(c.budget(), 280_896, "one frame of slack");
+        assert_eq!(c.lead(), Some(0), "level with the parent at first contact");
 
-        // 227 scanlines of 1232 cycles is 279664, so there is still 1232 left.
-        for _ in 0..227 {
+        // 113 scanlines of 1232 cycles is 139216, one scanline short of half a
+        // frame. Absolute numbers, so the test cannot agree with a typo in the
+        // constant it is checking.
+        for _ in 0..113 {
             c.advance(1232);
-            assert!(!c.hold(), "a child inside the horizon must never be held");
+            assert!(!c.hold(), "a child inside the slack must never be held");
         }
-        assert_eq!(c.budget(), 1232);
+        assert_eq!(c.lead(), Some(139_216));
 
         c.advance(1232);
-        assert_eq!(c.budget(), 0);
-        assert!(c.hold(), "a child a full frame ahead has to wait");
+        assert_eq!(c.lead(), Some(140_448), "which is half of 280896");
+        assert!(c.hold(), "a child half a frame ahead has to wait");
         assert_eq!(c.holds, 1);
 
-        // One frame of parent progress unlocks exactly one frame of ours.
+        // The parent moving is what releases it, and nothing else.
         c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 1_000_000 + 280_896));
-        assert_eq!(c.budget(), 280_896);
+        assert_eq!(c.lead(), Some(140_448 - 280_896), "now behind, by the frame it gained");
         assert!(!c.hold(), "and it is released by the parent moving, nothing else");
     }
 
@@ -2272,16 +2285,19 @@ mod tests {
         // A clock arrives and is answered, which consumes the armed word.
         c.on_packet(&parent_pkt(TAG_CLOCK, 0, 0x8FFF, 1_000));
         assert_eq!(c.child_clock(), Some((0x8FFF, 0x1111)), "the engine collects it");
-        c.advance(280_896); // and the whole frame of budget is spent
+        c.advance(280_896); // and it is now well past the slack
 
         assert!(
             !c.hold(),
             "the handler has not stored the next word yet, so it must keep running"
         );
-        assert_eq!(c.budget(), 0, "it is out of budget, which is not the question here");
+        assert!(
+            c.lead().unwrap() >= PACE_SLACK as i32,
+            "it is past the slack, which is not the question here"
+        );
 
         c.set_output(0x2222); // the handler runs
-        assert!(c.hold(), "armed and out of budget, now parking is safe");
+        assert!(c.hold(), "armed and past the slack, now parking is safe");
         assert_eq!(c.answered_cold, 0, "and no answer was given cold");
     }
 
@@ -2295,12 +2311,18 @@ mod tests {
     fn a_level_handshake_never_holds_the_child() {
         let mut c = CableProto::new();
         let mut parent_at = 0u32;
+        // Ticked at the rate a parent actually ticks, a quarter frame. Modelling
+        // one tick a frame against a half-frame slack is what a LAGGING child
+        // looks like, not a level one, and this test caught that when the slack
+        // was tightened without the tick rate following it.
         for frame in 0..60 {
-            parent_at = parent_at.wrapping_add(280_896);
-            c.on_packet(&parent_pkt(TAG_TICK, 0, 0, parent_at));
-            for line in 0..228 {
-                assert!(!c.hold(), "frame {frame} line {line} was held at 60 fps");
-                c.advance(1232);
+            for quarter in 0..4 {
+                parent_at = parent_at.wrapping_add(TICK_EVERY);
+                c.on_packet(&parent_pkt(TAG_TICK, 0, 0, parent_at));
+                for line in 0..57 {
+                    assert!(!c.hold(), "frame {frame} quarter {quarter} line {line} held at 60 fps");
+                    c.advance(1232);
+                }
             }
         }
         assert_eq!(c.holds, 0, "a level link must never hold");
@@ -2385,11 +2407,12 @@ mod tests {
         assert_eq!(c.starved, 1);
         assert!(!c.pacing(), "and the pacing is off until the parent comes back");
 
-        // It comes back: pacing re-engages with a fresh frame of slack and no
-        // memory of the old position.
+        // It comes back: pacing re-engages with a FRESH ANCHOR and no memory of
+        // the old position, so the two are level again rather than inheriting a
+        // stale epoch from before the silence.
         c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 9_000_000));
         assert!(c.pacing());
-        assert_eq!(c.budget(), 280_896);
+        assert_eq!(c.lead(), Some(0));
         assert!(!c.hold());
     }
 
@@ -2432,14 +2455,17 @@ mod tests {
 
     /// The 60 Hz floor: one tick a frame, whether or not the game is clocking.
     #[test]
-    fn a_parent_ticks_once_a_frame_and_not_twice() {
+    fn a_parent_ticks_every_quarter_frame_and_not_twice() {
         let mut p = CableProto::new();
-        for line in 0..227 {
+        // 57 scanlines is 70224 cycles, which is a quarter of 280896. The tick
+        // rate has to be FINER than the pacing slack, or a child is held against
+        // a position staler than the slack it is being held to.
+        for line in 0..56 {
             p.advance(1232);
-            assert!(!p.maybe_tick(), "line {line} is still inside the first frame");
+            assert!(!p.maybe_tick(), "line {line} is still inside the first quarter");
         }
         p.advance(1232);
-        assert!(p.maybe_tick(), "280896 cycles is a frame, so a tick is owed");
+        assert!(p.maybe_tick(), "70224 cycles is a quarter frame, so a tick is owed");
         assert!(!p.maybe_tick(), "and owed once, not every time it is asked");
 
         let out = p.take_outbox();
@@ -2452,14 +2478,14 @@ mod tests {
                 out[0][TIME_OFF + 2],
                 out[0][TIME_OFF + 3],
             ]),
-            280_896,
+            70_224,
             "carrying the position it was sent at"
         );
 
-        for _ in 0..228 {
+        for _ in 0..57 {
             p.advance(1232);
         }
-        assert!(p.maybe_tick(), "and again the frame after");
+        assert!(p.maybe_tick(), "and again the quarter after");
     }
 
     /// Selecting Multi-Player mode drops the pacing with everything else.
@@ -2480,9 +2506,9 @@ mod tests {
         assert!(!c.hold(), "so the child runs until the parent speaks again");
         c.on_packet(&parent_pkt(TAG_TICK, 0, 0, 12_345 + 1232));
         assert_eq!(
-            c.budget(),
-            280_896,
-            "and re-engaging grants a fresh frame, not a stale difference"
+            c.lead(),
+            Some(0),
+            "and re-engaging anchors afresh, rather than inheriting a stale epoch"
         );
     }
 
