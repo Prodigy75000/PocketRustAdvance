@@ -376,10 +376,13 @@ pub const CABLE_MARK_EVERY: u64 = 512;
 /// How many transfers at the TAIL of a link to keep, for dumping when the game
 /// leaves Multi-Player mode.
 ///
-/// Thirty-two is about half a second at one transfer a frame, which is long
-/// enough to hold whatever handshake a game does at a screen transition and
-/// short enough to read by eye next to the other device's.
-pub const CABLE_TAIL: usize = 32;
+/// **256, raised from 32 the first time it was read.** A child leaves the bus
+/// and its peer then clocks into absence for SECONDS before its own game gives
+/// up, so a short ring arrives holding nothing but the aftermath: thirty-two
+/// entries of `03FF,FFFF` where the interesting words were the eight before
+/// them. The dump is run-length encoded, so a long run of identical words costs
+/// one entry and the ring can be deep enough to outlast the silence.
+pub const CABLE_TAIL: usize = 256;
 
 /// How many transfers at the head of a session to record verbatim.
 ///

@@ -1073,11 +1073,36 @@ pub extern "C" fn retro_run() {
                 let mode = g.bus.sio_mode();
                 let was_multi = s.last_sio_mode == "MULTI";
                 if was_multi && mode != "MULTI" && g.cable_attached() {
-                    let tail: Vec<String> = g
-                        .cable_tail()
-                        .iter()
-                        .map(|(n, a, b)| format!("{n}:{a:04X},{b:04X}"))
-                        .collect();
+                    // Run-length encoded, because the host truncates a log line
+                    // at 580 characters and the run that matters is always
+                    // preceded by hundreds of identical words. "x40" costs three
+                    // characters and buys forty transfers of history.
+                    let mut tail: Vec<String> = Vec::new();
+                    let mut run: Option<(u64, u16, u16, u32)> = None;
+                    for (n, a, b) in g.cable_tail() {
+                        match run {
+                            Some((start, ra, rb, count)) if ra == a && rb == b => {
+                                run = Some((start, ra, rb, count + 1));
+                            }
+                            other => {
+                                if let Some((start, ra, rb, count)) = other {
+                                    tail.push(if count > 1 {
+                                        format!("{start}:{ra:04X},{rb:04X}x{count}")
+                                    } else {
+                                        format!("{start}:{ra:04X},{rb:04X}")
+                                    });
+                                }
+                                run = Some((n, a, b, 1));
+                            }
+                        }
+                    }
+                    if let Some((start, ra, rb, count)) = run {
+                        tail.push(if count > 1 {
+                            format!("{start}:{ra:04X},{rb:04X}x{count}")
+                        } else {
+                            format!("{start}:{ra:04X},{rb:04X}")
+                        });
+                    }
                     log_line(
                         s.log,
                         &format!("[cable-tail] left MULTI for {mode} after {}", tail.join(" ")),

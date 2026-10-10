@@ -2585,13 +2585,25 @@ mod tests {
             b.step_serial();
         }
 
+        // Phrased as the PROPERTY, so changing the depth does not change the
+        // meaning: the ring is bounded, it holds the newest entries, and the
+        // oldest it keeps is exactly the depth back from the newest. Hardcoding
+        // values derived from the constant is what broke this test when the
+        // depth went from 32 to 256.
+        let total = crate::cable::CABLE_TAIL as u64 + 10;
         assert_eq!(b.cable_tail.len(), crate::cable::CABLE_TAIL, "the ring is bounded");
         let (n, first, second) = *b.cable_tail.back().unwrap();
-        assert_eq!(n, 42, "the newest entry is the last transfer, not the first");
-        assert_eq!(first, 0x1000 + 41, "and carries its words verbatim");
-        assert_eq!(second, 0x2000 + 41);
+        assert_eq!(n, total, "the newest entry is the last transfer, not the first");
+        assert_eq!(first, 0x1000 + (total - 1) as u16, "and carries its words verbatim");
+        assert_eq!(second, 0x2000 + (total - 1) as u16);
         let (oldest, _, _) = *b.cable_tail.front().unwrap();
-        assert_eq!(oldest, 11, "the oldest kept is exactly CABLE_TAIL back");
+        assert_eq!(oldest, total - crate::cable::CABLE_TAIL as u64 + 1);
+        // One absolute claim, because the depth has a job: it has to outlast a
+        // peer clocking into absence for several seconds after its partner left.
+        assert!(
+            crate::cable::CABLE_TAIL >= 128,
+            "a ring shorter than a couple of seconds of absence arrives holding              only the aftermath, which is how the first dump was read"
+        );
     }
 
     /// A peer that has gone leaves a LONE GBA, not a broken one.
