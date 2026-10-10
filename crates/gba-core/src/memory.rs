@@ -147,6 +147,15 @@ pub struct GbaBus {
     cable_window_sum: u64,
     /// The first few transfers' words, for printing once.
     pub cable_trace: Vec<(u64, u16, u16)>,
+    /// The LAST transfers, as a ring. The head trace shows a link starting; this
+    /// shows one ending, which is the half we have never been able to look at.
+    ///
+    /// Every failure since the race worked looks identical from the counters:
+    /// one transfer a frame at 60 fps, nothing lost, nothing cold, and then the
+    /// game leaves Multi-Player mode. If the words the two ends exchanged just
+    /// before that are the same on both, the data was fine and the game quit for
+    /// a reason of its own; if they differ, this is where it will show.
+    pub cable_tail: std::collections::VecDeque<(u64, u16, u16)>,
     /// `cycles` as of the last `step_serial`, so serial timing is a delta the
     /// same way the timers are.
     serial_cycles: u64,
@@ -497,6 +506,7 @@ impl GbaBus {
             cable_mark_sum: 0xcbf2_9ce4_8422_2325,
             cable_window_sum: 0xcbf2_9ce4_8422_2325,
             cable_trace: Vec::new(),
+            cable_tail: std::collections::VecDeque::new(),
             serial_cycles: 0,
             serial_pending: 0,
             bios: b.into_boxed_slice(),
@@ -1823,6 +1833,10 @@ impl GbaBus {
             {
                 self.cable_trace.push((self.cable_transfers, w[0], w[1]));
             }
+            if self.cable_tail.len() >= crate::cable::CABLE_TAIL {
+                self.cable_tail.pop_front();
+            }
+            self.cable_tail.push_back((self.cable_transfers, w[0], w[1]));
         } else {
             self.cable_failures += 1;
         }
@@ -2548,6 +2562,36 @@ mod tests {
             b.dma_src[0], 0x0300_0304,
             "the channel must have run exactly once: a store of 1 over an enable              bit that is already 1 is not an edge and starts nothing"
         );
+    }
+
+    /// The tail ring has to hold the END of a link, not the start of it.
+    ///
+    /// Every failure since a full race became possible looks the same from the
+    /// counters: one transfer a frame at 60 fps, nothing lost, nothing cold, and
+    /// then the game leaves Multi-Player mode. The head trace shows a link
+    /// starting and is useless for that; this keeps the last transfers so the two
+    /// devices' final words can be read side by side.
+    #[test]
+    fn the_tail_keeps_the_last_transfers_not_the_first() {
+        let mut b = bus();
+        b.cable = Some(Box::new(Scripted(crate::cable::MultiResult::Landed([1, 2, 3, 4]), 0)));
+        for i in 0..(crate::cable::CABLE_TAIL as u16 + 10) {
+            b.cable = Some(Box::new(Scripted(
+                crate::cable::MultiResult::Landed([0x1000 + i, 0x2000 + i, 0, 0]),
+                0,
+            )));
+            b.write16(0x0400_0128, 0x2000 | 0x0080 | 0x0003, Access::NonSeq);
+            b.cycles += 40_000;
+            b.step_serial();
+        }
+
+        assert_eq!(b.cable_tail.len(), crate::cable::CABLE_TAIL, "the ring is bounded");
+        let (n, first, second) = *b.cable_tail.back().unwrap();
+        assert_eq!(n, 42, "the newest entry is the last transfer, not the first");
+        assert_eq!(first, 0x1000 + 41, "and carries its words verbatim");
+        assert_eq!(second, 0x2000 + 41);
+        let (oldest, _, _) = *b.cable_tail.front().unwrap();
+        assert_eq!(oldest, 11, "the oldest kept is exactly CABLE_TAIL back");
     }
 
     /// A peer that has gone leaves a LONE GBA, not a broken one.

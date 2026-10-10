@@ -373,6 +373,14 @@ pub const HORIZON: u32 = 280_896;
 /// seconds: often enough to bracket a failure, rare enough to be one log line.
 pub const CABLE_MARK_EVERY: u64 = 512;
 
+/// How many transfers at the TAIL of a link to keep, for dumping when the game
+/// leaves Multi-Player mode.
+///
+/// Thirty-two is about half a second at one transfer a frame, which is long
+/// enough to hold whatever handshake a game does at a screen transition and
+/// short enough to read by eye next to the other device's.
+pub const CABLE_TAIL: usize = 32;
+
 /// How many transfers at the head of a session to record verbatim.
 ///
 /// Enough to see the first words of a link go past on both devices and diff them

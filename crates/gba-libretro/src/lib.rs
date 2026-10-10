@@ -246,6 +246,9 @@ struct State {
     /// Last level handed to the host, so an unchanged level is not re-sent 60
     /// times a second.
     rumble_last: bool,
+    /// The serial mode at the previous heartbeat, so leaving Multi-Player mode
+    /// can be detected as an EDGE. That edge is the failure we keep chasing.
+    last_sio_mode: &'static str,
     /// Whether the front-end accepted the memory map. See
     /// `retro_get_memory_data`: when it did not, we must not answer SYSTEM_RAM.
     map_published: bool,
@@ -283,6 +286,7 @@ impl State {
             sensors: None,
             rumble: None,
             rumble_last: false,
+            last_sio_mode: "",
             map_published: false,
             log: None,
             rfu_last: None,
@@ -1059,6 +1063,28 @@ pub extern "C" fn retro_run() {
             // message at 580 characters. On 2026-10-07 the two fields added that
             // morning sat past the cut on one device and inside it on the other,
             // so the same build appeared to print different counters.
+            // The moment the game leaves Multi-Player mode, dump the last
+            // transfers. That transition IS the failure: every error since the
+            // race worked shows clean counters to the final transfer and then
+            // this. Both ends print it, so the two tails can be read side by
+            // side, which is the only way to tell "the data differed" from "the
+            // game quit for its own reasons".
+            if let Some(g) = s.gba.as_ref() {
+                let mode = g.bus.sio_mode();
+                let was_multi = s.last_sio_mode == "MULTI";
+                if was_multi && mode != "MULTI" && g.cable_attached() {
+                    let tail: Vec<String> = g
+                        .cable_tail()
+                        .iter()
+                        .map(|(n, a, b)| format!("{n}:{a:04X},{b:04X}"))
+                        .collect();
+                    log_line(
+                        s.log,
+                        &format!("[cable-tail] left MULTI for {mode} after {}", tail.join(" ")),
+                    );
+                }
+                s.last_sio_mode = mode;
+            }
             if !cable.is_empty() {
                 log_line(s.log, &format!("[cable] frames={}{cable}", s.frames));
                 // And a fingerprint of work RAM, only while a cable is attached,

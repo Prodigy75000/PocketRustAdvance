@@ -682,6 +682,11 @@ impl Gba {
         self.bus.cable_wordsum
     }
 
+    /// The last transfers the cable landed, oldest first.
+    pub fn cable_tail(&self) -> Vec<(u64, u16, u16)> {
+        self.bus.cable_tail.iter().copied().collect()
+    }
+
     /// A fingerprint of work RAM in sixteen chunks, for diffing two devices
     /// running the same linked game.
     ///
