@@ -688,6 +688,11 @@ impl Gba {
         self.bus.cable_gap
     }
 
+    /// Which eighth of the frame each transfer landed in.
+    pub fn cable_where(&self) -> [u64; 8] {
+        self.bus.cable_where
+    }
+
     /// The last transfers the cable landed, oldest first.
     pub fn cable_tail(&self) -> Vec<(u64, u16, u16)> {
         self.bus.cable_tail.iter().copied().collect()

@@ -169,6 +169,20 @@ pub struct GbaBus {
     pub cable_gap: [u64; 6],
     /// Cycle count when the previous transfer landed.
     cable_gap_last: u64,
+    /// Which eighth of the frame a transfer landed in.
+    ///
+    /// The last structural difference from hardware that nothing else here can
+    /// see. On a real cable the parent decides when to clock and the transfer
+    /// lands on BOTH machines in that same instant, so both would record the same
+    /// narrow distribution. Here the child lands its transfers wherever its own
+    /// emulation happens to be, which can be most of a frame away.
+    ///
+    /// If the child's histogram is broad against a narrow parent, that is worth
+    /// fixing and there is a way: the clock already carries the parent's
+    /// position, so its offset within ITS frame is knowable, and a child could
+    /// hold delivery until its own frame reaches the same point. If both are
+    /// broad, or both narrow, this is not where the failures live.
+    pub cable_where: [u64; 8],
     /// `cycles` as of the last `step_serial`, so serial timing is a delta the
     /// same way the timers are.
     serial_cycles: u64,
@@ -248,6 +262,9 @@ pub struct GbaBus {
     /// advances once per line, so without these a mid-line event is attributed to
     /// a line boundary and lands up to 1232 cycles away from where it really is.
     pub line_cycle_base: u64,
+    /// The scanline being emulated, kept so the cable can record WHERE in the
+    /// frame a transfer landed.
+    pub cur_line: u16,
     pub audio_line_base: u64,
     pub watch_addr: u32,
     /// Bytes covered by the watchpoint, starting at `watch_addr`. Defaults to 4.
@@ -522,6 +539,7 @@ impl GbaBus {
             cable_tail: std::collections::VecDeque::new(),
             cable_gap: [0; 6],
             cable_gap_last: 0,
+            cable_where: [0; 8],
             serial_cycles: 0,
             serial_pending: 0,
             bios: b.into_boxed_slice(),
@@ -560,6 +578,7 @@ impl GbaBus {
             data_break: false,
             frame_no: 0,
             line_cycle_base: 0,
+            cur_line: 0,
             audio_line_base: 0,
             watch_addr: 0,
             watch_len: 4,
@@ -1000,6 +1019,7 @@ impl GbaBus {
 
     /// Raise the LCD interrupts for `line` according to DISPSTAT's enable bits.
     pub fn raise_ppu_irqs(&mut self, line: u16) {
+        self.cur_line = line;
         let stat = self.ppu.dispstat();
         if line == 160 && stat & 0x08 != 0 {
             self.if_ |= 1 << 0; // V-blank
@@ -1860,6 +1880,8 @@ impl GbaBus {
                 self.cable_gap[frames] += 1;
             }
             self.cable_gap_last = self.cycles;
+            let line = self.cur_line.min(227) as usize;
+            self.cable_where[line * 8 / 228] += 1;
         } else {
             self.cable_failures += 1;
         }
@@ -2656,6 +2678,36 @@ mod tests {
         assert_eq!(b.cable_gap[2], 1, "two frames apart");
         assert_eq!(b.cable_gap[4], 1, "four frames apart, which a cable cannot do");
         assert_eq!(b.cable_gap.iter().sum::<u64>(), 3, "and the first one is not a gap");
+    }
+
+    /// A transfer is recorded in the eighth of the frame it actually landed in.
+    ///
+    /// The point of the histogram is comparing two devices, so the bucketing has
+    /// to be the same function of the scanline on both. 228 lines in eight
+    /// buckets puts V-blank, which starts at line 160, in the last two.
+    #[test]
+    fn a_transfer_is_bucketed_by_where_in_the_frame_it_landed() {
+        for (line, want) in [(0u16, 0usize), (28, 0), (29, 1), (160, 5), (227, 7)] {
+            let mut b = bus();
+            b.cable = Some(Box::new(Scripted(
+                crate::cable::MultiResult::Landed([1, 2, 3, 4]),
+                0,
+            )));
+            b.write16(0x0400_0128, 0x2000 | 0x0080 | 0x0003, Access::NonSeq);
+            b.cur_line = line;
+            b.cycles += 40_000;
+            b.step_serial();
+            assert_eq!(
+                b.cable_where[want], 1,
+                "line {line} belongs in bucket {want}"
+            );
+            assert_eq!(b.cable_where.iter().sum::<u64>(), 1, "and only there");
+        }
+
+        // V-blank is the back two buckets, which is where a game that clocks
+        // from its V-blank handler would pile up.
+        assert_eq!(160usize * 8 / 228, 5);
+        assert_eq!(227usize * 8 / 228, 7);
     }
 
     /// A peer that has gone leaves a LONE GBA, not a broken one.
