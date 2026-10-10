@@ -682,6 +682,12 @@ impl Gba {
         self.bus.cable_wordsum
     }
 
+    /// Transfers bucketed by how many emulated FRAMES passed since the previous
+    /// one: same frame, 1, 2, 3, 4, 5 or more.
+    pub fn cable_gap(&self) -> [u64; 6] {
+        self.bus.cable_gap
+    }
+
     /// The last transfers the cable landed, oldest first.
     pub fn cable_tail(&self) -> Vec<(u64, u16, u16)> {
         self.bus.cable_tail.iter().copied().collect()

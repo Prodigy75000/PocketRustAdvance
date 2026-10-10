@@ -156,6 +156,19 @@ pub struct GbaBus {
     /// before that are the same on both, the data was fine and the game quit for
     /// a reason of its own; if they differ, this is where it will show.
     pub cable_tail: std::collections::VecDeque<(u64, u16, u16)>,
+    /// Emulated cycles since the previous transfer landed, bucketed by FRAME.
+    ///
+    /// What the GAME sees, which is the one view still missing. Both ends agree
+    /// on the words and both run at 60 fps, so if a game still gives up, the
+    /// remaining difference from hardware is WHEN its transfers arrive in its own
+    /// timeline. A game that clocks once a frame and is built for a cable expects
+    /// them one frame apart; a gap of three or four is something hardware could
+    /// never hand it.
+    ///
+    /// Buckets: same frame, 1, 2, 3, 4, 5 or more.
+    pub cable_gap: [u64; 6],
+    /// Cycle count when the previous transfer landed.
+    cable_gap_last: u64,
     /// `cycles` as of the last `step_serial`, so serial timing is a delta the
     /// same way the timers are.
     serial_cycles: u64,
@@ -507,6 +520,8 @@ impl GbaBus {
             cable_window_sum: 0xcbf2_9ce4_8422_2325,
             cable_trace: Vec::new(),
             cable_tail: std::collections::VecDeque::new(),
+            cable_gap: [0; 6],
+            cable_gap_last: 0,
             serial_cycles: 0,
             serial_pending: 0,
             bios: b.into_boxed_slice(),
@@ -1837,6 +1852,14 @@ impl GbaBus {
                 self.cable_tail.pop_front();
             }
             self.cable_tail.push_back((self.cable_transfers, w[0], w[1]));
+            if self.cable_gap_last > 0 {
+                let gap = self.cycles.saturating_sub(self.cable_gap_last);
+                // One frame is HORIZON, which the cable module already defines as
+                // exactly that and documents as such.
+                let frames = (gap / crate::cable::HORIZON as u64).min(5) as usize;
+                self.cable_gap[frames] += 1;
+            }
+            self.cable_gap_last = self.cycles;
         } else {
             self.cable_failures += 1;
         }
@@ -2604,6 +2627,35 @@ mod tests {
             crate::cable::CABLE_TAIL >= 128,
             "a ring shorter than a couple of seconds of absence arrives holding              only the aftermath, which is how the first dump was read"
         );
+    }
+
+    /// The gap histogram has to measure EMULATED frames between transfers, which
+    /// is the only clock the game has.
+    ///
+    /// Both ends of a failing link agree on every word and both run at 60 fps, so
+    /// what is left to differ from hardware is WHEN a transfer reaches the game in
+    /// its own timeline. A cable hands a game its transfers one frame apart; a gap
+    /// of three or four is something no cable could produce.
+    #[test]
+    fn transfers_are_bucketed_by_the_frames_between_them() {
+        let mut b = bus();
+        let gaps_in_lines = [228u64, 228, 456, 912];
+        for (i, lines) in gaps_in_lines.iter().enumerate() {
+            b.cable = Some(Box::new(Scripted(
+                crate::cable::MultiResult::Landed([0x1000 + i as u16, 0, 0, 0]),
+                0,
+            )));
+            b.write16(0x0400_0128, 0x2000 | 0x0080 | 0x0003, Access::NonSeq);
+            b.cycles += lines * crate::ppu::CYCLES_PER_LINE as u64;
+            b.step_serial();
+        }
+
+        // The first transfer has nothing to measure against, so three gaps from
+        // four transfers: one frame, two frames, four frames.
+        assert_eq!(b.cable_gap[1], 1, "one frame apart");
+        assert_eq!(b.cable_gap[2], 1, "two frames apart");
+        assert_eq!(b.cable_gap[4], 1, "four frames apart, which a cable cannot do");
+        assert_eq!(b.cable_gap.iter().sum::<u64>(), 3, "and the first one is not a gap");
     }
 
     /// A peer that has gone leaves a LONE GBA, not a broken one.
