@@ -1103,10 +1103,24 @@ pub extern "C" fn retro_run() {
                             format!("{start}:{ra:04X},{rb:04X}")
                         });
                     }
-                    log_line(
-                        s.log,
-                        &format!("[cable-tail] left MULTI for {mode} after {}", tail.join(" ")),
-                    );
+                    // Several lines, numbered. Run-length encoding alone is not
+                    // enough: a tail whose words alternate compresses badly and
+                    // the host cuts the line at 580 characters, which cost the
+                    // child's half of the first failure that had both. Twelve
+                    // entries a line leaves room for the prefix whatever the
+                    // transfer indices grow to.
+                    let parts = tail.chunks(12).collect::<Vec<_>>();
+                    let total = parts.len();
+                    for (i, part) in parts.iter().enumerate() {
+                        log_line(
+                            s.log,
+                            &format!(
+                                "[cable-tail {}/{total}] left MULTI for {mode}: {}",
+                                i + 1,
+                                part.join(" ")
+                            ),
+                        );
+                    }
                 }
                 s.last_sio_mode = mode;
             }
